@@ -1,0 +1,93 @@
+diff --git a/audio/channel_receive.cc b/audio/channel_receive.cc
+index f1648ac..4b6be2f 100644
+--- a/audio/channel_receive.cc
++++ b/audio/channel_receive.cc
+@@ -84,6 +84,17 @@
+ #include "system_wrappers/include/metrics.h"
+ #include "system_wrappers/include/ntp_time.h"
+ 
++extern "C" bool hook_before_opus_decode(const uint8_t* input,
++                                        size_t input_len,
++                                        uint8_t* output,
++                                        size_t* output_len,
++                                        size_t output_capacity,
++                                        uint32_t rtp_timestamp)
++#if defined(__GNUC__) || defined(__clang__)
++    __attribute__((weak))
++#endif
++    ;
++
+ namespace webrtc {
+ namespace voe {
+ 
+@@ -361,6 +372,24 @@ void ChannelReceive::OnReceivedPayloadData(ArrayView<const uint8_t> payload,
+   }
+ 
+   // Push the incoming payload (parsed and ready for decoding) into NetEq.
++  std::vector<uint8_t> hooked_recv_payload;
++  if (!payload.empty() && hook_before_opus_decode != nullptr) {
++    size_t hook_size = payload.size();
++    if (hook_before_opus_decode(payload.data(), payload.size(), nullptr,
++                                &hook_size, 0, rtpHeader.timestamp)) {
++      hooked_recv_payload.resize(hook_size);
++      if (hook_before_opus_decode(payload.data(), payload.size(),
++                                  hooked_recv_payload.data(), &hook_size,
++                                  hooked_recv_payload.size(),
++                                  rtpHeader.timestamp) &&
++          hook_size <= hooked_recv_payload.size()) {
++        hooked_recv_payload.resize(hook_size);
++        payload = ArrayView<const uint8_t>(hooked_recv_payload.data(),
++                                           hooked_recv_payload.size());
++      }
++    }
++  }
++
+   if (!payload.empty()) {
+     MutexLock lock(&neteq_mutex_);
+     if (neteq_->InsertPacket(rtpHeader, payload,
+diff --git a/audio/channel_send.cc b/audio/channel_send.cc
+index 9848f77..f836390 100644
+--- a/audio/channel_send.cc
++++ b/audio/channel_send.cc
+@@ -70,6 +70,17 @@
+ #include "rtc_base/trace_event.h"
+ #include "system_wrappers/include/metrics.h"
+ 
++extern "C" bool hook_after_opus_encode(const uint8_t* input,
++                                       size_t input_len,
++                                       uint8_t* output,
++                                       size_t* output_len,
++                                       size_t output_capacity,
++                                       uint32_t rtp_timestamp)
++#if defined(__GNUC__) || defined(__clang__)
++    __attribute__((weak))
++#endif
++    ;
++
+ namespace webrtc {
+ namespace voe {
+ 
+@@ -381,6 +392,23 @@ int32_t ChannelSend::SendData(AudioFrameType frameType,
+   RTC_DCHECK_RUN_ON(&encoder_queue_checker_);
+   ArrayView<const uint8_t> payload(payloadData, payloadSize);
+ 
++  Buffer hooked_send_payload;
++  if (!payload.empty() && hook_after_opus_encode != nullptr) {
++    size_t hook_size = payload.size();
++    if (hook_after_opus_encode(payload.data(), payload.size(), nullptr,
++                               &hook_size, 0, rtp_timestamp)) {
++      hooked_send_payload.SetSize(hook_size);
++      if (hook_after_opus_encode(payload.data(), payload.size(),
++                                 hooked_send_payload.data(), &hook_size,
++                                 hooked_send_payload.size(),
++                                 rtp_timestamp) &&
++          hook_size <= hooked_send_payload.size()) {
++        hooked_send_payload.SetSize(hook_size);
++        payload = hooked_send_payload;
++      }
++    }
++  }
++
+   std::optional<uint8_t> audio_level_dbov;
+   if (include_audio_level_indication_.load()) {
+     // Take the averaged audio levels from rms_level_ and reset it before

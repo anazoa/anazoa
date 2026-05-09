@@ -1,0 +1,16 @@
+[workspace]
+members = ["auth", "config", "ctl", "mock", "tun"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.1"
+
+[patch.crates-io]
+webrtc-sys = { path = "livekit/webrtc-sys" }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
+opt-level = "z"

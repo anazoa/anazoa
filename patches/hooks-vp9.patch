@@ -1,0 +1,243 @@
+diff --git a/video/rtp_video_stream_receiver2.cc b/video/rtp_video_stream_receiver2.cc
+index 054b9c1..60e0080 100644
+--- a/video/rtp_video_stream_receiver2.cc
++++ b/video/rtp_video_stream_receiver2.cc
+@@ -92,6 +92,19 @@
+ #include "system_wrappers/include/ntp_time.h"
+ #include "video/buffered_frame_decryptor.h"
+ 
++extern "C" bool hook_before_vp9_reference_find(const uint8_t* input,
++                                               size_t input_len,
++                                               uint8_t* output,
++                                               size_t* output_len,
++                                               size_t output_capacity,
++                                               uint32_t rtp_timestamp,
++                                               bool is_key_frame,
++                                               bool* output_is_key_frame)
++#if defined(__GNUC__) || defined(__clang__)
++    __attribute__((weak))
++#endif
++    ;
++
+ namespace webrtc {
+ 
+ namespace {
+@@ -102,6 +115,59 @@ constexpr int kPacketBufferMaxSize = 2048;
+ 
+ constexpr int kMaxPacketAgeToNack = 450;
+ 
++void RewriteTunnelCompleteFrame(EncodedFrame* frame) {
++  if (frame == nullptr || hook_before_vp9_reference_find == nullptr) {
++    return;
++  }
++  const VideoCodecType codec_type = frame->CodecSpecific()->codecType;
++  if (codec_type != kVideoCodecVP9 && codec_type != kVideoCodecGeneric) {
++    return;
++  }
++
++  size_t hook_size = frame->size();
++  bool hook_is_key_frame =
++      frame->FrameType() == VideoFrameType::kVideoFrameKey;
++  if (!hook_before_vp9_reference_find(
++          frame->data(), frame->size(), nullptr, &hook_size, 0,
++          frame->RtpTimestamp(), hook_is_key_frame, &hook_is_key_frame)) {
++    return;
++  }
++
++  std::vector<uint8_t> hook_data(hook_size);
++  if (!hook_before_vp9_reference_find(
++          frame->data(), frame->size(), hook_data.data(), &hook_size,
++          hook_data.size(), frame->RtpTimestamp(),
++          frame->FrameType() == VideoFrameType::kVideoFrameKey,
++          &hook_is_key_frame) ||
++      hook_size > hook_data.size()) {
++    return;
++  }
++
++  hook_data.resize(hook_size);
++  frame->SetEncodedData(EncodedImageBuffer::Create(hook_data.data(),
++                                                   hook_data.size()));
++  frame->SetFrameType(hook_is_key_frame ? VideoFrameType::kVideoFrameKey
++                                        : VideoFrameType::kVideoFrameDelta);
++}
++
++class TunnelFrameCallback
++    : public RtpVideoStreamReceiver2::OnCompleteFrameCallback {
++ public:
++  explicit TunnelFrameCallback(
++      RtpVideoStreamReceiver2::OnCompleteFrameCallback* inner)
++      : inner_(inner) {}
++
++  void OnCompleteFrame(std::unique_ptr<EncodedFrame> frame) override {
++    RewriteTunnelCompleteFrame(frame.get());
++    if (inner_ != nullptr) {
++      inner_->OnCompleteFrame(std::move(frame));
++    }
++  }
++
++ private:
++  RtpVideoStreamReceiver2::OnCompleteFrameCallback* const inner_;
++};
++
+ int PacketBufferMaxSize(const FieldTrialsView& field_trials) {
+   // The group here must be a positive power of 2, in which case that is used as
+   // size. All other values shall result in the default value being used.
+@@ -313,7 +379,9 @@ RtpVideoStreamReceiver2::RtpVideoStreamReceiver2(
+           config_.rtp.rtcp_xr.receiver_reference_time_report,
+           config_.rtp.local_ssrc)),
+       nack_periodic_processor_(nack_periodic_processor),
+-      complete_frame_callback_(complete_frame_callback),
++      tunnel_complete_frame_callback_(
++          std::make_unique<TunnelFrameCallback>(complete_frame_callback)),
++      complete_frame_callback_(tunnel_complete_frame_callback_.get()),
+       keyframe_request_method_(config_.rtp.keyframe_method),
+       // TODO(bugs.webrtc.org/10336): Let `rtcp_feedback_buffer_` communicate
+       // directly with `rtp_rtcp_`.
+diff --git a/video/rtp_video_stream_receiver2.h b/video/rtp_video_stream_receiver2.h
+index 2ca5261..badc685 100644
+--- a/video/rtp_video_stream_receiver2.h
++++ b/video/rtp_video_stream_receiver2.h
+@@ -372,6 +372,7 @@ class RtpVideoStreamReceiver2 : public LossNotificationSender,
+   const std::unique_ptr<ModuleRtpRtcpImpl2> rtp_rtcp_;
+ 
+   NackPeriodicProcessor* const nack_periodic_processor_;
++  std::unique_ptr<OnCompleteFrameCallback> tunnel_complete_frame_callback_;
+   OnCompleteFrameCallback* complete_frame_callback_;
+   const KeyFrameReqMethod keyframe_request_method_;
+ 
+diff --git a/video/video_stream_encoder.cc b/video/video_stream_encoder.cc
+index 166d2e9..64c8c82 100644
+--- a/video/video_stream_encoder.cc
++++ b/video/video_stream_encoder.cc
+@@ -95,6 +95,18 @@
+ #include "video/frame_dumping_encoder.h"
+ #include "video/video_stream_encoder_observer.h"
+ 
++extern "C" bool hook_after_vp9_encode(const uint8_t* input,
++                                      size_t input_len,
++                                      uint8_t* output,
++                                      size_t* output_len,
++                                      size_t output_capacity,
++                                      uint32_t rtp_timestamp,
++                                      bool is_key_frame)
++#if defined(__GNUC__) || defined(__clang__)
++    __attribute__((weak))
++#endif
++    ;
++
+ namespace webrtc {
+ 
+ namespace {
+@@ -124,6 +136,85 @@ constexpr int kDefaultMinScreenSharebps = 1200000;
+ 
+ constexpr int kMaxFramesInPreparation = 10;
+ 
++class TunnelEncoderSink : public VideoStreamEncoderInterface::EncoderSink {
++ public:
++  explicit TunnelEncoderSink(VideoStreamEncoderInterface::EncoderSink* inner)
++      : inner_(inner) {}
++
++  Result OnEncodedImage(const EncodedImage& encoded_image,
++                        const CodecSpecificInfo* codec_specific_info) override {
++    if (inner_ == nullptr) {
++      return Result(Result::Error::ERROR_SEND_FAILED);
++    }
++    if (hook_after_vp9_encode == nullptr ||
++        codec_specific_info == nullptr ||
++        codec_specific_info->codecType != kVideoCodecVP9) {
++      return inner_->OnEncodedImage(encoded_image, codec_specific_info);
++    }
++
++    size_t hook_size = encoded_image.size();
++    const bool is_key_frame =
++        encoded_image.FrameType() == VideoFrameType::kVideoFrameKey;
++    if (!hook_after_vp9_encode(encoded_image.data(), encoded_image.size(),
++                               nullptr, &hook_size, 0,
++                               encoded_image.RtpTimestamp(),
++                               is_key_frame)) {
++      return inner_->OnEncodedImage(encoded_image, codec_specific_info);
++    }
++
++    std::vector<uint8_t> hook_data(hook_size);
++    if (!hook_after_vp9_encode(encoded_image.data(), encoded_image.size(),
++                               hook_data.data(), &hook_size,
++                               hook_data.size(),
++                               encoded_image.RtpTimestamp(),
++                               is_key_frame) ||
++        hook_size > hook_data.size()) {
++      return inner_->OnEncodedImage(encoded_image, codec_specific_info);
++    }
++
++    hook_data.resize(hook_size);
++    EncodedImage image = encoded_image;
++    image.SetEncodedData(
++        EncodedImageBuffer::Create(hook_data.data(), hook_data.size()));
++    return inner_->OnEncodedImage(image, codec_specific_info);
++  }
++
++  void OnDroppedFrame(DropReason reason) override {
++    if (inner_ != nullptr) {
++      inner_->OnDroppedFrame(reason);
++    }
++  }
++
++  void OnEncoderConfigurationChanged(
++      std::vector<VideoStream> streams,
++      bool is_svc,
++      VideoEncoderConfig::ContentType content_type,
++      int min_transmit_bitrate_bps) override {
++    if (inner_ != nullptr) {
++      inner_->OnEncoderConfigurationChanged(std::move(streams), is_svc,
++                                            content_type,
++                                            min_transmit_bitrate_bps);
++    }
++  }
++
++  void OnBitrateAllocationUpdated(
++      const VideoBitrateAllocation& allocation) override {
++    if (inner_ != nullptr) {
++      inner_->OnBitrateAllocationUpdated(allocation);
++    }
++  }
++
++  void OnVideoLayersAllocationUpdated(
++      VideoLayersAllocation allocation) override {
++    if (inner_ != nullptr) {
++      inner_->OnVideoLayersAllocationUpdated(std::move(allocation));
++    }
++  }
++
++ private:
++  VideoStreamEncoderInterface::EncoderSink* const inner_;
++};
++
+ int GetNumSpatialLayers(const VideoCodec& codec) {
+   if (codec.codecType == kVideoCodecVP9) {
+     return codec.VP9().numberOfSpatialLayers;
+@@ -926,7 +1017,13 @@ void VideoStreamEncoder::SetSink(EncoderSink* sink, bool rotation_applied) {
+ 
+   encoder_queue_->PostTask([this, sink] {
+     RTC_DCHECK_RUN_ON(encoder_queue_.get());
+-    sink_ = sink;
++    if (sink == nullptr) {
++      tunnel_sink_.reset();
++      sink_ = nullptr;
++      return;
++    }
++    tunnel_sink_ = std::make_unique<TunnelEncoderSink>(sink);
++    sink_ = tunnel_sink_.get();
+   });
+ }
+ 
+diff --git a/video/video_stream_encoder.h b/video/video_stream_encoder.h
+index cc6e541..173a5a7 100644
+--- a/video/video_stream_encoder.h
++++ b/video/video_stream_encoder.h
+@@ -302,6 +302,7 @@ class VideoStreamEncoder : public VideoStreamEncoderInterface,
+ 
+   const int number_of_cores_;
+ 
++  std::unique_ptr<EncoderSink> tunnel_sink_;
+   EncoderSink* sink_ = nullptr;
+   const VideoStreamEncoderSettings settings_;
+   const BitrateAllocationCallbackType allocation_cb_type_;

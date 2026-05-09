@@ -1,0 +1,7 @@
+[submodule "raylib"]
+	path = raylib
+	url = https://github.com/raysan5/raylib
+[submodule "rust-sdks"]
+	path = livekit
+	url = https://github.com/livekit/rust-sdks
+	ignore = dirty

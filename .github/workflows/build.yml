@@ -1,0 +1,263 @@
+name: Build
+
+on:
+    workflow_dispatch:
+
+env:
+    CARGO_TERM_COLOR: always
+    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+
+jobs:
+    build:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - arch: x86_64
+                      runner: ubuntu-latest
+                      lk_arch: x64
+                      dynamic_target: x86_64-unknown-linux-gnu
+                      static_target: x86_64-unknown-linux-musl
+                      test_flags: --release
+                    - arch: aarch64
+                      runner: ubuntu-latest
+                      lk_arch: arm64
+                      dynamic_target: aarch64-unknown-linux-gnu
+                      static_target: aarch64-unknown-linux-musl
+                      test_flags: --release --no-run --target aarch64-unknown-linux-gnu
+                      pkg_config_sysroot: /
+                      pkg_config_path: /usr/lib/aarch64-linux-gnu/pkgconfig
+
+        runs-on: ${{ matrix.runner }}
+
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  submodules: recursive
+
+            - name: Compute livekit submodule SHA
+              id: lk-sha
+              run: echo "sha=$(git -C livekit rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+            - name: Restore libwebrtc cache
+              id: webrtc-cache
+              uses: actions/cache/restore@v5
+              with:
+                  path: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
+                  key: libwebrtc-${{ matrix.lk_arch }}-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
+
+            - name: Patch livekit/webrtc-sys
+              run: |
+                  cp patches/hooks-opus.patch patches/hooks-vp9.patch livekit/webrtc-sys/libwebrtc/patches/
+                  git -C livekit apply ../patches/webrtc-sys.patch
+
+            - name: Free disk space
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              run: |
+                  sudo rm -rf \
+                    /usr/local/lib/android \
+                    /usr/local/share/powershell \
+                    /usr/share/dotnet \
+                    /usr/share/swift \
+                    /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL \
+                    "$AGENT_TOOLSDIRECTORY/go" \
+                    "$AGENT_TOOLSDIRECTORY/node"
+                  sudo docker image prune -af || true
+                  df -h
+
+            - name: Install WebRTC build dependencies
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                    python3 python3-pip \
+                    build-essential \
+                    git curl lsb-release \
+                    ninja-build \
+                    pkg-config
+
+            - name: Build libwebrtc
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              working-directory: livekit/webrtc-sys/libwebrtc
+              run: bash build_linux.sh --arch ${{ matrix.lk_arch }} --profile release
+
+            - name: Save libwebrtc cache
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v5
+              with:
+                  path: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
+                  key: libwebrtc-${{ matrix.lk_arch }}-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: ${{ matrix.dynamic_target }},${{ matrix.static_target }}
+
+            - name: Cache Cargo registry
+              uses: actions/cache@v5
+              with:
+                  path: |
+                      ~/.cargo/registry/index
+                      ~/.cargo/registry/cache
+                      ~/.cargo/git/db
+                  key: cargo-${{ matrix.arch }}-${{ hashFiles('Cargo.lock') }}
+                  restore-keys: cargo-${{ matrix.arch }}-
+
+            - name: Install build tools
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y cmake musl-tools
+                  if [ "${{ matrix.arch }}" = "aarch64" ]; then
+                    sudo apt-get update
+                    sudo apt-get install -y \
+                      gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+                  fi
+
+            - name: Test
+              env:
+                  LK_CUSTOM_WEBRTC: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
+                  PKG_CONFIG_SYSROOT_DIR: ${{ matrix.pkg_config_sysroot }}
+                  PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
+              run: cargo test ${{ matrix.test_flags }}
+
+            - name: Build anazoa-tun
+              env:
+                  LK_CUSTOM_WEBRTC: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
+                  PKG_CONFIG_SYSROOT_DIR: ${{ matrix.pkg_config_sysroot }}
+                  PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
+              run: cargo build --release --bin anazoa-tun --target ${{ matrix.dynamic_target }}
+
+            - name: Build anazoa-auth and anazoa-ctl
+              run: cargo build --release --bin anazoa-auth --bin anazoa-ctl --target ${{ matrix.static_target }}
+
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: anazoa-${{ matrix.arch }}
+                  path: |
+                      target/${{ matrix.static_target }}/release/anazoa-auth
+                      target/${{ matrix.static_target }}/release/anazoa-ctl
+                      target/${{ matrix.dynamic_target }}/release/anazoa-tun
+
+    release:
+        needs: build
+        runs-on: ubuntu-latest
+        if: startsWith(github.ref, 'refs/tags/')
+        permissions:
+            contents: write
+        strategy:
+            matrix:
+                include:
+                    - arch: x86_64
+                      artifact: anazoa-x86_64
+                      dynamic_target: x86_64-unknown-linux-gnu
+                      static_target: x86_64-unknown-linux-musl
+                    - arch: aarch64
+                      artifact: anazoa-aarch64
+                      dynamic_target: aarch64-unknown-linux-gnu
+                      static_target: aarch64-unknown-linux-musl
+        steps:
+            - uses: actions/download-artifact@v7
+              with:
+                  name: ${{ matrix.artifact }}
+                  path: /tmp/artifact
+
+            - name: Create archive
+              run: |
+                  mkdir staging
+                  cp /tmp/artifact/${{ matrix.dynamic_target }}/release/anazoa-tun staging/
+                  cp /tmp/artifact/${{ matrix.static_target }}/release/anazoa-ctl staging/
+                  cp /tmp/artifact/${{ matrix.static_target }}/release/anazoa-auth staging/
+                  tar -czf anazoa-${{ matrix.arch }}.tar.gz -C staging .
+
+            - uses: softprops/action-gh-release@v2
+              with:
+                  files: anazoa-${{ matrix.arch }}.tar.gz
+
+    docker:
+        needs: build
+        runs-on: ubuntu-latest
+        if: startsWith(github.ref, 'refs/tags/')
+        permissions:
+            contents: read
+            packages: write
+        strategy:
+            matrix:
+                include:
+                    - arch: x86_64
+                      platform: linux/amd64
+                      artifact: anazoa-x86_64
+                      binary: x86_64-unknown-linux-gnu/release/anazoa-tun
+                    - arch: aarch64
+                      platform: linux/arm64
+                      artifact: anazoa-aarch64
+                      binary: aarch64-unknown-linux-gnu/release/anazoa-tun
+        steps:
+            - uses: actions/checkout@v6
+
+            - uses: actions/download-artifact@v7
+              with:
+                  name: ${{ matrix.artifact }}
+                  path: /tmp/artifact
+
+            - name: Stage binary
+              run: cp /tmp/artifact/${{ matrix.binary }} anazoa-tun
+
+            - uses: docker/setup-buildx-action@v4
+
+            - uses: docker/login-action@v4
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - uses: docker/metadata-action@v6
+              id: meta
+              with:
+                  images: ghcr.io/${{ github.repository }}
+                  flavor: suffix=-${{ matrix.arch }}
+                  tags: |
+                      type=semver,pattern={{version}}
+                      type=semver,pattern={{major}}.{{minor}}
+
+            - uses: docker/build-push-action@v7
+              with:
+                  context: .
+                  platforms: ${{ matrix.platform }}
+                  push: true
+                  provenance: false
+                  tags: ${{ steps.meta.outputs.tags }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+    docker-manifest:
+        needs: docker
+        runs-on: ubuntu-latest
+        if: startsWith(github.ref, 'refs/tags/')
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - uses: docker/login-action@v4
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            - uses: docker/metadata-action@v6
+              id: meta
+              with:
+                  images: ghcr.io/${{ github.repository }}
+                  tags: |
+                      type=semver,pattern={{version}}
+                      type=semver,pattern={{major}}.{{minor}}
+
+            - name: Create and push multi-arch manifest
+              run: |
+                  for tag in ${{ steps.meta.outputs.tags }}; do
+                      docker buildx imagetools create \
+                          --tag "$tag" \
+                          "${tag}-x86_64" \
+                          "${tag}-aarch64"
+                  done

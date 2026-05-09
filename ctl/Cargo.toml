@@ -1,0 +1,9 @@
+[package]
+name = "anazoa-ctl"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net"] }

@@ -1,0 +1,14 @@
+services:
+    anazoa:
+        build: .
+        # image: ghcr.io/anazoa/anazoa:0.1-x86_64
+        container_name: anazoa
+        cap_add:
+            - NET_ADMIN
+        devices:
+            - /dev/net/tun:/dev/net/tun
+        network_mode: host
+        volumes:
+            - .:/app
+        # command: ["-c", "/app/anazoa.toml"]
+        restart: unless-stopped

@@ -1,0 +1,7 @@
+adb shell
+su
+cd /data/local/reveng
+./frida-server &
+./tcpdump -i wlan0 -w max.pcap
+
+frida -U -f ru.oneme.app -l tls-keylog.js -l wt-hook.js

@@ -1,0 +1,489 @@
+// Extracted from /usr/share/max/bin/max-service/lib64/libcall-service.so
+// (descriptor_table_protodef_vk_2dcall_2dservice_2eproto, 10580 bytes at 0xb46ae0)
+// gRPC service: com.vk.calls.sdk.v1.CallAgent
+// Plaintext gRPC on localhost:<rpc-port> (default 61415)
+
+syntax = "proto3";
+package com.vk.calls.sdk.v1;
+
+option java_multiple_files = true;
+
+// ── Enums ─────────────────────────────────────────────────────────────────────
+
+enum WindowAction {
+  HIDE            = 0;
+  SHOW            = 1;
+  MINIMIZE        = 2;
+  FULLSCREENIZE   = 3;
+}
+
+enum WindowType {
+  CALL        = 0;
+  PARTICIPANT = 1;
+  SPEAKER     = 2;
+  ASSIGNMENT  = 3;
+}
+
+enum WindowLayout {
+  HIDDEN          = 0;
+  SHOWN           = 1;
+  MINIMIZED       = 2;
+  FULLSCREENIZED  = 3;
+}
+
+enum TokenType {
+  ACCESS_TOKEN = 0;
+  CALL_TOKEN   = 1;
+}
+
+enum IncomingCallAction {
+  DEFER          = 0;
+  INDICATE_BUSY  = 1;
+  REJECT         = 2;
+  ACCEPT         = 3;
+}
+
+enum GrammCase {
+  NOMINATIVE    = 0;
+  GENITIVE      = 1;
+  DATIVE        = 2;
+  ACCUSATIVE    = 3;
+  INSTRUMENTAL  = 4;
+  ABLATIVE      = 5;
+}
+
+enum Gender {
+  UNKNOWN = 0;
+  MALE    = 1;
+  FEMALE  = 2;
+}
+
+enum Direction {
+  FORWARD  = 0;
+  BACKWARD = 1;
+}
+
+enum NetworkQuality {
+  BAD  = 0;
+  GOOD = 1;
+}
+
+enum LinkStatus {
+  DOWN = 0;
+  UP   = 1;
+}
+
+enum CallSessionState {
+  WAITING_HALL = 0;
+  CONNECTED    = 1;
+  POSTMORTEM   = 2;
+}
+
+enum PostCallAction {
+  REDIAL    = 0;
+  OPEN_CHAT = 1;
+}
+
+// ── Shared primitives ─────────────────────────────────────────────────────────
+
+message Empty {}
+
+message Header {
+  int64           timestamp = 1;
+  string          reqId     = 2;
+  optional string callId    = 3;
+}
+
+message UserId {
+  string id = 1;
+}
+
+message Token {
+  string    value = 1;
+  TokenType type  = 2;
+}
+
+message WindowState {
+  WindowType   type   = 1;
+  WindowLayout layout = 2;
+}
+
+// ── Status ────────────────────────────────────────────────────────────────────
+
+message StatusRequest {
+  Header hdr = 1;
+}
+
+// Returned by GetStatus and streamed by SubscribeToStatusNotifications.
+// internalParams is JSON: {"protocolVersion":5,"platform":"DESKTOP",
+//   "deviceId":"...","sdkVersion":"1.44.54144","clientAppKey":"..."}
+message StatusReport {
+  Header          hdr                        = 1;
+  optional bool   healthy                    = 2;
+  repeated UserId userIds                    = 3;
+  optional bool   allUsersLoggedOut          = 4;
+  repeated string callIds                    = 5;
+  optional bool   allCallsEnded              = 6;
+  repeated string microphones                = 9;
+  optional bool   allMicrophonesDisconnected = 10;
+  repeated string speakers                   = 11;
+  optional bool   allSpeakersDisconnected    = 12;
+  repeated string cameras                    = 13;
+  optional bool   allCamerasDisconnected     = 14;
+  optional string internalParams             = 15;
+}
+
+// Generic response used by most mutating RPCs.
+message GenericResponse {
+  Header         hdr       = 1;
+  bool           accepted  = 2;
+  optional int64 errorCode = 3;
+}
+
+// ── Auth ──────────────────────────────────────────────────────────────────────
+
+message LoginRequest {
+  Header          hdr    = 1;
+  UserId          userId = 2;
+  optional Token  token  = 3;
+}
+
+message LogoutRequest {
+  Header hdr    = 1;
+  UserId userId = 2;
+}
+
+// ── Calls ─────────────────────────────────────────────────────────────────────
+
+message FastCallSetupInfo {
+  string          conversationId       = 1;
+  optional string joinLink             = 2;
+  string          internalCallerParams = 3;
+}
+
+message FastCallErrorInfo {
+  int64  errorCode          = 1;
+  UserId targetId           = 2;
+  string targetDescription  = 3;
+}
+
+message NewCallRequest {
+  Header                   hdr               = 1;
+  UserId                   userId            = 2;
+  bool                     micro_on          = 3;
+  bool                     camera_on         = 4;
+  optional string          link              = 5;
+  optional UserId          peerId            = 6;
+  optional string          preferredMicrophone = 7;
+  optional string          preferredSpeaker  = 8;
+  optional string          preferredCamera   = 9;
+  optional string          description       = 10;
+  optional string          externalLink      = 11;
+  optional string          createCallPayload = 12;
+  optional bool            isChatCall        = 13;
+  optional FastCallSetupInfo fastCallSetupInfo = 14;
+  optional FastCallErrorInfo fastCallErrorInfo = 15;
+}
+
+message EndCallRequest {
+  Header hdr = 1;
+}
+
+message ChangeCallWindowRequest {
+  Header          hdr       = 1;
+  WindowAction    action    = 2;
+  optional string origReqId = 3;
+  optional bool   casual    = 4;
+}
+
+message ChangeMyMediaRequest {
+  Header hdr       = 1;
+  bool   micro_on  = 2;
+  bool   camera_on = 3;
+}
+
+// ── Call notifications (SubscribeToCallNotifications) ─────────────────────────
+
+message CallInfoRequest {
+  Header          hdr       = 1;
+  optional string origReqId = 2;
+}
+
+message CallSettingUp {}
+message CallNotFound  {}
+
+message MediaState {
+  bool micro_on  = 1;
+  bool camera_on = 2;
+}
+
+message CallWindowsState {
+  repeated WindowState windows = 1;
+}
+
+message CallState {
+  optional CallWindowsState windows      = 1;
+  optional MediaState       media        = 2;
+  optional bool             accepted     = 3;
+  optional CallSessionState sessionState = 4;
+  optional int64            errorCode    = 5;
+  optional string           link         = 6;
+}
+
+message CallFailed {
+  int64 errorCode = 1;
+}
+
+message CallEnded {
+  bool                  byAgent   = 1;
+  optional int64        errorCode = 2;
+  optional PostCallAction action  = 3;
+}
+
+message OpenChat    {}
+
+message OpenProfile {
+  UserId userId = 1;
+}
+
+// Server-streamed response from SubscribeToCallNotifications.
+// Exactly one of the event fields is set per notification.
+message CallEvent {
+  Header          hdr       = 1;
+  optional string origReqId = 2;
+  CallSettingUp   settingUp = 3;
+  CallState       state     = 4;
+  CallNotFound    notFound  = 5;
+  CallFailed      failed    = 6;
+  CallEnded       ended     = 7;
+  OpenChat        openChat  = 8;
+  OpenProfile     openProfile = 9;
+}
+
+// ── Incoming call notifications ───────────────────────────────────────────────
+
+message PendingIncomingCall {
+  UserId userId    = 1;
+  UserId callerId  = 2;
+  bool   videoCall = 3;
+}
+message DroppedIncomingCall  {}
+message RejectedIncomingCall {}
+message AcceptedIncomingCall {}
+
+message IncomingCallEvent {
+  Header               hdr      = 1;
+  PendingIncomingCall  pending  = 2;
+  DroppedIncomingCall  dropped  = 3;
+  RejectedIncomingCall rejected = 4;
+  AcceptedIncomingCall accepted = 5;
+}
+
+message IncomingCallActionRequest {
+  Header               hdr               = 1;
+  IncomingCallAction   action            = 2;
+  optional bool        micro_on          = 3;
+  optional bool        camera_on         = 4;
+  optional UserId      callerId          = 5;
+  optional string      callerDescription = 6;
+}
+
+// ── SetupDataChannel (bidirectional stream) ───────────────────────────────────
+
+// Client → server: provide data requested by the server.
+message CallToken {
+  UserId userId     = 1;
+  string tokenHost  = 2;
+  string tokenValue = 3;
+}
+
+message CasedName {
+  GrammCase case = 1;
+  string    name = 2;
+}
+
+message AvatarData {
+  bytes image = 1;
+}
+
+message AvatarInfo {
+  uint64          size = 1;
+  optional string link = 2;
+  optional AvatarData raw = 3;
+}
+
+message UserInfo {
+  UserId              userId         = 1;
+  repeated CasedName  firstNames     = 2;
+  repeated CasedName  lastNames      = 3;
+  optional Gender     gender         = 4;
+  bool                callCapability = 5;
+  repeated AvatarInfo avatars        = 6;
+  optional int64      lastOnline     = 7;
+  optional bool       pinned         = 8;
+  optional bool       favorite       = 9;
+  optional uint64     membersNum     = 10;
+}
+
+message UsersInfo {
+  repeated UserInfo data = 1;
+}
+
+message ContactListPage {
+  string            sessionId  = 1;
+  uint64            pageToken  = 2;
+  bool              lastPage   = 3;
+  repeated UserInfo data       = 4;
+}
+
+message ContactListPageError {
+  string sessionId  = 1;
+  uint64 pageToken  = 2;
+  int64  errorCode  = 3;
+}
+
+message ContactListClosed {
+  string sessionId = 1;
+  int64  errorCode = 2;
+}
+
+message DataChannelEvent {
+  Header               hdr                 = 1;
+  CallToken            callToken           = 2;
+  UsersInfo            usersInfo           = 3;
+  ContactListPage      contactListPage     = 4;
+  ContactListPageError contactListPageError = 5;
+  ContactListClosed    contactListClosed   = 6;
+}
+
+// Server → client: requests for data or call events.
+message NeedCallToken {
+  UserId userId = 1;
+}
+
+message NeedUsersInfo {
+  repeated UserId userIds = 1;
+}
+
+message NeedContactList {
+  UserId userId     = 1;
+  string sessionId  = 2;
+  uint64 pageSize   = 3;
+}
+
+message NeedContactListPage {
+  string    sessionId  = 1;
+  uint64    pageToken  = 2;
+  Direction direction  = 3;
+}
+
+message AddPartiesToCall {
+  string          callId  = 1;
+  repeated UserId userIds = 2;
+  string          link    = 3;
+}
+
+message NetworkQualityReport {
+  string                  callId     = 1;
+  optional NetworkQuality quality    = 2;
+  optional LinkStatus     linkStatus = 3;
+}
+
+message CreateCallLink {
+  string callId = 1;
+}
+
+message OpenChatOutOfCall {
+  string targetId = 1;
+}
+
+message DataChannelRequest {
+  Header               hdr                 = 1;
+  NeedCallToken        needCallToken        = 2;
+  NeedUsersInfo        needUsersInfo        = 3;
+  NeedContactList      needContactList      = 4;
+  NeedContactListPage  needContactListPage  = 5;
+  AddPartiesToCall     addPartiesToCall     = 6;
+  NetworkQualityReport networkQualityReport = 7;
+  CreateCallLink       createCallLink       = 8;
+  OpenChatOutOfCall    openChatOutOfCall    = 9;
+}
+
+// ── PushConfig / PushCallMetadata ─────────────────────────────────────────────
+
+message ConfigEvent {
+  Header hdr  = 1;
+  string data = 2;
+}
+
+message CallMetadataEvent {
+  Header          hdr               = 1;
+  optional int64  unreadMsgCount    = 2;
+  optional string callDescription   = 3;
+  optional UserId targetId          = 4;
+  optional string targetDescription = 5;
+}
+
+// ── GetCurrentCalls / SubscribeToCurrentCallsNotifications ───────────────────
+
+message CurrentCallsRequest {
+  Header hdr      = 1;
+  int64  maxCount = 2;
+}
+
+message CallInfo {
+  string callId      = 1;
+  string description = 2;
+}
+
+message CurrentCallsResponse {
+  Header            hdr          = 1;
+  repeated CallInfo currentCalls = 2;
+}
+
+message CurrentCallsChanged {
+  Header hdr = 1;
+}
+
+// ── Service ───────────────────────────────────────────────────────────────────
+
+service CallAgent {
+  // Unary: query current health + logged-in users + active calls + devices.
+  rpc GetStatus (StatusRequest) returns (StatusReport);
+
+  // Server-streaming: push StatusReport on every state change.
+  rpc SubscribeToStatusNotifications (Empty) returns (stream StatusReport);
+
+  // Auth: inform the SDK which user is logged in / out.
+  rpc Login  (LoginRequest)  returns (GenericResponse);
+  rpc Logout (LogoutRequest) returns (GenericResponse);
+
+  // Outgoing call lifecycle.
+  rpc NewCall            (NewCallRequest)            returns (GenericResponse);
+  rpc EndCall            (EndCallRequest)            returns (GenericResponse);
+  rpc ChangeCallWindow   (ChangeCallWindowRequest)   returns (GenericResponse);
+  rpc ChangeMyMedia      (ChangeMyMediaRequest)      returns (GenericResponse);
+
+  // Metadata push from the UI to the SDK.
+  rpc PushConfig       (ConfigEvent)       returns (GenericResponse);
+  rpc PushCallMetadata (CallMetadataEvent) returns (GenericResponse);
+
+  // Server-streaming: call state updates for an active call.
+  rpc SubscribeToCallNotifications (CallInfoRequest) returns (stream CallEvent);
+
+  // Server-streaming: incoming call ring events.
+  rpc SubscribeToIncomingCallNotifications (Empty) returns (stream IncomingCallEvent);
+
+  // Accept / reject an incoming call.
+  rpc ProcessIncomingCall (IncomingCallActionRequest) returns (GenericResponse);
+
+  // Bidirectional stream: client provides tokens/contacts/users info;
+  // server sends back requests for data and network quality reports.
+  rpc SetupDataChannel (stream DataChannelEvent) returns (stream DataChannelRequest);
+
+  // Query currently active calls.
+  rpc GetCurrentCalls (CurrentCallsRequest) returns (CurrentCallsResponse);
+
+  // Server-streaming: notification whenever the active call list changes.
+  rpc SubscribeToCurrentCallsNotifications (Empty) returns (stream CurrentCallsChanged);
+}

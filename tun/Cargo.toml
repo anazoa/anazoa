@@ -1,0 +1,26 @@
+[package]
+name = "anazoa-tun"
+version.workspace = true
+edition = "2024"
+
+[dependencies]
+anazoa-auth = { path = "../auth" }
+anazoa-config = { path = "../config" }
+anyhow = "1"
+bytes = "1"
+nix = { version = "0.31", features = ["user", "signal", "process"] }
+rand = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["io-util", "macros", "rt-multi-thread", "net", "signal", "time", "sync", "process"] }
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tun-rs = { version = "2", features = ["async"] }
+cxx = "1"
+
+libwebrtc = { version = "0.3.30", default-features = false }
+webrtc-sys = "0.3.28"
+ogg = "0.9.2"
+opus = "0.3.1"
+webm = "2.2.0"

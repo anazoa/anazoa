@@ -1,0 +1,29 @@
+# To get these, run anazoa-auth login --phone +71234567890
+token = ""
+signaling-user-id = "0"
+remote-peer-id = 0
+
+# Generate VAD metadata via scripts/vad.sh first
+media = "TheIdiot_01-15_LibriVox.opus"
+media-video-resolution = "1280x720"
+
+tun-name = "tun0"
+privdrop = "nobody:nogroup"
+ctl-socket = "/run/anazoa.sock"
+
+[fingerprint]
+app-version = "26.13.0"
+build-number = 6683
+push-device-type = "GCM"
+arch = "arm64-v8a"
+
+# It's strongly advised to change these parameters to match some real device
+os-version = "Android 14"
+os-api-level = 34
+screen = "425dpi 425dpi 1080x2340"
+device-name = "samsung SM-S911B"
+device-locale = "ru"
+locale = "ru"
+timezone = "Europe/Moscow"
+# random 8 bytes as a hex string
+device-id = "bbaaaaddff0000dd"
