@@ -255,9 +255,10 @@ jobs:
 
             - name: Create and push multi-arch manifest
               run: |
-                  for tag in ${{ steps.meta.outputs.tags }}; do
+                  for tag in $(echo ${{ steps.meta.outputs.tags }}); do
+                      tag_version="${tag#*:}"
                       docker buildx imagetools create \
                           --tag "$tag" \
-                          "${tag}-x86_64" \
-                          "${tag}-aarch64"
+                          "ghcr.io/anazoa/anazoa-x86_64:$tag_version" \
+                          "ghcr.io/anazoa/anazoa-aarch64:$tag_version"
                   done
