@@ -190,7 +190,7 @@ jobs:
                   cp /tmp/artifact/${{ matrix.static_target }}/release/anazoa-auth staging/
                   tar -czf anazoa-${{ matrix.arch }}.tar.gz -C staging .
 
-            - uses: softprops/action-gh-release@v2
+            - uses: softprops/action-gh-release@v3
               with:
                   files: |
                     anazoa-${{ matrix.arch }}.tar.gz
@@ -276,10 +276,10 @@ jobs:
 
             - name: Create and push multi-arch manifest
               run: |
-                  for tag in $(echo ${{ steps.meta.outputs.tags }}); do
+                  while IFS= read -r tag; do
                       tag_version="${tag#*:}"
                       docker buildx imagetools create \
                           --tag "$tag" \
                           "ghcr.io/anazoa/anazoa-x86_64:$tag_version" \
                           "ghcr.io/anazoa/anazoa-aarch64:$tag_version"
-                  done
+                  done <<< "${{ steps.meta.outputs.tags }}"
