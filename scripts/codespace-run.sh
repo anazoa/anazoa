@@ -1,4 +1,5 @@
 #!/bin/sh
+set -eu
 
 LOGFILE="anazoa.log"
 PIDFILE="anazoa.pid"

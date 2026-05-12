@@ -1,5 +1,5 @@
 #!/bin/sh
-set -euo pipefail
+set -eu
 
 export LK_CUSTOM_WEBRTC=livekit/webrtc-sys/libwebrtc/linux-x64-release
 
