@@ -84,6 +84,16 @@ jobs:
               working-directory: livekit/webrtc-sys/libwebrtc
               run: bash build_linux.sh --arch ${{ matrix.lk_arch }} --profile release
 
+            - name: Package libwebrtc build output
+              run: |
+                  tar -C livekit/webrtc-sys/libwebrtc -czf libwebrtc-linux-${{ matrix.arch }}-dev.tar.gz linux-${{ matrix.lk_arch }}-release
+
+            - name: Upload libwebrtc artifact
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libwebrtc-linux-${{ matrix.arch }}-dev
+                  path: libwebrtc-linux-${{ matrix.arch }}-dev.tar.gz
+
             - name: Save libwebrtc cache
               if: steps.webrtc-cache.outputs.cache-hit != 'true'
               uses: actions/cache/save@v5
@@ -163,6 +173,15 @@ jobs:
                   name: ${{ matrix.artifact }}
                   path: /tmp/artifact
 
+            - uses: actions/download-artifact@v7
+              with:
+                  name: libwebrtc-linux-${{ matrix.arch }}-dev
+                  path: /tmp/artifact
+
+            - name: Stage libwebrtc release asset
+              run: |
+                  cp /tmp/artifact/libwebrtc-linux-${{ matrix.arch }}-dev.tar.gz .
+
             - name: Create archive
               run: |
                   mkdir staging
@@ -173,7 +192,9 @@ jobs:
 
             - uses: softprops/action-gh-release@v2
               with:
-                  files: anazoa-${{ matrix.arch }}.tar.gz
+                  files: |
+                    anazoa-${{ matrix.arch }}.tar.gz
+                    libwebrtc-linux-${{ matrix.arch }}-dev.tar.gz
 
     docker:
         needs: build
