@@ -1,0 +1,27 @@
+# callback.toml - configuration for the callback.py script
+
+address-to = "listener@gmail.com"
+address-from = "sender@yandex.ru"
+subject = "Срочно"
+body = "Артемий, зайди к нам в кабинет 404 и не забудь документы."
+
+# Sender configuration
+[smtp]
+host = "smtp.yandex.ru"
+# port = 465  # default
+user = "sender@yandex.ru"
+# https://id.yandex.ru/security/app-passwords
+password = "app-password"
+
+# Listener configuration
+[imap]
+host = "imap.gmail.com"
+# port = 993  # default
+user = "listener@gmail.com"
+# https://myaccount.google.com/apppasswords
+password = "app-password"
+
+[ctl]
+# executable = "anazoa-ctl"  # default
+# socket = "/run/anazoa.sock"  # default
+# window_secs = 60  # default

@@ -288,6 +288,14 @@ fn tunnel_stats_json() -> Value {
     })
 }
 
+fn answer_window_open(deadline: &Option<Option<Instant>>) -> bool {
+    match deadline {
+        None => false,
+        Some(None) => true,
+        Some(Some(d)) => Instant::now() <= *d,
+    }
+}
+
 // Returns true if the call should end (hangup received).
 fn handle_call_cmd(cmd: Option<DaemonCmd>, peer_id: i64, started_at: Instant) -> bool {
     match cmd {
@@ -309,6 +317,10 @@ fn handle_call_cmd(cmd: Option<DaemonCmd>, peer_id: i64, started_at: Instant) ->
         }
         Some(DaemonCmd::Call { resp, .. }) => {
             let _ = resp.send(Err(anyhow!("already in a call")));
+            false
+        }
+        Some(DaemonCmd::Answer { resp, .. }) => {
+            let _ = resp.send(Err(anyhow!("cannot set answer mode during a call")));
             false
         }
         None => true,
@@ -343,6 +355,7 @@ async fn idle_loop(
     oneme: Arc<Mutex<SessionClient>>,
     peer_id: i64,
     cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
+    answer_deadline: &mut Option<Option<Instant>>,
 ) -> IdleOutcome {
     let (call_tx, mut call_rx) = mpsc::channel(1);
     let mut wait_task = spawn_wait_task(Arc::clone(&oneme), call_tx.clone());
@@ -357,7 +370,15 @@ async fn idle_loop(
             Some(result) = call_rx.recv() => {
                 match result {
                     Ok(incoming) if incoming.caller_id == peer_id => {
-                        return IdleOutcome::Incoming { call: incoming };
+                        if answer_window_open(answer_deadline) {
+                            *answer_deadline = None;
+                            return IdleOutcome::Incoming { call: incoming };
+                        }
+                        warn!(
+                            "ignoring call from peer {} outside answer window",
+                            incoming.caller_id
+                        );
+                        wait_task = spawn_wait_task(Arc::clone(&oneme), call_tx.clone());
                     }
                     Ok(incoming) => {
                         warn!("ignoring call from unexpected peer {}", incoming.caller_id);
@@ -379,6 +400,16 @@ async fn idle_loop(
                     }
                     DaemonCmd::Hangup { resp } => {
                         let _ = resp.send(Err(anyhow!("not in a call")));
+                    }
+                    DaemonCmd::Answer { secs, resp } => {
+                        *answer_deadline = Some(
+                            secs.map(|s| Instant::now() + Duration::from_secs(s)),
+                        );
+                        let result = match secs {
+                            Some(s) => json!({"state": "armed", "secs": s}),
+                            None => json!({"state": "always"}),
+                        };
+                        let _ = resp.send(Ok(result));
                     }
                     DaemonCmd::Call { peer_id: override_id, resp } => {
                         wait_task.abort();
@@ -462,6 +493,7 @@ async fn run_incoming_call(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_outgoing_call(
     oneme: Arc<Mutex<SessionClient>>,
     peer_id: i64,
@@ -572,8 +604,16 @@ async fn run_daemon(
     info!("OneMe session established");
     let oneme = Arc::new(Mutex::new(oneme));
 
+    let mut answer_deadline: Option<Option<Instant>> = None;
     loop {
-        match idle_loop(Arc::clone(&oneme), cfg.remote_peer_id, cmd_rx).await {
+        match idle_loop(
+            Arc::clone(&oneme),
+            cfg.remote_peer_id,
+            cmd_rx,
+            &mut answer_deadline,
+        )
+        .await
+        {
             IdleOutcome::Incoming { call } => {
                 run_incoming_call(
                     Arc::clone(&oneme),

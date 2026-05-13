@@ -1,6 +1,6 @@
 # Anazoa
 
-Anazoa tunnels point-to-point IP traffic over a WebRTC video call on the Russia's government-pushed Max platform. Both ends impersonate an Android Max client. IP packets are carried as tunnel frames embedded in the VP9 video bitstream, paced by Google Chrome libwebrtc's internal scheduler.
+Anazoa tunnels point-to-point IP traffic over a WebRTC video call on Russia's government-pushed Max platform. Both ends impersonate an Android Max client. IP packets are carried as tunnel frames embedded in the VP9 video bitstream, paced by Google Chrome libwebrtc's internal scheduler.
 
 Inspired by the [Protozoa](https://dl.acm.org/doi/10.1145/3372297.3417874) work.
 
@@ -8,7 +8,7 @@ Expected tunneling bandwidth for a 720p video call is around 2 Mbps.
 
 ## Usage
 
-Two peers need to be configured, local and remote.
+Two peers need to be configured, A and B.
 
 1. Use `anazoa.toml.sample` as a template for creating two `anazoa.toml` configuration files (it's advised to tweak `fingerprint` section) and for each peer run
 ```
@@ -29,13 +29,23 @@ anazoa-tun -c anazoa.toml
 ```
 and then configure newly created `tun0` (the name chosen via `tun-name` parameter) network interfaces (see `scripts/setup-tun-test.sh` for a sample).
 
-3. Make a call
+3. Allow to answer a call for peer A
+```
+anazoa-ctl -s /run/anazoa.sock answer always
+```
+Explicit answer permission is needed to mitigate active probing. In a real deployment, you may want to send an order for a callback via an independent channel (for example, e-mail) and allow answering for a short time period only:
+```
+anazoa-ctl -s /run/anazoa.sock answer 120
+```
+See `scripts/callback.py` for a ready-made e-mail based workflow.
+
+4. Make a call from peer B
 ```
 anazoa-ctl -s /run/anazoa.sock call
 ```
-After a WebRTC connection establishes (the peer on the other side answers automatically), the tunnel is ready to be used.
+After a WebRTC connection establishes, the tunnel is ready to be used.
 
-To hang up the call run on any side
+To hang up the call, run on any side
 ```
 anazoa-ctl -s /run/anazoa.sock hangup
 ```

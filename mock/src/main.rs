@@ -376,6 +376,16 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
     )?;
 
     Command::new(&ctl_exe)
+        .args([
+            "-s",
+            &calltaker_sock.display().to_string(),
+            "answer",
+            "always",
+        ])
+        .status()
+        .context("ctl answer")?;
+
+    Command::new(&ctl_exe)
         .args(["-s", &caller_sock.display().to_string(), "call"])
         .status()
         .context("ctl call")?;
@@ -636,6 +646,7 @@ fn tun_args(tun_config: &Path) -> Vec<String> {
     vec!["-c".to_string(), tun_config.display().to_string()]
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_tun_config(
     path: &Path,
     tun_name: &str,

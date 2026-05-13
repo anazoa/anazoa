@@ -16,6 +16,10 @@ pub enum DaemonCmd {
     Status {
         resp: oneshot::Sender<Result<Value>>,
     },
+    Answer {
+        secs: Option<u64>,
+        resp: oneshot::Sender<Result<Value>>,
+    },
 }
 
 pub fn bind_socket(socket_path: &str) -> Result<UnixListener> {
@@ -93,6 +97,13 @@ async fn dispatch(
         }
         "hangup" => DaemonCmd::Hangup { resp: resp_tx },
         "status" => DaemonCmd::Status { resp: resp_tx },
+        "answer" => {
+            let secs = params.get("secs").and_then(Value::as_u64);
+            DaemonCmd::Answer {
+                secs,
+                resp: resp_tx,
+            }
+        }
         other => return Err(format!("method not found: {other}")),
     };
 

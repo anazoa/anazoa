@@ -763,19 +763,17 @@ pub unsafe extern "C" fn hook_after_vp9_encode(
             {
                 webm.write_video_frame(orig_frame, is_key_frame);
             }
-            if is_key_frame {
-                if let Some((w, h)) = vp9_keyframe_dimensions(orig_frame) {
-                    let prev = unpack_resolution(
-                        state
-                            .encoder_resolution
-                            .swap(pack_resolution(w, h), Ordering::Relaxed),
-                    );
-                    if prev != (w, h) {
-                        info!("encoder resolution changed: {w}×{h}");
-                    }
-                    if let Ok(mut cache) = state.vp9_keyframe_cache.lock() {
-                        cache.insert((w, h), orig_frame.to_vec());
-                    }
+            if is_key_frame && let Some((w, h)) = vp9_keyframe_dimensions(orig_frame) {
+                let prev = unpack_resolution(
+                    state
+                        .encoder_resolution
+                        .swap(pack_resolution(w, h), Ordering::Relaxed),
+                );
+                if prev != (w, h) {
+                    info!("encoder resolution changed: {w}×{h}");
+                }
+                if let Ok(mut cache) = state.vp9_keyframe_cache.lock() {
+                    cache.insert((w, h), orig_frame.to_vec());
                 }
             }
         }
@@ -1026,7 +1024,7 @@ fn read_stream_bits(data: &[u8], pos: usize, n: usize) -> Option<u32> {
     debug_assert!(n <= 24);
     let byte = pos / 8;
     let shift = pos % 8;
-    let bytes_needed = (shift + n + 7) / 8;
+    let bytes_needed = (shift + n).div_ceil(8);
     let mut val = 0u32;
     for i in 0..bytes_needed {
         val = (val << 8) | u32::from(*data.get(byte + i)?);

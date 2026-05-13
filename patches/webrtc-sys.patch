@@ -68,7 +68,7 @@ index 072794ec..d05b4082 100644
  
              add_lazy_load_so(
 diff --git a/webrtc-sys/libwebrtc/build_linux.sh b/webrtc-sys/libwebrtc/build_linux.sh
-index 926e21be..05586d12 100755
+index 926e21be..de13d5dc 100755
 --- a/webrtc-sys/libwebrtc/build_linux.sh
 +++ b/webrtc-sys/libwebrtc/build_linux.sh
 @@ -72,6 +72,9 @@ git apply "$COMMAND_DIR/patches/ssl_verify_callback_with_native_handle.patch" -v
@@ -97,3 +97,12 @@ index 926e21be..05586d12 100755
  
  # generate ninja files
  gn gen "$OUTPUT_DIR" --root="src" --args="${args}"
+@@ -138,7 +141,7 @@ python3 "./src/tools_webrtc/libs/generate_licenses.py" \
+   --target :default "$OUTPUT_DIR" "$OUTPUT_DIR"
+ 
+ cp "$OUTPUT_DIR/obj/webrtc.ninja" "$ARTIFACTS_DIR"
+-cp "$OUTPUT_DIR/obj/modules/desktop_capture/desktop_capture.ninja" "$ARTIFACTS_DIR"
++# cp "$OUTPUT_DIR/obj/modules/desktop_capture/desktop_capture.ninja" "$ARTIFACTS_DIR"
+ cp "$OUTPUT_DIR/args.gn" "$ARTIFACTS_DIR"
+ cp "$OUTPUT_DIR/LICENSE.md" "$ARTIFACTS_DIR"
+ 
