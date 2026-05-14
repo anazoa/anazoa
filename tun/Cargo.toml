@@ -17,7 +17,13 @@ toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tun-rs = { version = "2", features = ["async"] }
+
+# For raylib
 cxx = "1"
+
+# For Noise authentication
+base64 = "0.22"
+snow = "0.10"
 
 libwebrtc = { version = "0.3.30", default-features = false }
 webrtc-sys = "0.3.28"

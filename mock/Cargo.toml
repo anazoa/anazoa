@@ -24,6 +24,7 @@ tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-threa
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
+snow = "0.10"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
 lz4_flex = "0.13"

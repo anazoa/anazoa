@@ -3,6 +3,15 @@ token = ""
 signaling-user-id = "0"
 remote-peer-id = 0
 
+# Noise KK mutual authentication (optional but strongly recommended).
+# Each peer has its own key pair; peers exchange public keys out-of-band.
+# Generate a key pair with: anazoa-auth genkey
+#   or: wg genkey | tee my.key | wg pubkey > my.pub
+# The callee withholds video (and thus all tunnel data) until the Noise KK
+# handshake completes successfully in the audio stream.
+# noise-privkey = "<your private key>"
+# noise-peer-pubkey = "<remote peer's public key>"
+
 # Generate VAD metadata via scripts/vad.sh first
 media = "TheIdiot_01-15_LibriVox.opus"
 media-video-resolution = "1280x720"

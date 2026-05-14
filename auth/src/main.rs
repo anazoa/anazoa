@@ -12,7 +12,23 @@ pub struct LocalAuthConfig {
 
 fn usage() -> ! {
     eprintln!("usage: anazoa-auth [-c config.toml] login --phone <phone>");
+    eprintln!("       anazoa-auth genkey");
     std::process::exit(1);
+}
+
+fn genkey() -> ! {
+    use base64::Engine as _;
+    let pattern: snow::params::NoiseParams = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let keypair = snow::Builder::new(pattern)
+        .generate_keypair()
+        .expect("generate keypair");
+    let enc = base64::engine::general_purpose::STANDARD;
+    println!("noise-privkey = \"{}\"", enc.encode(&keypair.private));
+    println!(
+        "noise-peer-pubkey = \"{}\"  # share this with the other peer",
+        enc.encode(&keypair.public)
+    );
+    std::process::exit(0);
 }
 
 fn version() -> ! {
@@ -30,6 +46,7 @@ async fn main() -> Result<()> {
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--version" => version(),
+            "genkey" => genkey(),
             "-c" => {
                 config_path = args
                     .next()

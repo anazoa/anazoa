@@ -326,6 +326,9 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
     let caller_config = tmpdir.join("caller.toml");
     let calltaker_sock = tmpdir.join("calltaker.sock");
     let caller_sock = tmpdir.join("caller.sock");
+
+    let (calltaker_privkey, calltaker_pubkey, caller_privkey, caller_pubkey) =
+        generate_noise_keypairs();
     write_tun_config(
         &calltaker_config,
         &cli.tun_name,
@@ -335,6 +338,8 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         media_path.as_deref(),
         &tmpdir,
         &calltaker_sock,
+        &calltaker_privkey,
+        &caller_pubkey,
     )?;
     write_tun_config(
         &caller_config,
@@ -345,6 +350,8 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         media_path.as_deref(),
         &tmpdir,
         &caller_sock,
+        &caller_privkey,
+        &calltaker_pubkey,
     )?;
 
     let calltaker_args = tun_args(&calltaker_config);
@@ -656,6 +663,8 @@ fn write_tun_config(
     media_path: Option<&Path>,
     log_dir: &Path,
     daemon_socket: &Path,
+    noise_privkey: &str,
+    noise_peer_pubkey: &str,
 ) -> Result<()> {
     let media_line = media_path
         .map(|p| format!("media = \"{}\"\n", p.display()))
@@ -691,6 +700,9 @@ remote-peer-id = {peer_id}
 media-video-resolution = "{DEFAULT_VIDEO_RESOLUTION}"
 {media_line}ctl-socket = "{daemon_socket}"
 tun-name = "{tun_name}"
+
+noise-privkey = "{noise_privkey}"
+noise-peer-pubkey = "{noise_peer_pubkey}"
 
 [debug]
 level = "debug"
@@ -998,6 +1010,24 @@ fn file_contains(path: &Path, needle: &str) -> Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("open {}", path.display())),
     }
+}
+
+fn generate_noise_keypairs() -> (String, String, String, String) {
+    use base64::Engine as _;
+    let pattern: snow::params::NoiseParams = "Noise_KK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+    let kp_a = snow::Builder::new(pattern.clone())
+        .generate_keypair()
+        .expect("generate calltaker keypair");
+    let kp_b = snow::Builder::new(pattern)
+        .generate_keypair()
+        .expect("generate caller keypair");
+    let enc = base64::engine::general_purpose::STANDARD;
+    (
+        enc.encode(&kp_a.private),
+        enc.encode(&kp_a.public),
+        enc.encode(&kp_b.private),
+        enc.encode(&kp_b.public),
+    )
 }
 
 fn strip_prefix_len(cidr: &str) -> Result<&str> {

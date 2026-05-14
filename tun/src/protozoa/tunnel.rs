@@ -3,8 +3,24 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::media::{VIDEO_HEIGHT, VIDEO_WIDTH};
+use super::noise::{
+    NOISE_KEYS, NOISE_MSG_SIZE, noise_process_incoming, noise_reset_state, noise_try_inject,
+};
 use super::vp9::VP9_BLACK_KEYFRAMES;
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
+
+// Re-export the noise public API so callers only need to import from this module.
+pub use super::noise::{NoiseRole, init_noise_keys, noise_auth_failed};
+
+/// Reset noise and tunnel auth state for a new call.
+pub fn prepare_noise_for_call(role: NoiseRole) {
+    noise_reset_state(role);
+    if let Some(ts) = TUNNEL_STATE.get()
+        && NOISE_KEYS.get().is_some()
+    {
+        ts.authenticated.store(false, Ordering::Relaxed);
+    }
+}
 
 use anyhow::{Context, Result, anyhow, bail};
 use bytes::{Buf, BufMut};
@@ -112,6 +128,10 @@ pub struct TunnelState {
     /// Updated on every outbound keyframe with the actual encoder output.
     pub vp9_keyframe_cache: Mutex<HashMap<(u16, u16), Vec<u8>>>,
 
+    /// Set to true once the Noise KK handshake completes successfully.
+    /// Always true when Noise authentication is not configured.
+    pub authenticated: AtomicBool,
+
     pub hook_encode_calls: AtomicU64,
     pub hook_reference_calls: AtomicU64,
     pub tun_read_packets: AtomicU64,
@@ -143,6 +163,7 @@ impl TunnelState {
             webm_mux: Mutex::new(webm_mux),
             next_packet_id: AtomicU32::new(rand::random()),
             vp9_replacement_needs_keyframe: AtomicBool::new(true),
+            authenticated: AtomicBool::new(NOISE_KEYS.get().is_none()),
             hook_encode_calls: AtomicU64::new(0),
             hook_reference_calls: AtomicU64::new(0),
             tun_read_packets: AtomicU64::new(0),
@@ -889,6 +910,35 @@ pub type OpusDecodeHook = unsafe extern "C" fn(*mut u8, usize, u32) -> usize;
 pub static KEEP_OPUS_HOOKS: (OpusEncodeHook, OpusDecodeHook) =
     (hook_after_opus_encode, hook_before_opus_decode);
 
+fn after_opus_encode(payload: &mut [u8]) -> bool {
+    if noise_try_inject(payload) {
+        return true;
+    }
+    // WebM logging (side effect only; no payload change).
+    if let Some(state) = TUNNEL_STATE.get()
+        && let Ok(mut mux) = state.webm_mux.lock()
+        && let Some(ref mut webm) = *mux
+    {
+        webm.write_audio_packet(payload);
+    }
+    false
+}
+
+fn before_opus_decode(payload: &mut [u8]) -> usize {
+    let Some(tunnel) = TUNNEL_STATE.get() else {
+        return 0;
+    };
+    let authenticated = tunnel.authenticated.load(Ordering::Relaxed);
+    let Some((new_size, just_authenticated)) = noise_process_incoming(payload, authenticated)
+    else {
+        return 0;
+    };
+    if just_authenticated {
+        tunnel.authenticated.store(true, Ordering::Relaxed);
+    }
+    new_size
+}
+
 /// # Safety
 ///
 /// Called from patched libwebrtc after Opus encoding, before RTP packetization.
@@ -899,14 +949,10 @@ pub unsafe extern "C" fn hook_after_opus_encode(
     len: usize,
     _rtp_timestamp: u32,
 ) -> bool {
-    if let Some(state) = TUNNEL_STATE.get()
-        && let Ok(mut mux) = state.webm_mux.lock()
-        && let Some(ref mut webm) = *mux
-    {
-        let data = unsafe { std::slice::from_raw_parts(payload, len) };
-        webm.write_audio_packet(data);
+    if payload.is_null() || len == 0 {
+        return false;
     }
-    false
+    after_opus_encode(unsafe { std::slice::from_raw_parts_mut(payload, len) })
 }
 
 /// # Safety
@@ -915,11 +961,14 @@ pub unsafe extern "C" fn hook_after_opus_encode(
 /// Modifies `payload` in place; returns the new size, or 0 if unchanged.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hook_before_opus_decode(
-    _payload: *mut u8,
-    _len: usize,
+    payload: *mut u8,
+    len: usize,
     _rtp_timestamp: u32,
 ) -> usize {
-    0
+    if payload.is_null() || len < NOISE_MSG_SIZE {
+        return 0;
+    }
+    before_opus_decode(unsafe { std::slice::from_raw_parts_mut(payload, len) })
 }
 
 pub fn keep_opus_hooks_linked() {

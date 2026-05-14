@@ -34,6 +34,12 @@ pub struct Config {
         default = "default_oneme_keepalive_secs"
     )]
     pub oneme_keepalive_secs: u64,
+    /// Base64-encoded 32-byte X25519 private key for Noise KK authentication.
+    #[serde(rename = "noise-privkey", default)]
+    pub noise_privkey: Option<String>,
+    /// Base64-encoded 32-byte X25519 public key of the remote peer.
+    #[serde(rename = "noise-peer-pubkey", default)]
+    pub noise_peer_pubkey: Option<String>,
 }
 
 pub const DEFAULT_ONEME_KEEPALIVE_SECS: u64 = 25;

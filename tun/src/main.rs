@@ -24,8 +24,9 @@ use protozoa::media::{
     send_i420_video_frame,
 };
 use protozoa::tunnel::{
-    OUTBOUND_QUEUE_MAX_PACKETS, TUNNEL_STATE, finalize_webm, keep_opus_hooks_linked,
-    keep_vp9_hooks_linked, start_tun_bridge, unpack_resolution,
+    NoiseRole, OUTBOUND_QUEUE_MAX_PACKETS, TUNNEL_STATE, finalize_webm, init_noise_keys,
+    keep_opus_hooks_linked, keep_vp9_hooks_linked, noise_auth_failed, prepare_noise_for_call,
+    start_tun_bridge, unpack_resolution,
 };
 use protozoa::vp9::{VP9_BLACK_KEYFRAMES, parse_resolution};
 use protozoa::webrtc::{
@@ -39,6 +40,9 @@ use webrtc_sys::peer_connection::ffi::PeerConnectionState;
 
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(60);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+// NOISE_CHECK_FRAMES covers ~4 s at 50 fps; 10 s leaves headroom for slow ICE/DTLS
+// before audio begins. noise_auth_failed() via custom_tick is the normal failure path.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── call execution ────────────────────────────────────────────────────────────
 
@@ -128,8 +132,10 @@ async fn drive_call(
     video_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut custom_tick = interval(Duration::from_secs(5));
     custom_tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let auth_deadline = tokio::time::sleep(AUTH_TIMEOUT);
 
     let silence = vec![0i16; AUDIO_FRAME_SAMPLES * AUDIO_CHANNELS as usize];
+    tokio::pin!(auth_deadline);
 
     loop {
         tokio::select! {
@@ -184,6 +190,12 @@ async fn drive_call(
             }
 
             _ = video_tick.tick() => {
+                let authenticated = TUNNEL_STATE
+                    .get()
+                    .is_none_or(|s| s.authenticated.load(std::sync::atomic::Ordering::Relaxed));
+                if !authenticated {
+                    continue;
+                }
                 let result = if let Some(media) = media.as_mut() {
                     let frame_count = media.frame_count;
                     if frame_count % 150 == 0 {
@@ -205,10 +217,25 @@ async fn drive_call(
             }
 
             _ = custom_tick.tick() => {
+                if noise_auth_failed() {
+                    warn!("Noise KK authentication failed, hanging up");
+                    break;
+                }
                 if let Err(err) = signaling.send_custom_data().await {
                     debug!("custom-data send failed: {err:#}");
                 }
                 log_tunnel_stats();
+            }
+
+            _ = &mut auth_deadline => {
+                if noise_auth_failed()
+                    || TUNNEL_STATE
+                        .get()
+                        .is_some_and(|s| !s.authenticated.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    warn!("Noise KK authentication deadline exceeded, hanging up");
+                    break;
+                }
             }
 
             cmd = cmd_rx.recv() => {
@@ -441,6 +468,7 @@ async fn run_incoming_call(
     video_height: u32,
 ) {
     info!("incoming call from peer {}", incoming.caller_id);
+    prepare_noise_for_call(NoiseRole::Responder);
 
     let turn = incoming.turn.clone();
 
@@ -506,6 +534,7 @@ async fn run_outgoing_call(
     video_height: u32,
 ) {
     info!("placing call to {peer_id}");
+    prepare_noise_for_call(NoiseRole::Initiator);
     let started = match oneme.lock().await.start_outgoing_call(peer_id).await {
         Ok(s) => s,
         Err(err) => {
@@ -849,6 +878,16 @@ fn extract_ice_ufrag(sdp: &str) -> Option<String> {
 
 // ── entry point ───────────────────────────────────────────────────────────────
 
+fn parse_noise_key(b64: &str) -> Result<[u8; 32]> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim())
+        .context("noise key is not valid base64")?;
+    bytes
+        .try_into()
+        .map_err(|v: Vec<u8>| anyhow!("noise key must decode to 32 bytes, got {}", v.len()))
+}
+
 fn usage() -> ! {
     eprintln!("usage: anazoa-tun [-c config.toml]");
     std::process::exit(1);
@@ -884,6 +923,20 @@ async fn main() -> Result<()> {
     }
     keep_vp9_hooks_linked();
     keep_opus_hooks_linked();
+
+    match (
+        cfg.noise_privkey.as_deref().filter(|s| !s.is_empty()),
+        cfg.noise_peer_pubkey.as_deref().filter(|s| !s.is_empty()),
+    ) {
+        (Some(priv_b64), Some(pub_b64)) => {
+            let privkey = parse_noise_key(priv_b64)?.to_vec();
+            let peer_pubkey = parse_noise_key(pub_b64)?.to_vec();
+            init_noise_keys(privkey, peer_pubkey);
+            info!("Noise KK authentication enabled");
+        }
+        (None, None) => {}
+        _ => bail!("noise-privkey and noise-peer-pubkey must both be set or both omitted"),
+    }
 
     let log_dir = cfg.auth.debug.log_dir.as_deref().map(std::path::Path::new);
     let tun_name = cfg.tun_name.as_deref().context("missing tun-name")?;
