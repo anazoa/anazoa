@@ -51,7 +51,7 @@ jobs:
             - name: Patch livekit/webrtc-sys
               run: |
                   cp patches/hooks-opus.patch patches/hooks-vp9.patch livekit/webrtc-sys/libwebrtc/patches/
-                  git -C livekit apply ../patches/webrtc-sys.patch
+                  git -C livekit apply ../patches/livekit.patch
 
             - name: Free disk space
               if: steps.webrtc-cache.outputs.cache-hit != 'true'
@@ -193,8 +193,8 @@ jobs:
             - uses: softprops/action-gh-release@v3
               with:
                   files: |
-                    anazoa-${{ matrix.arch }}.tar.gz
-                    libwebrtc-linux-${{ matrix.arch }}-dev.tar.gz
+                      anazoa-${{ matrix.arch }}.tar.gz
+                      libwebrtc-linux-${{ matrix.arch }}-dev.tar.gz
 
     docker:
         needs: build

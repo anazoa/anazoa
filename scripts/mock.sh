@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eux
 
-export LK_CUSTOM_WEBRTC=livekit/webrtc-sys/libwebrtc/linux-x64-release
+export LK_CUSTOM_WEBRTC=$(pwd)/livekit/webrtc-sys/libwebrtc/linux-x64-release
+
+# export LK_DEBUG_WEBRTC=true
+# export LK_CUSTOM_WEBRTC=$(pwd)/livekit/webrtc-sys/libwebrtc/linux-x64-debug
 
 # cargo clean -p webrtc-sys --release
 cargo build --release
