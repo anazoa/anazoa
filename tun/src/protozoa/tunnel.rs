@@ -706,18 +706,8 @@ impl PartialPacket {
     }
 }
 
-pub type Vp9EncodeHook =
-    unsafe extern "C" fn(*const u8, usize, *mut u8, *mut usize, usize, u32, bool) -> bool;
-pub type Vp9ReferenceHook = unsafe extern "C" fn(
-    *const u8,
-    usize,
-    *mut u8,
-    *mut usize,
-    usize,
-    u32,
-    bool,
-    *mut bool,
-) -> bool;
+pub type Vp9EncodeHook = unsafe extern "C" fn(*mut u8, usize, u32, bool) -> bool;
+pub type Vp9ReferenceHook = unsafe extern "C" fn(*mut u8, usize, u32, bool, *mut bool) -> usize;
 
 #[used]
 pub static KEEP_VP9_HOOKS: (Vp9EncodeHook, Vp9ReferenceHook) =
@@ -725,73 +715,55 @@ pub static KEEP_VP9_HOOKS: (Vp9EncodeHook, Vp9ReferenceHook) =
 
 /// # Safety
 ///
-/// Called from patched libwebrtc VP9 encoder code. `output_len` must be valid
-/// for writes. When `output` is non-null, it must point to a writable buffer of
-/// at least `output_capacity` bytes.
+/// Called from patched libwebrtc VP9 encoder code. `payload` must point to a
+/// readable and writable buffer of exactly `len` bytes; the hook modifies it
+/// in place and always produces output of the same length.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hook_after_vp9_encode(
-    input: *const u8,
-    input_len: usize,
-    output: *mut u8,
-    output_len: *mut usize,
-    output_capacity: usize,
+    payload: *mut u8,
+    len: usize,
     _rtp_timestamp: u32,
     is_key_frame: bool,
 ) -> bool {
-    let _ = input;
-    if output_len.is_null() {
+    if payload.is_null() || len == 0 {
         return false;
     }
-    unsafe {
-        *output_len = input_len;
-    }
-    if output.is_null() {
-        return true;
-    }
-    if output_capacity < input_len {
-        return false;
-    }
+    let buf = unsafe { std::slice::from_raw_parts_mut(payload, len) };
 
     if let Some(state) = TUNNEL_STATE.get() {
         state.hook_encode_calls.fetch_add(1, Ordering::Relaxed);
 
-        // 1. Log original VP9 frame; on keyframes update resolution and keyframe cache.
-        if !input.is_null() && input_len > 0 {
-            let orig_frame = unsafe { std::slice::from_raw_parts(input, input_len) };
-            if let Ok(mut mux) = state.webm_mux.lock()
-                && let Some(ref mut webm) = *mux
-            {
-                webm.write_video_frame(orig_frame, is_key_frame);
+        // Read the original frame before overwriting, for webm mux and keyframe cache.
+        let orig = buf.to_vec();
+        if let Ok(mut mux) = state.webm_mux.lock()
+            && let Some(ref mut webm) = *mux
+        {
+            webm.write_video_frame(&orig, is_key_frame);
+        }
+        if is_key_frame && let Some((w, h)) = vp9_keyframe_dimensions(&orig) {
+            let prev = unpack_resolution(
+                state
+                    .encoder_resolution
+                    .swap(pack_resolution(w, h), Ordering::Relaxed),
+            );
+            if prev != (w, h) {
+                info!("encoder resolution changed: {w}×{h}");
             }
-            if is_key_frame && let Some((w, h)) = vp9_keyframe_dimensions(orig_frame) {
-                let prev = unpack_resolution(
-                    state
-                        .encoder_resolution
-                        .swap(pack_resolution(w, h), Ordering::Relaxed),
-                );
-                if prev != (w, h) {
-                    info!("encoder resolution changed: {w}×{h}");
-                }
-                if let Ok(mut cache) = state.vp9_keyframe_cache.lock() {
-                    cache.insert((w, h), orig_frame.to_vec());
-                }
+            if let Ok(mut cache) = state.vp9_keyframe_cache.lock() {
+                cache.insert((w, h), orig);
             }
         }
 
-        // 2. Prepare 'out' for tunnel injection.
-        let out = unsafe { std::slice::from_raw_parts_mut(output, input_len) };
-        out.fill(FRAME_KIND_PADDING);
-
-        // 3. Inject tunnel frames.
+        buf.fill(FRAME_KIND_PADDING);
         let sender_res = unpack_resolution(state.encoder_resolution.load(Ordering::Relaxed));
-        let is_data = if let Some(frame) = next_tunnel_frame(input_len, is_key_frame, sender_res)
-            && frame.len() <= input_len
+        let is_data = if let Some(frame) = next_tunnel_frame(len, is_key_frame, sender_res)
+            && frame.len() <= len
         {
-            out[..frame.len()].copy_from_slice(&frame);
+            buf[..frame.len()].copy_from_slice(&frame);
             state.tunnel_frames_sent.fetch_add(1, Ordering::Relaxed);
             state
                 .tunnel_frame_bytes_sent
-                .fetch_add(input_len as u64, Ordering::Relaxed);
+                .fetch_add(len as u64, Ordering::Relaxed);
             true
         } else {
             false
@@ -811,52 +783,50 @@ pub unsafe extern "C" fn hook_after_vp9_encode(
 /// # Safety
 ///
 /// Called from patched libwebrtc after VP9 RTP payloads are depacketized and
-/// decrypted, but before the VP9 reference finder sees the frame. `output_len`
-/// must be valid for writes. When `output` is non-null, it must point to a
-/// writable buffer of at least `output_capacity` bytes. `output_is_key_frame`
+/// decrypted, but before the VP9 reference finder sees the frame. `payload`
+/// must point to a readable and writable buffer of exactly `len` bytes; the
+/// hook overwrites it in place with a replacement frame and returns the new
+/// length. Returns 0 if no replacement was written. `output_is_key_frame`
 /// may be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hook_before_vp9_reference_find(
-    input: *const u8,
-    input_len: usize,
-    output: *mut u8,
-    output_len: *mut usize,
-    output_capacity: usize,
+    payload: *mut u8,
+    len: usize,
     _rtp_timestamp: u32,
     is_key_frame: bool,
     output_is_key_frame: *mut bool,
-) -> bool {
+) -> usize {
     if !output_is_key_frame.is_null() {
         unsafe {
             *output_is_key_frame = is_key_frame;
         }
     }
-    if !output_len.is_null() {
-        unsafe {
-            *output_len = 0;
-        }
-    }
     let Some(state) = TUNNEL_STATE.get() else {
-        return false;
+        return 0;
     };
     state.hook_reference_calls.fetch_add(1, Ordering::Relaxed);
 
+    if payload.is_null() || len == 0 {
+        return 0;
+    }
+
     let mut carrier_is_key_frame = None;
-    if output.is_null() && !input.is_null() && input_len > 0 {
-        let frame = unsafe { std::slice::from_raw_parts(input, input_len) };
+    {
+        let frame = unsafe { std::slice::from_raw_parts(payload, len) };
         if let Some((kf, w, h)) = handle_inbound_tunnel_frame(frame) {
             carrier_is_key_frame = Some(kf);
             state.tunnel_frames_received.fetch_add(1, Ordering::Relaxed);
             state
                 .tunnel_frame_bytes_received
-                .fetch_add(input_len as u64, Ordering::Relaxed);
+                .fetch_add(len as u64, Ordering::Relaxed);
             if w > 0 && h > 0 {
                 state
                     .remote_vp9_resolution
                     .store(pack_resolution(w, h), Ordering::Relaxed);
             }
         }
-    }
+    } // immutable borrow of payload ends here
+
     let replacement_is_key_frame = state.vp9_replacement_needs_keyframe.load(Ordering::Relaxed)
         || carrier_is_key_frame.unwrap_or(is_key_frame);
 
@@ -891,23 +861,17 @@ pub unsafe extern "C" fn hook_before_vp9_reference_find(
             *output_is_key_frame = replacement_is_key_frame;
         }
     }
-    if !output_len.is_null() {
-        unsafe {
-            *output_len = replacement.len();
-        }
+
+    if replacement.is_empty() || replacement.len() > len {
+        return 0;
     }
-    if output.is_null() {
-        return true;
-    }
-    if output_capacity < replacement.len() {
-        return false;
-    }
-    let out = unsafe { std::slice::from_raw_parts_mut(output, replacement.len()) };
+
+    let out = unsafe { std::slice::from_raw_parts_mut(payload, replacement.len()) };
     out.copy_from_slice(replacement);
     state
         .vp9_replacement_needs_keyframe
         .store(false, Ordering::Relaxed);
-    true
+    replacement.len()
 }
 
 pub fn keep_vp9_hooks_linked() {
@@ -918,10 +882,8 @@ pub fn keep_vp9_hooks_linked() {
 // Opus audio hooks
 // ---------------------------------------------------------------------------
 
-pub type OpusEncodeHook =
-    unsafe extern "C" fn(*const u8, usize, *mut u8, *mut usize, usize, u32) -> bool;
-pub type OpusDecodeHook =
-    unsafe extern "C" fn(*const u8, usize, *mut u8, *mut usize, usize, u32) -> bool;
+pub type OpusEncodeHook = unsafe extern "C" fn(*mut u8, usize, u32) -> bool;
+pub type OpusDecodeHook = unsafe extern "C" fn(*mut u8, usize, u32) -> usize;
 
 #[used]
 pub static KEEP_OPUS_HOOKS: (OpusEncodeHook, OpusDecodeHook) =
@@ -930,27 +892,18 @@ pub static KEEP_OPUS_HOOKS: (OpusEncodeHook, OpusDecodeHook) =
 /// # Safety
 ///
 /// Called from patched libwebrtc after Opus encoding, before RTP packetization.
-/// `output_len` must be valid for writes. When `output` is non-null, it must
-/// point to a writable buffer of at least `output_capacity` bytes.
-/// Return true and write to `output` to replace the payload; return false to leave it unchanged.
+/// Modifies `payload` in place; returns true if the payload was changed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hook_after_opus_encode(
-    input: *const u8,
-    input_len: usize,
-    output: *mut u8,
-    _output_len: *mut usize,
-    _output_capacity: usize,
+    payload: *mut u8,
+    len: usize,
     _rtp_timestamp: u32,
 ) -> bool {
-    // Snoop on the first (size-query) call only; return false to leave payload unchanged.
-    if output.is_null()
-        && !input.is_null()
-        && input_len > 0
-        && let Some(state) = TUNNEL_STATE.get()
+    if let Some(state) = TUNNEL_STATE.get()
         && let Ok(mut mux) = state.webm_mux.lock()
         && let Some(ref mut webm) = *mux
     {
-        let data = unsafe { std::slice::from_raw_parts(input, input_len) };
+        let data = unsafe { std::slice::from_raw_parts(payload, len) };
         webm.write_audio_packet(data);
     }
     false
@@ -959,19 +912,14 @@ pub unsafe extern "C" fn hook_after_opus_encode(
 /// # Safety
 ///
 /// Called from patched libwebrtc before inserting a received Opus payload into NetEQ.
-/// `output_len` must be valid for writes. When `output` is non-null, it must
-/// point to a writable buffer of at least `output_capacity` bytes.
-/// Return true and write to `output` to replace the payload; return false to leave it unchanged.
+/// Modifies `payload` in place; returns the new size, or 0 if unchanged.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hook_before_opus_decode(
-    _input: *const u8,
-    _input_len: usize,
-    _output: *mut u8,
-    _output_len: *mut usize,
-    _output_capacity: usize,
+    _payload: *mut u8,
+    _len: usize,
     _rtp_timestamp: u32,
-) -> bool {
-    false
+) -> usize {
+    0
 }
 
 pub fn keep_opus_hooks_linked() {
