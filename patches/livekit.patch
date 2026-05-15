@@ -36,7 +36,7 @@ index 5499d006..1bf026a9 100644
 -env_logger = { workspace = true }
 +env_logger = "0.11"
 diff --git a/webrtc-sys/build.rs b/webrtc-sys/build.rs
-index 4535fc5e..3766443f 100644
+index 4535fc5e..5ec96f2c 100644
 --- a/webrtc-sys/build.rs
 +++ b/webrtc-sys/build.rs
 @@ -23,7 +23,8 @@ fn main() {
@@ -49,7 +49,16 @@ index 4535fc5e..3766443f 100644
  
      println!("cargo:rerun-if-env-changed=LK_DEBUG_WEBRTC");
      println!("cargo:rerun-if-env-changed=LK_CUSTOM_WEBRTC");
-@@ -171,11 +172,13 @@ fn main() {
+@@ -127,8 +128,6 @@ fn main() {
+         builder.define(key.as_str(), value);
+     }
+ 
+-    // Link webrtc library
+-    println!("cargo:rustc-link-lib=static=webrtc");
+     match target_os.as_str() {
+         "windows" => {
+             println!("cargo:rustc-link-lib=dylib=msdmo");
+@@ -171,11 +170,13 @@ fn main() {
              println!("cargo:rustc-link-lib=dylib=pthread");
              println!("cargo:rustc-link-lib=dylib=m");
  
@@ -67,6 +76,17 @@ index 4535fc5e..3766443f 100644
              }
  
              add_lazy_load_so(
+@@ -324,6 +325,10 @@ fn main() {
+     builder.define("LIVEKIT_TEST", None);
+     builder.warnings(false).compile("webrtcsys-cxx");
+ 
++    // Link webrtc after webrtcsys-cxx so GNU ld sees the undefined references
++    // from webrtcsys-cxx before scanning the archive, pulling in the right objects.
++    println!("cargo:rustc-link-lib=static=webrtc");
++
+     for entry in glob::glob("./src/**/*.cpp").unwrap() {
+         println!("cargo:rerun-if-changed={}", entry.unwrap().display());
+     }
 diff --git a/webrtc-sys/build/Cargo.toml b/webrtc-sys/build/Cargo.toml
 index 72b86528..0d36a066 100644
 --- a/webrtc-sys/build/Cargo.toml

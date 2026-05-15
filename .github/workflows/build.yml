@@ -71,8 +71,8 @@ jobs:
             - name: Install WebRTC build dependencies
               if: steps.webrtc-cache.outputs.cache-hit != 'true'
               run: |
-                  sudo apt-get update
-                  sudo apt-get install -y \
+                  sudo apt update
+                  sudo apt install -y \
                     python3 python3-pip \
                     build-essential \
                     git curl lsb-release \
@@ -117,24 +117,24 @@ jobs:
 
             - name: Install build tools
               run: |
-                  sudo apt-get update
-                  sudo apt-get install -y cmake musl-tools
+                  sudo apt update
+                  sudo apt install -y cmake musl-tools
                   if [ "${{ matrix.arch }}" = "aarch64" ]; then
-                    sudo apt-get update
-                    sudo apt-get install -y \
+                    sudo apt update
+                    sudo apt install -y \
                       gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
                   fi
 
             - name: Test
               env:
-                  LK_CUSTOM_WEBRTC: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
+                  LK_CUSTOM_WEBRTC: ${{ github.workspace }}/livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
                   PKG_CONFIG_SYSROOT_DIR: ${{ matrix.pkg_config_sysroot }}
                   PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
               run: cargo test ${{ matrix.test_flags }}
 
             - name: Build anazoa-tun
               env:
-                  LK_CUSTOM_WEBRTC: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
+                  LK_CUSTOM_WEBRTC: ${{ github.workspace }}/livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
                   PKG_CONFIG_SYSROOT_DIR: ${{ matrix.pkg_config_sysroot }}
                   PKG_CONFIG_PATH: ${{ matrix.pkg_config_path }}
               run: cargo build --release --bin anazoa-tun --target ${{ matrix.dynamic_target }}
