@@ -1,143 +1,11 @@
-diff --git a/libwebrtc/Cargo.toml b/libwebrtc/Cargo.toml
-index aab4ff18..8bf50fc8 100644
---- a/libwebrtc/Cargo.toml
-+++ b/libwebrtc/Cargo.toml
-@@ -1,11 +1,11 @@
- [package]
- name = "libwebrtc"
- version = "0.3.30"
--edition.workspace = true
-+edition = "2021"
- homepage = "https://livekit.io"
--license.workspace = true
-+license = "Apache-2.0"
- description = "Livekit safe bindings to libwebrtc"
--repository.workspace = true
-+repository = "https://github.com/livekit/rust-sdks"
- 
- [features]
- default = [ "glib-main-loop" ]
-@@ -16,11 +16,11 @@ default = [ "glib-main-loop" ]
- glib-main-loop = [ "dep:glib" ]
- 
- [dependencies]
--livekit-protocol = { workspace = true }
--log = { workspace = true }
--serde = { workspace = true, features = ["derive"] }
--serde_json = { workspace = true }
--thiserror = { workspace = true }
-+livekit-protocol = { version = "0.7.5", path = "../livekit-protocol" }
-+log = "0.4"
-+serde = { version = "1", features = ["derive"] }
-+serde_json = "1.0"
-+thiserror = "2"
- 
- [target.'cfg(any(target_os = "linux", target_os = "freebsd"))'.dependencies]
- glib = { version = "0.21.3", optional = true }
-@@ -29,11 +29,11 @@ glib = { version = "0.21.3", optional = true }
- jni = "0.21"
- 
- [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
--webrtc-sys = { workspace = true }
--livekit-runtime = { workspace = true }
--lazy_static = { workspace = true }
--parking_lot = { workspace = true }
--tokio = { workspace = true, default-features = false, features = ["sync", "macros"] }
-+webrtc-sys = { version = "0.3.28", path = "../webrtc-sys" }
-+livekit-runtime = { version = "0.4.0", path = "../livekit-runtime" }
-+lazy_static = "1.4"
-+parking_lot = "0.12"
-+tokio = { version = "1", default-features = false, features = ["sync", "macros"] }
- cxx = "1.0"
- rtrb = "0.3.3"
- 
-@@ -58,4 +58,4 @@ web-sys = { version = "0.3", features = [
- ] }
- 
- [dev-dependencies]
--env_logger = { workspace = true }
-+env_logger = "0.11"
-diff --git a/livekit-protocol/Cargo.toml b/livekit-protocol/Cargo.toml
-index efb29837..ea935fda 100644
---- a/livekit-protocol/Cargo.toml
-+++ b/livekit-protocol/Cargo.toml
-@@ -1,23 +1,23 @@
- [package]
- name = "livekit-protocol"
- version = "0.7.5"
--edition.workspace = true
--license.workspace = true
-+edition = "2021"
-+license = "Apache-2.0"
- description = "Livekit protocol and utilities for the Rust SDK"
--repository.workspace = true
-+repository = "https://github.com/livekit/rust-sdks"
- 
- [dependencies]
--livekit-runtime = { workspace = true }
--tokio = { workspace = true, default-features = false, features = [
-+livekit-runtime = { version = "0.4.0", path = "../livekit-runtime" }
-+tokio = { version = "1", default-features = false, features = [
-     "sync",
-     "macros",
-     "rt",
- ] }
--futures-util = { workspace = true, features = ["sink"] }
--parking_lot = { workspace = true }
-+futures-util = { version = "0.3", default-features = false, features = ["sink"] }
-+parking_lot = "0.12"
- prost = "0.12"
- 
--serde = { workspace = true }
-+serde = "1"
- pbjson = "0.6"
- pbjson-types = "0.6"
--thiserror = { workspace = true }
-+thiserror = "2"
-diff --git a/livekit-runtime/Cargo.toml b/livekit-runtime/Cargo.toml
-index 59d43059..24a2a5fe 100644
---- a/livekit-runtime/Cargo.toml
-+++ b/livekit-runtime/Cargo.toml
-@@ -1,10 +1,10 @@
- [package]
- name = "livekit-runtime"
- version = "0.4.0"
--license.workspace = true
-+license = "Apache-2.0"
- description = "Async runtime compatibility layer for LiveKit"
--edition.workspace = true
--repository.workspace = true
-+edition = "2021"
-+repository = "https://github.com/livekit/rust-sdks"
- 
- [features]
- default = ["tokio"]
-@@ -18,7 +18,7 @@ dispatcher = ["dep:futures", "dep:async-io", "dep:async-std", "dep:async-task"]
- 
- [dependencies]
- # tokio
--tokio = { workspace = true, default-features = false, optional = true, features = [
-+tokio = { version = "1", default-features = false, optional = true, features = [
-     "rt",
-     "rt-multi-thread",
-     "net",
-@@ -28,7 +28,7 @@ tokio-stream = { version = "0.1.14", optional = true }
- 
- # dispatcher and async-std
- async-std = { version = "1", optional = true }
--futures = { workspace = true, optional = true }
-+futures = { version = "0.3", optional = true }
- async-io = { version = "2.3.1", optional = true }
- 
- # dispatcher
 diff --git a/webrtc-sys/Cargo.toml b/webrtc-sys/Cargo.toml
-index d1bbd8bd..222300af 100644
+index 5499d006..1bf026a9 100644
 --- a/webrtc-sys/Cargo.toml
 +++ b/webrtc-sys/Cargo.toml
 @@ -1,21 +1,21 @@
  [package]
  name = "webrtc-sys"
- version = "0.3.28"
+ version = "0.3.31"
 -edition.workspace = true
 +edition = "2021"
  homepage = "https://livekit.io"
@@ -157,7 +25,7 @@ index d1bbd8bd..222300af 100644
  
  [build-dependencies]
 -webrtc-sys-build = { workspace = true }
-+webrtc-sys-build = "0.3.15"
++webrtc-sys-build = { path = "build" }
  cxx-build = "1.0"
  glob = "0.3"
  cc = "1.0"
@@ -168,7 +36,7 @@ index d1bbd8bd..222300af 100644
 -env_logger = { workspace = true }
 +env_logger = "0.11"
 diff --git a/webrtc-sys/build.rs b/webrtc-sys/build.rs
-index 072794ec..d05b4082 100644
+index 4535fc5e..3766443f 100644
 --- a/webrtc-sys/build.rs
 +++ b/webrtc-sys/build.rs
 @@ -23,7 +23,8 @@ fn main() {
@@ -181,7 +49,7 @@ index 072794ec..d05b4082 100644
  
      println!("cargo:rerun-if-env-changed=LK_DEBUG_WEBRTC");
      println!("cargo:rerun-if-env-changed=LK_CUSTOM_WEBRTC");
-@@ -168,11 +169,13 @@ fn main() {
+@@ -171,11 +172,13 @@ fn main() {
              println!("cargo:rustc-link-lib=dylib=pthread");
              println!("cargo:rustc-link-lib=dylib=m");
  
@@ -200,13 +68,13 @@ index 072794ec..d05b4082 100644
  
              add_lazy_load_so(
 diff --git a/webrtc-sys/build/Cargo.toml b/webrtc-sys/build/Cargo.toml
-index da530bee..e7f9e2b7 100644
+index 72b86528..0d36a066 100644
 --- a/webrtc-sys/build/Cargo.toml
 +++ b/webrtc-sys/build/Cargo.toml
 @@ -1,10 +1,10 @@
  [package]
  name = "webrtc-sys-build"
- version = "0.3.15"
+ version = "0.3.16"
 -edition.workspace = true
 -license.workspace = true
 +edition = "2021"
@@ -224,7 +92,7 @@ index da530bee..e7f9e2b7 100644
 -anyhow = { workspace = true }
 +anyhow = "1.0"
 diff --git a/webrtc-sys/build/src/lib.rs b/webrtc-sys/build/src/lib.rs
-index e830d008..a02814fa 100644
+index b21aff87..bc394783 100644
 --- a/webrtc-sys/build/src/lib.rs
 +++ b/webrtc-sys/build/src/lib.rs
 @@ -118,12 +118,13 @@ pub fn webrtc_dir() -> path::PathBuf {
@@ -248,12 +116,12 @@ index e830d008..a02814fa 100644
      let mut seen = HashSet::new();
      let mut vec = Vec::new();
 diff --git a/webrtc-sys/libwebrtc/build_linux.sh b/webrtc-sys/libwebrtc/build_linux.sh
-index 926e21be..de13d5dc 100755
+index 52ebbad1..00cf01df 100755
 --- a/webrtc-sys/libwebrtc/build_linux.sh
 +++ b/webrtc-sys/libwebrtc/build_linux.sh
-@@ -72,6 +72,9 @@ git apply "$COMMAND_DIR/patches/ssl_verify_callback_with_native_handle.patch" -v
- git apply "$COMMAND_DIR/patches/add_deps.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+@@ -78,6 +78,9 @@ git apply "$COMMAND_DIR/patches/add_deps.patch" -v --ignore-space-change --ignor
  git apply "$COMMAND_DIR/patches/fix_desktop_capture_compile.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+ git apply "$COMMAND_DIR/patches/external_audio_source.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
  
 +git apply "$COMMAND_DIR/patches/hooks-opus.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 +git apply "$COMMAND_DIR/patches/hooks-vp9.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
@@ -261,7 +129,7 @@ index 926e21be..de13d5dc 100755
  # Disable CREL (compact relocations). Chromium's build enables experimental
  # CREL via -Wa,--crel which causes segfaults on aarch64-linux (and is known
  # broken on arm32 and s390x too).
-@@ -116,12 +119,12 @@ args="is_debug=$debug  \
+@@ -125,12 +128,12 @@ args="is_debug=$debug  \
    enable_stripping=true \
    ffmpeg_branding=\"Chrome\" \
    rtc_use_h264=true \
@@ -277,12 +145,12 @@ index 926e21be..de13d5dc 100755
  
  # generate ninja files
  gn gen "$OUTPUT_DIR" --root="src" --args="${args}"
-@@ -138,7 +141,7 @@ python3 "./src/tools_webrtc/libs/generate_licenses.py" \
-   --target :default "$OUTPUT_DIR" "$OUTPUT_DIR"
+@@ -149,7 +152,7 @@ vpython3 "./src/tools_webrtc/libs/generate_licenses.py" \
+   --target :default "$OUTPUT_DIR" "$OUTPUT_DIR" || echo "Warning: License generation failed (non-critical)"
  
  cp "$OUTPUT_DIR/obj/webrtc.ninja" "$ARTIFACTS_DIR"
 -cp "$OUTPUT_DIR/obj/modules/desktop_capture/desktop_capture.ninja" "$ARTIFACTS_DIR"
 +# cp "$OUTPUT_DIR/obj/modules/desktop_capture/desktop_capture.ninja" "$ARTIFACTS_DIR"
  cp "$OUTPUT_DIR/args.gn" "$ARTIFACTS_DIR"
- cp "$OUTPUT_DIR/LICENSE.md" "$ARTIFACTS_DIR"
  
+ cp "$OUTPUT_DIR/LICENSE.md" "$ARTIFACTS_DIR"

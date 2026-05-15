@@ -5,13 +5,6 @@ resolver = "2"
 [workspace.package]
 version = "0.1.2"
 
-[patch.crates-io]
-libwebrtc = { path = "livekit/libwebrtc" }
-livekit-protocol = { path = "livekit/livekit-protocol" }
-livekit-runtime = { path = "livekit/livekit-runtime" }
-webrtc-sys = { path = "livekit/webrtc-sys" }
-webrtc-sys-build = { path = "livekit/webrtc-sys/build" }
-
 [profile.release]
 strip = true
 lto = true

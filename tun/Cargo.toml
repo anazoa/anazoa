@@ -25,8 +25,7 @@ cxx = "1"
 base64 = "0.22"
 snow = "0.10"
 
-libwebrtc = { version = "0.3.30", default-features = false }
-webrtc-sys = "0.3.28"
+webrtc-sys = { path = "../livekit/webrtc-sys" }
 ogg = "0.9.2"
 opus = "0.3.1"
 webm = "2.2.0"
