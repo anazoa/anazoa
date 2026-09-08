@@ -21,8 +21,10 @@ use crate::calls::StartedConversationInfo;
 use crate::{FingerprintConfig, ServiceEndpoints, TurnServer, ensure_rustls_provider};
 
 const ONE_ME_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+const SESSION_ID_MIN: u32 = 30;
+const SESSION_ID_RANGE: u32 = 171;
 const MAX_FRAME_LEN: usize = 1 << 20;
-const MAX_DECOMPRESSED_LEN: usize = 4 << 20;
+const MAX_DECOMPRESSED_LEN: usize = 64 << 10;
 const CMD_EVENT: u8 = 0;
 const CMD_SUCCESS: u8 = 1;
 const CMD_ERROR: u8 = 3;
@@ -116,7 +118,6 @@ struct Packet {
 pub struct OnemeClient {
     tls: TlsStream<TcpStream>,
     seq: u16,
-    seq_exhausted: bool,
     fingerprint: FingerprintConfig,
     client_session_id: u32,
     auth_token: Option<String>,
@@ -145,11 +146,10 @@ impl OnemeClient {
             .await
             .with_context(|| format!("start TLS to {host}:{port}"))?;
 
-        let client_session_id = rand::random::<u32>() % 171 + 30;
+        let client_session_id = rand::random::<u32>() % SESSION_ID_RANGE + SESSION_ID_MIN;
         let mut client = Self {
             tls,
             seq: 1,
-            seq_exhausted: false,
             fingerprint: fingerprint.clone(),
             client_session_id,
             auth_token: None,
@@ -162,15 +162,8 @@ impl OnemeClient {
     }
 
     async fn send(&mut self, opcode: u16, payload: Value) -> Result<u16> {
-        if self.seq_exhausted {
-            bail!("OneMe sequence space exhausted; reconnect required");
-        }
         let seq = self.seq;
-        if seq == u16::MAX {
-            self.seq_exhausted = true;
-        } else {
-            self.seq += 1;
-        }
+        self.seq = self.seq.wrapping_add(1);
 
         let payload = encode_json_to_msgpack(&payload)?;
         let len_field = payload.len() as u32;
@@ -594,53 +587,7 @@ fn build_tls_config(skip_tls_verify: bool) -> rustls::ClientConfig {
         .with_no_client_auth()
 }
 
-#[derive(Debug)]
-struct SkipTlsVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for SkipTlsVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-        ]
-    }
-}
+use crate::SkipTlsVerifier;
 
 fn oneme_host_port(url: &str) -> Result<(String, u16)> {
     let uri = url

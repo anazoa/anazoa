@@ -6,19 +6,6 @@ use anyhow::{Context, Result};
 use crate::oneme::SessionClient;
 use crate::{FingerprintConfig, ServiceEndpoints};
 
-const DEFAULT_ONEME_KEEPALIVE_SECS: u64 = 25;
-
-pub async fn run_login(phone: Option<String>, fingerprint: &FingerprintConfig) -> Result<()> {
-    tracing::info!("Starting login with OneMe protocol");
-    run_login_with_endpoints(
-        phone,
-        &ServiceEndpoints::default(),
-        DEFAULT_ONEME_KEEPALIVE_SECS,
-        fingerprint,
-    )
-    .await
-}
-
 pub async fn run_login_with_endpoints(
     phone: Option<String>,
     endpoints: &ServiceEndpoints,

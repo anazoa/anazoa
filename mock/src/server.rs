@@ -25,6 +25,7 @@ use wtransport::ServerConfig;
 use wtransport::endpoint::endpoint_side::Server as WtServer;
 use wtransport::tls::{Certificate as WtCertificate, CertificateChain, PrivateKey as WtPrivateKey};
 
+const MAX_ONEME_FRAME_LEN: usize = 1 << 20;
 const CALLTAKER_PARTICIPANT_ID: i64 = 1;
 const CALLER_PARTICIPANT_ID: i64 = 2;
 const CALLTAKER_EXTERNAL_ID: &str = "1001";
@@ -492,6 +493,9 @@ where
     let seq = u16::from_be_bytes([header[2], header[3]]);
     let opcode = u16::from_be_bytes([header[4], header[5]]);
     let len = u32::from_be_bytes([header[6], header[7], header[8], header[9]]) as usize;
+    if len > MAX_ONEME_FRAME_LEN {
+        anyhow::bail!("mock OneMe frame length {len} exceeds limit of {MAX_ONEME_FRAME_LEN} bytes");
+    }
     let mut payload = vec![0u8; len];
     if len > 0 {
         stream

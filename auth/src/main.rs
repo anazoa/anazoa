@@ -1,8 +1,10 @@
 use anyhow::{Result, anyhow};
 use serde::Deserialize;
 
-use anazoa_auth::run_login;
+use anazoa_auth::run_login_with_endpoints;
 use anazoa_config::{AuthConfig, init_logging, load_config};
+
+const DEFAULT_ONEME_KEEPALIVE_SECS: u64 = 25;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct LocalAuthConfig {
@@ -72,7 +74,7 @@ async fn main() -> Result<()> {
     let cfg: LocalAuthConfig = load_config(&config_path)?;
     init_logging(&cfg.auth.debug.level);
 
-    run_login(phone, &cfg.auth.fingerprint).await?;
+    run_login_with_endpoints(phone, &cfg.auth.endpoints, DEFAULT_ONEME_KEEPALIVE_SECS, &cfg.auth.fingerprint).await?;
 
     Ok(())
 }

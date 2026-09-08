@@ -12,8 +12,6 @@ pub struct ServiceEndpoints {
     pub oneme_web_url: String,
     #[serde(rename = "oneme-api-url")]
     pub oneme_api_url: String,
-    #[serde(rename = "signaling-origin")]
-    pub signaling_origin: String,
     /// Skip TLS certificate verification. Only set this for local testing.
     #[serde(rename = "skip-tls-verify", default)]
     pub skip_tls_verify: bool,
@@ -24,7 +22,6 @@ impl Default for ServiceEndpoints {
         Self {
             oneme_web_url: "https://web.max.ru".to_string(),
             oneme_api_url: "https://api.oneme.ru".to_string(),
-            signaling_origin: "https://web.max.ru".to_string(),
             skip_tls_verify: false,
         }
     }
@@ -106,7 +103,10 @@ fn parse_log_level(level: &str) -> LevelFilter {
         "warn" => LevelFilter::WARN,
         "error" => LevelFilter::ERROR,
         "off" => LevelFilter::OFF,
-        _ => LevelFilter::INFO,
+        _ => {
+            eprintln!("warning: unrecognised log level {level:?}, defaulting to INFO");
+            LevelFilter::INFO
+        }
     }
 }
 

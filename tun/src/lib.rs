@@ -26,7 +26,7 @@ pub struct Config {
     #[serde(rename = "ctl-socket", default = "default_socket_path")]
     pub ctl_socket: String,
     #[serde(rename = "tun-name")]
-    pub tun_name: Option<String>,
+    pub tun_name: String,
     #[serde(default)]
     pub privdrop: Option<String>,
     #[serde(

@@ -236,6 +236,9 @@ async fn drive_call(
                     warn!("Noise KK authentication deadline exceeded, hanging up");
                     break;
                 }
+
+                let far_future = tokio::time::Instant::now() + Duration::from_secs(u64::MAX / 2);
+                auth_deadline.as_mut().reset(far_future);
             }
 
             cmd = cmd_rx.recv() => {
@@ -599,6 +602,32 @@ async fn run_outgoing_call(
     }
 }
 
+async fn connect_session_with_retry(
+    cfg: &anazoa_tun::Config,
+    endpoints: &ServiceEndpoints,
+) -> Option<SessionClient> {
+    loop {
+        let session = tokio::select! {
+            _ = shutdown_signal() => return None,
+            r = SessionClient::establish(
+                &cfg.token,
+                endpoints,
+                cfg.oneme_keepalive_secs,
+                &cfg.auth.fingerprint,
+            ) => r,
+        };
+        match session {
+            Ok((client, _)) => return Some(client),
+            Err(err) => {
+                warn!("session: {err:#}");
+                if wait_or_shutdown(RECONNECT_DELAY).await {
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 async fn run_daemon(
     cfg: &anazoa_tun::Config,
     media: &mut Option<RaylibMedia>,
@@ -610,28 +639,11 @@ async fn run_daemon(
 
     // Establish the OneMe session once and keep it alive across calls,
     // matching Android behavior (single WebSocket for the full app session).
-    let oneme = loop {
-        let session = tokio::select! {
-            _ = shutdown_signal() => return Ok(()),
-            r = SessionClient::establish(
-                &cfg.token,
-                &endpoints,
-                cfg.oneme_keepalive_secs,
-                &cfg.auth.fingerprint,
-            ) => r,
-        };
-        match session {
-            Ok((client, _)) => break client,
-            Err(err) => {
-                warn!("session: {err:#}");
-                if wait_or_shutdown(RECONNECT_DELAY).await {
-                    return Ok(());
-                }
-            }
-        }
+    let Some(client) = connect_session_with_retry(cfg, &endpoints).await else {
+        return Ok(());
     };
     info!("OneMe session established");
-    let oneme = Arc::new(Mutex::new(oneme));
+    let oneme = Arc::new(Mutex::new(client));
 
     let mut answer_deadline: Option<Option<Instant>> = None;
     loop {
@@ -678,30 +690,11 @@ async fn run_daemon(
                 if wait_or_shutdown(RECONNECT_DELAY).await {
                     return Ok(());
                 }
-                loop {
-                    let session = tokio::select! {
-                        _ = shutdown_signal() => return Ok(()),
-                        r = SessionClient::establish(
-                            &cfg.token,
-                            &endpoints,
-                            cfg.oneme_keepalive_secs,
-                            &cfg.auth.fingerprint,
-                        ) => r,
-                    };
-                    match session {
-                        Ok((client, _)) => {
-                            *oneme.lock().await = client;
-                            info!("OneMe session re-established");
-                            break;
-                        }
-                        Err(err) => {
-                            warn!("session: {err:#}");
-                            if wait_or_shutdown(RECONNECT_DELAY).await {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
+                let Some(client) = connect_session_with_retry(cfg, &endpoints).await else {
+                    return Ok(());
+                };
+                *oneme.lock().await = client;
+                info!("OneMe session re-established");
             }
         }
     }
@@ -939,7 +932,7 @@ async fn main() -> Result<()> {
     }
 
     let log_dir = cfg.auth.debug.log_dir.as_deref().map(std::path::Path::new);
-    let tun_name = cfg.tun_name.as_deref().context("missing tun-name")?;
+    let tun_name = cfg.tun_name.as_str();
     if tun_name.is_empty() {
         bail!("tun-name must not be empty");
     }

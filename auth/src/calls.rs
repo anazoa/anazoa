@@ -49,6 +49,8 @@ pub struct StartedConversationInfo {
 type RequestBody = Full<Bytes>;
 type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, RequestBody>;
 
+const CALLS_URL: &str = "https://calls.okcdn.ru/fb.do";
+
 pub async fn login_uid(call_token: &str) -> Result<String> {
     let device_id = Uuid::new_v4().simple().to_string();
     let device_id = &device_id[..16];
@@ -61,7 +63,7 @@ pub async fn login_uid(call_token: &str) -> Result<String> {
 
     let session_data_json = serde_json::to_string(&session_data)?;
     let login_data: LoginData = post_form_json(
-        "https://calls.okcdn.ru/fb.do",
+        CALLS_URL,
         &[
             ("method", "auth.anonymLogin"),
             ("format", "JSON"),

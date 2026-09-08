@@ -157,12 +157,7 @@ async fn read_quic_varint(recv: &mut wtransport::RecvStream) -> Result<u64> {
 
 // ── Connect helpers ──────────────────────────────────────────────────────────
 
-async fn connect_signaling(
-    url: &str,
-    origin: Option<&str>,
-    skip_tls_verify: bool,
-) -> Result<SignalingWire> {
-    let _ = origin;
+async fn connect_signaling(url: &str, skip_tls_verify: bool) -> Result<SignalingWire> {
     let wt_url = if let Some(rest) = url.strip_prefix("wss://") {
         // Production WT signaling is on port 23432 at path /wt.
         // Extract just the host from the wss:// authority and carry over the query string.
@@ -305,11 +300,7 @@ impl SignalingClient {
         );
 
         tracing::info!("Connecting to signaling (calltaker)");
-        let wire = connect_signaling(
-            &endpoint,
-            Some(&endpoints.signaling_origin),
-            endpoints.skip_tls_verify,
-        )
+        let wire = connect_signaling(&endpoint, endpoints.skip_tls_verify)
         .await?;
         let mut raw = RawSignalingClient {
             wire,
@@ -348,11 +339,7 @@ impl SignalingClient {
         tracing::debug!("signaling endpoint (caller): {url}");
 
         tracing::info!("Connecting to signaling (caller)");
-        let wire = connect_signaling(
-            &url,
-            Some(&endpoints.signaling_origin),
-            endpoints.skip_tls_verify,
-        )
+        let wire = connect_signaling(&url, endpoints.skip_tls_verify)
         .await?;
         let mut raw = RawSignalingClient {
             wire,
@@ -619,7 +606,7 @@ impl SignalingClient {
 }
 
 fn signaling_endpoint(base: &str, signaling_user_id: &str, fp: &FingerprintConfig) -> String {
-    let device = fp.device_name.replacen(' ', "%2F", 1);
+    let device = fp.device_name.replace(' ', "%2F");
     let os_api = fp.os_api_level;
     let suffix = format!(
         "appVersion=sdk-0.1.10.1&capabilities=3c57f&clientType=ONE_ME\
@@ -643,10 +630,11 @@ fn calltaker_signaling_endpoint(
     peer_id: u64,
     token: &str,
 ) -> String {
-    let device = fp.device_name.replacen(' ', "%2F", 1);
+    let device = fp.device_name.replace(' ', "%2F");
     let os_api = fp.os_api_level;
+    let sep = if base.contains('?') { '&' } else { '?' };
     format!(
-        "{base}?appVersion=sdk-0.1.10.1&capabilities=3c57f&clientType=ONE_ME\
+        "{base}{sep}appVersion=sdk-0.1.10.1&capabilities=3c57f&clientType=ONE_ME\
          &compression=deflate-raw&conversationId={conversation_id}&device={device}\
          &entityType=USER&ispAsOrg=null&locCc=null&locReg=null\
          &osVersion={os_api}&peerId={peer_id}&platform=ANDROID\
@@ -764,53 +752,7 @@ fn maybe_log_signaling_notification(msg: &Value) {
     }
 }
 
-#[derive(Debug)]
-struct SkipTlsVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for SkipTlsVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
-    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-        ]
-    }
-}
+use crate::SkipTlsVerifier;
 
 #[derive(Debug, Deserialize)]
 struct ConnectionNotification {

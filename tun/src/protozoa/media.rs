@@ -78,6 +78,7 @@ pub struct OpusMedia {
     path: String,
     reader: ogg::PacketReader<BufReader<File>>,
     decoder: opus::Decoder,
+    decode_buf: Vec<i16>,
     /// Absolute frame index the reader is currently positioned at.
     reader_frame: usize,
     /// Speech intervals as (start_frame, end_frame) inclusive frame indices.
@@ -88,20 +89,11 @@ pub struct OpusMedia {
 
 impl OpusMedia {
     pub fn spawn(path: &str) -> Result<Self> {
-        let vad_map = build_vad_map(path)?;
+        let (vad_map, reader) = build_vad_map(path)?;
         if vad_map.is_empty() {
             bail!("no speech detected in {path}");
         }
         info!("{} speech fragments detected in {}", vad_map.len(), path);
-
-        let file = File::open(path).with_context(|| format!("open {path}"))?;
-        let mut reader = ogg::PacketReader::new(BufReader::new(file));
-        reader
-            .read_packet()?
-            .ok_or_else(|| anyhow!("missing opus id header"))?;
-        reader
-            .read_packet()?
-            .ok_or_else(|| anyhow!("missing opus comment header"))?;
 
         let decoder = opus::Decoder::new(AUDIO_SAMPLE_RATE, opus::Channels::Mono)?;
         let mut rng = SmallRng::seed_from_u64(rand::random());
@@ -111,6 +103,7 @@ impl OpusMedia {
             path: path.to_string(),
             reader,
             decoder,
+            decode_buf: vec![0i16; 5760],
             reader_frame: 0,
             vad_map,
             state: PlaybackState::Silent {
@@ -203,7 +196,9 @@ impl OpusMedia {
             }
 
             let packet = self.read_audio_packet()?;
-            let samples = decode_packet(&mut self.decoder, &packet)?;
+            let len = self.decoder.decode(&packet, &mut self.decode_buf, false)?;
+            let mut samples = self.decode_buf[..len].to_vec();
+            samples.resize(AUDIO_FRAME_SAMPLES, 0);
             if self.reader_frame > end_frame {
                 let next_frag = (frag_idx + 1) % self.vad_map.len();
                 let now = Instant::now();
@@ -270,7 +265,9 @@ impl OpusMedia {
 // Use vad.sh to embed the map before using a file with this binary.
 // ---------------------------------------------------------------------------
 
-fn build_vad_map(path: &str) -> Result<Vec<(usize, usize)>> {
+fn build_vad_map(
+    path: &str,
+) -> Result<(Vec<(usize, usize)>, ogg::PacketReader<BufReader<File>>)> {
     let file = File::open(path).with_context(|| format!("open {path}"))?;
     let mut reader = ogg::PacketReader::new(BufReader::new(file));
     reader
@@ -310,7 +307,8 @@ fn build_vad_map(path: &str) -> Result<Vec<(usize, usize)>> {
         if let Some(eq) = entry.find('=')
             && entry[..eq].eq_ignore_ascii_case("vadmap")
         {
-            return parse_vadmap(&entry[eq + 1..], path);
+            let map = parse_vadmap(&entry[eq + 1..], path)?;
+            return Ok((map, reader));
         }
     }
 
@@ -355,13 +353,6 @@ fn parse_vadmap(value: &str, path: &str) -> Result<Vec<(usize, usize)>> {
 // Audio helpers
 // ---------------------------------------------------------------------------
 
-fn decode_packet(decoder: &mut opus::Decoder, data: &[u8]) -> Result<Vec<i16>> {
-    let mut buf = vec![0i16; 5760]; // max Opus frame at 48 kHz (120 ms)
-    let len = decoder.decode(data, &mut buf, false)?;
-    buf.truncate(len);
-    buf.resize(AUDIO_FRAME_SAMPLES, 0); // pad if shorter, truncate if longer
-    Ok(buf)
-}
 
 fn gen_cn_frame(rng: &mut SmallRng) -> Vec<i16> {
     (0..AUDIO_FRAME_SAMPLES)
