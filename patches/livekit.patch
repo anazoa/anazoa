@@ -174,3 +174,16 @@ index 52ebbad1..00cf01df 100755
  cp "$OUTPUT_DIR/args.gn" "$ARTIFACTS_DIR"
  
  cp "$OUTPUT_DIR/LICENSE.md" "$ARTIFACTS_DIR"
+diff --git a/webrtc-sys/libwebrtc/.gclient b/webrtc-sys/libwebrtc/.gclient
+index 6305d0cb..bbb57052 100644
+--- a/webrtc-sys/libwebrtc/.gclient
++++ b/webrtc-sys/libwebrtc/.gclient
+@@ -1,7 +1,7 @@
+ solutions = [
+   {
+     "name": 'src',
+-    "url": 'https://github.com/webrtc-sdk/webrtc.git@m144_release',
++    "url": 'https://github.com/webrtc-sdk/webrtc.git@aaeeee8077eb0a4cad1c9494e9c6433c751ef663',
+     "custom_deps": {},
+     "deps_file": "DEPS",
+     "managed": False,
