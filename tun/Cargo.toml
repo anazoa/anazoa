@@ -22,10 +22,10 @@ tun-rs = { version = "2", features = ["async"] }
 cxx = "1"
 
 # For Noise authentication
-base64 = "0.22"
+base64 = "0.23"
 snow = "0.10"
 
 webrtc-sys = { path = "../livekit/webrtc-sys" }
 ogg = "0.9.2"
-opus = "0.3.1"
+opus = "0.4"
 webm = "2.2.0"

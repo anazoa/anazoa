@@ -10,7 +10,7 @@ path = "src/main.rs"
 [dependencies]
 anazoa-auth = { path = "../auth" }
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 bytes = "1"
 http-body-util = "0.1"
 hyper = { version = "1", features = ["server", "http1"] }
@@ -27,6 +27,6 @@ tracing-subscriber = { version = "0.3", features = ["fmt"] }
 snow = "0.10"
 uuid = { version = "1", features = ["v4"] }
 flate2 = "1"
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 serde_urlencoded = "0.7"
 wtransport = { version = "0.7", default-features = false, features = ["ring", "quinn"] }
