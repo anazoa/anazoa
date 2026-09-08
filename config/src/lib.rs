@@ -29,8 +29,6 @@ impl Default for ServiceEndpoints {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct FingerprintConfig {
-    #[serde(rename = "app-version")]
-    pub app_version: String,
     #[serde(rename = "os-version")]
     pub os_version: String,
     /// Android API level integer (e.g. 34 for Android 14). Used in signaling URL `osVersion` param.
@@ -38,12 +36,7 @@ pub struct FingerprintConfig {
     pub os_api_level: u32,
     pub timezone: String,
     pub screen: String,
-    #[serde(rename = "push-device-type")]
-    pub push_device_type: String,
-    pub arch: String,
     pub locale: String,
-    #[serde(rename = "build-number")]
-    pub build_number: u32,
     #[serde(rename = "device-name")]
     pub device_name: String,
     #[serde(rename = "device-locale")]
@@ -100,6 +93,7 @@ fn parse_log_level(level: &str) -> LevelFilter {
     match level.to_ascii_lowercase().as_str() {
         "trace" => LevelFilter::TRACE,
         "debug" => LevelFilter::DEBUG,
+        "info" => LevelFilter::INFO,
         "warn" => LevelFilter::WARN,
         "error" => LevelFilter::ERROR,
         "off" => LevelFilter::OFF,

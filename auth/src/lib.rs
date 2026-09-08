@@ -1,4 +1,5 @@
 pub mod calls;
+pub mod integrity;
 pub mod login;
 pub mod oneme;
 pub mod signaling;

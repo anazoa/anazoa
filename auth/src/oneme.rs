@@ -33,6 +33,7 @@ const OPCODE_CLIENT_HELLO: u16 = 6;
 const OPCODE_START_AUTH: u16 = 17;
 const OPCODE_CHECK_CODE: u16 = 18;
 const OPCODE_CHAT_SYNC: u16 = 19;
+const OPCODE_LOGIN_CHECK_PASSWORD: u16 = 115;
 const OPCODE_START_OUTGOING_CALL: u16 = 78;
 const OPCODE_INCOMING_CALL: u16 = 137;
 const OPCODE_CALL_TOKEN_REQUEST: u16 = 158;
@@ -57,7 +58,7 @@ impl SessionClient {
         endpoints: &ServiceEndpoints,
         oneme_keepalive_secs: u64,
         fingerprint: &FingerprintConfig,
-    ) -> Result<(Self, i64)> {
+    ) -> Result<(Self, Option<i64>)> {
         let mut client = Self::connect(
             endpoints,
             Duration::from_secs(oneme_keepalive_secs),
@@ -65,9 +66,7 @@ impl SessionClient {
         )
         .await?;
         client.do_chat_sync(auth_token).await?;
-        let user_id = client
-            .user_id()
-            .ok_or_else(|| anyhow!("missing OneMe user ID after chat sync"))?;
+        let user_id = client.user_id();
         Ok((client, user_id))
     }
 
@@ -83,8 +82,12 @@ impl SessionClient {
         self.inner.do_verification_request(phone).await
     }
 
-    pub async fn do_code_enter(&mut self, token: &str, code: &str) -> Result<String> {
+    pub async fn do_code_enter(&mut self, token: &str, code: &str) -> Result<CodeOutcome> {
         self.inner.do_code_enter(token, code).await
+    }
+
+    pub async fn do_password_check(&mut self, track_id: &str, password: &str) -> Result<String> {
+        self.inner.do_password_check(track_id, password).await
     }
 
     pub async fn wait_for_incoming_call(&mut self) -> Result<IncomingCall> {
@@ -115,6 +118,18 @@ struct Packet {
     payload: Value,
 }
 
+/// Outcome of [`SessionClient::do_code_enter`].
+pub enum CodeOutcome {
+    /// The SMS code was enough — this is the LOGIN token.
+    LoggedIn(String),
+    /// The account has a login password ("2FA"); call
+    /// [`SessionClient::do_password_check`] with `track_id` to finish.
+    PasswordRequired {
+        track_id: String,
+        hint: Option<String>,
+    },
+}
+
 pub struct OnemeClient {
     tls: TlsStream<TcpStream>,
     seq: u16,
@@ -122,6 +137,9 @@ pub struct OnemeClient {
     client_session_id: u32,
     auth_token: Option<String>,
     user_id: Option<i64>,
+    /// `callsSeed` from the SESSION_INIT response — the `seed` input to the
+    /// START_AUTH integrity token (see `integrity`).
+    calls_seed: Option<i64>,
     queue: VecDeque<Packet>,
     keepalive_interval: Duration,
 }
@@ -154,6 +172,7 @@ impl OnemeClient {
             client_session_id,
             auth_token: None,
             user_id: None,
+            calls_seed: None,
             queue: VecDeque::new(),
             keepalive_interval,
         };
@@ -162,10 +181,14 @@ impl OnemeClient {
     }
 
     async fn send(&mut self, opcode: u16, payload: Value) -> Result<u16> {
+        let payload = encode_json_to_msgpack(&payload)?;
+        self.send_bytes(opcode, payload).await
+    }
+
+    async fn send_bytes(&mut self, opcode: u16, payload: Vec<u8>) -> Result<u16> {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
 
-        let payload = encode_json_to_msgpack(&payload)?;
         let len_field = payload.len() as u32;
         let mut buf = Vec::with_capacity(10 + payload.len());
         buf.push(10);
@@ -306,14 +329,14 @@ impl OnemeClient {
                     "mt_instanceid": Uuid::new_v4().to_string(),
                     "userAgent": {
                         "deviceType": "ANDROID",
-                        "appVersion": fp.app_version,
+                        "appVersion": crate::integrity::MAX_APP_VERSION,
                         "osVersion": fp.os_version,
                         "timezone": fp.timezone,
                         "screen": fp.screen,
-                        "pushDeviceType": fp.push_device_type,
-                        "arch": fp.arch,
+                        "pushDeviceType": "GCM",
+                        "arch": crate::integrity::MAX_ARCH,
                         "locale": fp.locale,
-                        "buildNumber": fp.build_number,
+                        "buildNumber": crate::integrity::MAX_BUILD_NUMBER,
                         "deviceName": fp.device_name,
                         "deviceLocale": fp.device_locale
                     },
@@ -322,7 +345,18 @@ impl OnemeClient {
                 }),
             )
             .await?;
-        let _ = Self::expect_success_packet(self.recv_seq(seq, OPCODE_CLIENT_HELLO).await?)?;
+        let payload = Self::expect_success_packet(self.recv_seq(seq, OPCODE_CLIENT_HELLO).await?)?;
+        debug!("SESSION_INIT response: {}", truncate_json(&payload));
+        // `callsSeed` feeds the START_AUTH integrity token; `isVpn` is the
+        // server's own verdict on our egress IP (logged for the record).
+        self.calls_seed = payload.get("callsSeed").and_then(|v| v.as_i64());
+        match self.calls_seed {
+            Some(seed) => debug!("callsSeed = {seed} (0x{seed:016x})"),
+            None => debug!("SESSION_INIT response carries no callsSeed"),
+        }
+        if let Some(is_vpn) = payload.get("isVpn").and_then(|v| v.as_bool()) {
+            debug!("server isVpn verdict = {is_vpn}");
+        }
         Ok(())
     }
 
@@ -346,25 +380,36 @@ impl OnemeClient {
             .await?;
         let payload = Self::expect_success_packet(self.recv_seq(seq, OPCODE_CHAT_SYNC).await?)?;
         self.auth_token = Some(token.to_string());
-        self.user_id = Some(extract_profile_id(&payload)?);
+        match extract_profile_id(&payload) {
+            Ok(id) => self.user_id = Some(id),
+            Err(err) => debug!("chat sync: {err:#}"),
+        }
         Ok(())
     }
 
     pub async fn do_verification_request(&mut self, phone: &str) -> Result<String> {
-        let seq = self
-            .send(
-                OPCODE_START_AUTH,
-                serde_json::json!({
-                    "type": "START_AUTH",
-                    "phone": phone,
-                }),
+        // `oe0.java`: START_AUTH is `{phone, type, mode}`. `mode` is a native
+        // integrity token the server validates for ANDROID sessions (a WEB hello
+        // is exempt). Reconstructed in `integrity` from the SESSION_INIT
+        // `callsSeed` + our fingerprint.
+        let calls_seed = self.calls_seed.ok_or_else(|| {
+            anyhow!(
+                "SESSION_INIT gave no callsSeed, cannot build the START_AUTH integrity token \
+                 (see reveng/max-mode-token.md)"
             )
-            .await?;
+        })?;
+        let fp = &self.fingerprint;
+        let mode = crate::integrity::mode(calls_seed, &fp.device_id);
+        debug!("START_AUTH mode = {}", bytes_to_hex(&mode));
+
+        let payload = encode_start_auth_payload(phone, &mode)?;
+        let seq = self.send_bytes(OPCODE_START_AUTH, payload).await?;
         let payload = Self::expect_success_packet(self.recv_seq(seq, OPCODE_START_AUTH).await?)?;
+        debug!("START_AUTH response: {}", truncate_json(&payload));
         map_string(&payload, "token")
     }
 
-    pub async fn do_code_enter(&mut self, token: &str, code: &str) -> Result<String> {
+    pub async fn do_code_enter(&mut self, token: &str, code: &str) -> Result<CodeOutcome> {
         let seq = self
             .send(
                 OPCODE_CHECK_CODE,
@@ -376,6 +421,51 @@ impl OnemeClient {
             )
             .await?;
         let payload = Self::expect_success_packet(self.recv_seq(seq, OPCODE_CHECK_CODE).await?)?;
+        debug!("CHECK_CODE response: {}", truncate_json(&payload));
+        // The CHECK_CODE response carries `profile.contact.id` (the freshly
+        // authenticated user) — the subsequent LOGIN sync omits it for a brand
+        // new account.
+        match extract_profile_id(&payload) {
+            Ok(id) => self.user_id = Some(id),
+            Err(err) => debug!("check code: {err:#}"),
+        }
+
+        if let Ok(login_token) = extract_login_token(&payload) {
+            return Ok(CodeOutcome::LoggedIn(login_token));
+        }
+        // `pd0.java`: when the account has a login password, the response instead
+        // carries `passwordChallenge = {trackId, hint?, email?}` and no LOGIN
+        // token — the caller must answer it with opcode 115.
+        if let Some(challenge) = payload.get("passwordChallenge").filter(|v| v.is_object()) {
+            let track_id = map_string(challenge, "trackId")
+                .context("CHECK_CODE passwordChallenge without a trackId")?;
+            let hint = challenge
+                .get("hint")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            return Ok(CodeOutcome::PasswordRequired { track_id, hint });
+        }
+        Err(extract_login_token(&payload).unwrap_err())
+    }
+
+    pub async fn do_password_check(&mut self, track_id: &str, password: &str) -> Result<String> {
+        let seq = self
+            .send(
+                OPCODE_LOGIN_CHECK_PASSWORD,
+                serde_json::json!({
+                    "trackId": track_id,
+                    "password": password,
+                }),
+            )
+            .await?;
+        let payload =
+            Self::expect_success_packet(self.recv_seq(seq, OPCODE_LOGIN_CHECK_PASSWORD).await?)?;
+        debug!("LOGIN_CHECK_PASSWORD response: {}", truncate_json(&payload));
+        match extract_profile_id(&payload) {
+            Ok(id) => self.user_id = Some(id),
+            Err(err) => debug!("password check: {err:#}"),
+        }
         extract_login_token(&payload)
     }
 
@@ -500,6 +590,8 @@ struct VcpDecoded {
     signaling_token: String,
     #[serde(rename = "wse")]
     signaling_server: String,
+    #[serde(rename = "wte")]
+    wt_endpoint: Option<String>,
     #[serde(rename = "stne")]
     stun_server: String,
     #[serde(rename = "trne")]
@@ -513,7 +605,10 @@ struct VcpDecoded {
 #[derive(Debug, Clone)]
 pub struct SignalingServer {
     pub token: String,
+    /// WebSocket endpoint (`wss://…/ws2`).
     pub url: String,
+    /// WebTransport endpoint (`https://host:port/wt`) when the server provides one.
+    pub wt_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -542,6 +637,7 @@ impl IncomingCall {
             signaling: SignalingServer {
                 token: decoded.signaling_token,
                 url: decoded.signaling_server,
+                wt_url: decoded.wt_endpoint,
             },
             stun: decoded.stun_server,
             caller_id: raw.caller_id,
@@ -566,6 +662,7 @@ fn decode_vcp(vcp: &str) -> Result<VcpDecoded> {
         .context("base64 decode vcp")?;
     let decompressed =
         lz4_flex::block::decompress(&compressed, expected_size).context("lz4 decompress vcp")?;
+    debug!("decoded vcp: {}", String::from_utf8_lossy(&decompressed));
     serde_json::from_slice(&decompressed).context("deserialize vcp")
 }
 
@@ -717,6 +814,33 @@ pub fn encode_json_to_msgpack(value: &Value) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     encode_json_value(value, &mut out)?;
     Ok(out)
+}
+
+fn encode_start_auth_payload(phone: &str, mode: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_msgpack_map_len(3, &mut out)?;
+    encode_msgpack_string("type", &mut out);
+    encode_msgpack_string("START_AUTH", &mut out);
+    encode_msgpack_string("phone", &mut out);
+    encode_msgpack_string(phone, &mut out);
+    encode_msgpack_string("mode", &mut out);
+    encode_msgpack_bin(mode, &mut out);
+    Ok(out)
+}
+
+fn encode_msgpack_bin(bytes: &[u8], out: &mut Vec<u8>) {
+    let len = bytes.len();
+    if len <= u8::MAX as usize {
+        out.push(0xc4);
+        out.push(len as u8);
+    } else if len <= u16::MAX as usize {
+        out.push(0xc5);
+        out.extend_from_slice(&(len as u16).to_be_bytes());
+    } else {
+        out.push(0xc6);
+        out.extend_from_slice(&(len as u32).to_be_bytes());
+    }
+    out.extend_from_slice(bytes);
 }
 
 fn encode_json_value(value: &Value, out: &mut Vec<u8>) -> Result<()> {

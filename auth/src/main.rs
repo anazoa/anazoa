@@ -13,7 +13,7 @@ pub struct LocalAuthConfig {
 }
 
 fn usage() -> ! {
-    eprintln!("usage: anazoa-auth [-c config.toml] login --phone <phone>");
+    eprintln!("usage: anazoa-auth [-c config.toml] login <phone>");
     eprintln!("       anazoa-auth genkey");
     std::process::exit(1);
 }
@@ -42,8 +42,7 @@ fn version() -> ! {
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let mut config_path = "anazoa.toml".to_string();
-    let mut phone = None;
-    let mut login_cmd = false;
+    let mut phone: Option<String> = None;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -55,26 +54,27 @@ async fn main() -> Result<()> {
                     .ok_or_else(|| anyhow!("-c requires an argument"))?;
             }
             "login" => {
-                login_cmd = true;
-            }
-            "--phone" => {
-                phone = Some(
-                    args.next()
-                        .ok_or_else(|| anyhow!("--phone requires an argument"))?,
-                );
+                phone = match args.next() {
+                    Some(p) if !p.is_empty() && !p.starts_with('-') => Some(p),
+                    _ => usage(), // `login` with no phone number
+                };
             }
             _ => usage(),
         }
     }
 
-    if !login_cmd {
-        usage();
-    }
+    let phone = phone.unwrap_or_else(|| usage()); // no `login` command at all
 
     let cfg: LocalAuthConfig = load_config(&config_path)?;
     init_logging(&cfg.auth.debug.level);
 
-    run_login_with_endpoints(phone, &cfg.auth.endpoints, DEFAULT_ONEME_KEEPALIVE_SECS, &cfg.auth.fingerprint).await?;
+    run_login_with_endpoints(
+        &phone,
+        &cfg.auth.endpoints,
+        DEFAULT_ONEME_KEEPALIVE_SECS,
+        &cfg.auth.fingerprint,
+    )
+    .await?;
 
     Ok(())
 }

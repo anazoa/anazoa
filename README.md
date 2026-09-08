@@ -14,7 +14,7 @@ Two peers need to be configured, A and B.
 ```
 cp anazoa.toml.sample anazoa.toml
 edit anazoa.toml
-anazoa-auth -c anazoa.toml login --phone +71234567890
+anazoa-auth -c anazoa.toml login +71234567890
 ```
 
 Phone numbers must be different for the two peers.

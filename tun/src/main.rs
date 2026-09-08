@@ -237,8 +237,9 @@ async fn drive_call(
                     break;
                 }
 
-                let far_future = tokio::time::Instant::now() + Duration::from_secs(u64::MAX / 2);
-                auth_deadline.as_mut().reset(far_future);
+                auth_deadline
+                    .as_mut()
+                    .reset(tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24 * 365));
             }
 
             cmd = cmd_rx.recv() => {

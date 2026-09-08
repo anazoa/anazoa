@@ -1,4 +1,4 @@
-# To get these, run anazoa-auth login --phone +71234567890
+# To get these, run anazoa-auth login +71234567890
 token = ""
 signaling-user-id = "0"
 remote-peer-id = 0
@@ -20,13 +20,8 @@ tun-name = "tun0"
 privdrop = "nobody:nogroup"
 ctl-socket = "/run/anazoa.sock"
 
-[fingerprint]
-app-version = "26.13.0"
-build-number = 6683
-push-device-type = "GCM"
-arch = "arm64-v8a"
-
 # It's strongly advised to change these parameters to match some real device
+[fingerprint]
 os-version = "Android 14"
 os-api-level = 34
 screen = "425dpi 425dpi 1080x2340"

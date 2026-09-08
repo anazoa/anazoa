@@ -158,28 +158,8 @@ async fn read_quic_varint(recv: &mut wtransport::RecvStream) -> Result<u64> {
 // ── Connect helpers ──────────────────────────────────────────────────────────
 
 async fn connect_signaling(url: &str, skip_tls_verify: bool) -> Result<SignalingWire> {
-    let wt_url = if let Some(rest) = url.strip_prefix("wss://") {
-        // Production WT signaling is on port 23432 at path /wt.
-        // Extract just the host from the wss:// authority and carry over the query string.
-        let (authority, path_and_query) = rest.split_once('/').unwrap_or((rest, ""));
-        let host = authority.split(':').next().unwrap_or(authority);
-        let query = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let wt = if query.is_empty() {
-            format!("https://{host}:23432/wt")
-        } else {
-            format!("https://{host}:23432/wt?{query}")
-        };
-        std::borrow::Cow::Owned(wt)
-    } else {
-        std::borrow::Cow::Borrowed(url)
-    };
-    if !wt_url.starts_with("https://") {
-        bail!(
-            "unsupported signaling transport: expected WebTransport https:// endpoint, got {url}"
-        );
-    }
     tracing::info!("connecting to signaling via WebTransport");
-    let (conn, send, recv) = connect_wt(&wt_url, skip_tls_verify).await?;
+    let (conn, send, recv) = connect_wt(url, skip_tls_verify).await?;
     Ok(SignalingWire::Wt(WtConn { conn, send, recv }))
 }
 
@@ -290,8 +270,11 @@ impl SignalingClient {
         fingerprint: &FingerprintConfig,
     ) -> Result<Self> {
         let peer_id = rand::random::<u64>() >> 1;
+        let base = incoming_call.signaling.wt_url.as_deref().ok_or_else(|| {
+            anyhow!("incoming call vcp has no `wte` WebTransport endpoint (only `wse`)")
+        })?;
         let endpoint = calltaker_signaling_endpoint(
-            &incoming_call.signaling.url,
+            base,
             signaling_user_id,
             fingerprint,
             &incoming_call.conversation_id,
@@ -299,9 +282,9 @@ impl SignalingClient {
             &incoming_call.signaling.token,
         );
 
+        tracing::debug!("signaling endpoint (calltaker): {endpoint}");
         tracing::info!("Connecting to signaling (calltaker)");
-        let wire = connect_signaling(&endpoint, endpoints.skip_tls_verify)
-        .await?;
+        let wire = connect_signaling(&endpoint, endpoints.skip_tls_verify).await?;
         let mut raw = RawSignalingClient {
             wire,
             pending_messages: VecDeque::new(),
@@ -331,16 +314,14 @@ impl SignalingClient {
         endpoints: &ServiceEndpoints,
         fingerprint: &FingerprintConfig,
     ) -> Result<Self> {
-        let url = if let Some(wt) = &started.wt_endpoint {
-            signaling_endpoint(wt, signaling_user_id, fingerprint)
-        } else {
-            signaling_endpoint(&started.endpoint, signaling_user_id, fingerprint)
-        };
+        let wt = started.wt_endpoint.as_deref().ok_or_else(|| {
+            anyhow!("start-call response has no `wtEndpoint` (only WebSocket `endpoint`)")
+        })?;
+        let url = signaling_endpoint(wt, signaling_user_id, fingerprint);
         tracing::debug!("signaling endpoint (caller): {url}");
 
         tracing::info!("Connecting to signaling (caller)");
-        let wire = connect_signaling(&url, endpoints.skip_tls_verify)
-        .await?;
+        let wire = connect_signaling(&url, endpoints.skip_tls_verify).await?;
         let mut raw = RawSignalingClient {
             wire,
             pending_messages: VecDeque::new(),

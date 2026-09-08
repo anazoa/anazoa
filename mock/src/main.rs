@@ -671,15 +671,11 @@ fn write_tun_config(
         .unwrap_or_default();
 
     let fingerprint_section = r#"[fingerprint]
-app-version = "26.13.0"
 os-version = "Android 11"
 os-api-level = 30
 timezone = "Europe/Moscow"
 screen = "420dpi 420dpi 1080x2340"
-push-device-type = "GCM"
-arch = "arm64-v8a"
 locale = "en"
-build-number = 6683
 device-name = "samsung SM-A405FM"
 device-locale = "en"
 device-id = "f211d3fd4bc2d9cf""#;

@@ -18,6 +18,7 @@ rand = "0.10"
 snow = "0.10"
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
 serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
 serde_json = "1"
 serde_urlencoded = "0.7"
 tokio = { version = "1", features = ["io-util", "net", "time", "rt", "macros", "rt-multi-thread"] }

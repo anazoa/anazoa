@@ -265,9 +265,7 @@ impl OpusMedia {
 // Use vad.sh to embed the map before using a file with this binary.
 // ---------------------------------------------------------------------------
 
-fn build_vad_map(
-    path: &str,
-) -> Result<(Vec<(usize, usize)>, ogg::PacketReader<BufReader<File>>)> {
+fn build_vad_map(path: &str) -> Result<(Vec<(usize, usize)>, ogg::PacketReader<BufReader<File>>)> {
     let file = File::open(path).with_context(|| format!("open {path}"))?;
     let mut reader = ogg::PacketReader::new(BufReader::new(file));
     reader
@@ -352,7 +350,6 @@ fn parse_vadmap(value: &str, path: &str) -> Result<Vec<(usize, usize)>> {
 // ---------------------------------------------------------------------------
 // Audio helpers
 // ---------------------------------------------------------------------------
-
 
 fn gen_cn_frame(rng: &mut SmallRng) -> Vec<i16> {
     (0..AUDIO_FRAME_SAMPLES)
