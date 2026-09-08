@@ -1,11 +1,11 @@
 diff --git a/webrtc-sys/Cargo.toml b/webrtc-sys/Cargo.toml
-index 5499d006..1bf026a9 100644
+index 0dc40648..1e5c4d51 100644
 --- a/webrtc-sys/Cargo.toml
 +++ b/webrtc-sys/Cargo.toml
-@@ -1,21 +1,21 @@
+@@ -1,28 +1,28 @@
  [package]
  name = "webrtc-sys"
- version = "0.3.31"
+ version = "0.3.43"
 -edition.workspace = true
 +edition = "2021"
  homepage = "https://livekit.io"
@@ -28,15 +28,18 @@ index 5499d006..1bf026a9 100644
 +webrtc-sys-build = { path = "build" }
  cxx-build = "1.0"
  glob = "0.3"
- cc = "1.0"
-@@ -25,4 +25,4 @@ pkg-config = "0.3.22"
+-cc = { workspace = true }
++cc = { version = "1.0", features = ["parallel"] }
+ pkg-config = "0.3.22"
+ 
+ [target.'cfg(target_os = "linux")'.build-dependencies]
  pkg-config = "0.3.22"
  
  [dev-dependencies]
 -env_logger = { workspace = true }
 +env_logger = "0.11"
 diff --git a/webrtc-sys/build.rs b/webrtc-sys/build.rs
-index 4535fc5e..5ec96f2c 100644
+index 6451740b..74d6f15f 100644
 --- a/webrtc-sys/build.rs
 +++ b/webrtc-sys/build.rs
 @@ -23,7 +23,8 @@ fn main() {
@@ -49,7 +52,7 @@ index 4535fc5e..5ec96f2c 100644
  
      println!("cargo:rerun-if-env-changed=LK_DEBUG_WEBRTC");
      println!("cargo:rerun-if-env-changed=LK_CUSTOM_WEBRTC");
-@@ -127,8 +128,6 @@ fn main() {
+@@ -132,8 +133,6 @@ fn main() {
          builder.define(key.as_str(), value);
      }
  
@@ -58,9 +61,9 @@ index 4535fc5e..5ec96f2c 100644
      match target_os.as_str() {
          "windows" => {
              println!("cargo:rustc-link-lib=dylib=msdmo");
-@@ -171,11 +170,13 @@ fn main() {
-             println!("cargo:rustc-link-lib=dylib=pthread");
-             println!("cargo:rustc-link-lib=dylib=m");
+@@ -178,14 +177,17 @@ fn main() {
+ 
+             configure_hermetic_libcxx(&mut builder, &webrtc_include);
  
 -            // In order to avoid any ABI mismatches we use the sysroot's headers.
 -            add_gio_headers(&mut builder);
@@ -68,15 +71,22 @@ index 4535fc5e..5ec96f2c 100644
 +                // In order to avoid any ABI mismatches we use the sysroot's headers.
 +                add_gio_headers(&mut builder);
  
+-            // Do not use pkg_config::probe_library, because we only require headers.
 -            for lib_name in ["glib-2.0", "gobject-2.0", "gio-2.0"] {
--                pkg_config::probe_library(lib_name).unwrap();
+-                let lib = pkg_config::Config::new().cargo_metadata(false).probe(lib_name).unwrap();
+-                for path in lib.include_paths {
+-                    builder.include(path);
++                // Do not use pkg_config::probe_library, because we only require headers.
 +                for lib_name in ["glib-2.0", "gobject-2.0", "gio-2.0"] {
-+                    pkg_config::probe_library(lib_name).unwrap();
-+                }
++                    let lib =
++                        pkg_config::Config::new().cargo_metadata(false).probe(lib_name).unwrap();
++                    for path in lib.include_paths {
++                        builder.include(path);
++                    }
+                 }
              }
  
-             add_lazy_load_so(
-@@ -324,6 +325,10 @@ fn main() {
+@@ -396,6 +398,10 @@ fn main() {
      builder.define("LIVEKIT_TEST", None);
      builder.warnings(false).compile("webrtcsys-cxx");
  
@@ -88,13 +98,13 @@ index 4535fc5e..5ec96f2c 100644
          println!("cargo:rerun-if-changed={}", entry.unwrap().display());
      }
 diff --git a/webrtc-sys/build/Cargo.toml b/webrtc-sys/build/Cargo.toml
-index 72b86528..0d36a066 100644
+index 4e985b52..d3abf22b 100644
 --- a/webrtc-sys/build/Cargo.toml
 +++ b/webrtc-sys/build/Cargo.toml
 @@ -1,10 +1,10 @@
  [package]
  name = "webrtc-sys-build"
- version = "0.3.16"
+ version = "0.3.19"
 -edition.workspace = true
 -license.workspace = true
 +edition = "2021"
@@ -112,7 +122,7 @@ index 72b86528..0d36a066 100644
 -anyhow = { workspace = true }
 +anyhow = "1.0"
 diff --git a/webrtc-sys/build/src/lib.rs b/webrtc-sys/build/src/lib.rs
-index b21aff87..bc394783 100644
+index 586b6675..fcb8b837 100644
 --- a/webrtc-sys/build/src/lib.rs
 +++ b/webrtc-sys/build/src/lib.rs
 @@ -118,12 +118,13 @@ pub fn webrtc_dir() -> path::PathBuf {
@@ -135,13 +145,26 @@ index b21aff87..bc394783 100644
  
      let mut seen = HashSet::new();
      let mut vec = Vec::new();
+diff --git a/webrtc-sys/libwebrtc/.gclient b/webrtc-sys/libwebrtc/.gclient
+index 490388b9..7462b3fc 100644
+--- a/webrtc-sys/libwebrtc/.gclient
++++ b/webrtc-sys/libwebrtc/.gclient
+@@ -1,7 +1,7 @@
+ solutions = [
+   {
+     "name": 'src',
+-    "url": 'https://github.com/webrtc-sdk/webrtc.git@m150_release',
++    "url": 'https://github.com/webrtc-sdk/webrtc.git@030ad13afd0ab7d16c70662e0e793ea1b892c158',
+     "custom_deps": {},
+     "deps_file": "DEPS",
+     "managed": False,
 diff --git a/webrtc-sys/libwebrtc/build_linux.sh b/webrtc-sys/libwebrtc/build_linux.sh
-index 52ebbad1..00cf01df 100755
+index 417c9b9f..a78bba6a 100755
 --- a/webrtc-sys/libwebrtc/build_linux.sh
 +++ b/webrtc-sys/libwebrtc/build_linux.sh
-@@ -78,6 +78,9 @@ git apply "$COMMAND_DIR/patches/add_deps.patch" -v --ignore-space-change --ignor
- git apply "$COMMAND_DIR/patches/fix_desktop_capture_compile.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+@@ -79,6 +79,9 @@ git apply "$COMMAND_DIR/patches/fix_desktop_capture_compile.patch" -v --ignore-s
  git apply "$COMMAND_DIR/patches/external_audio_source.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+ git apply "$COMMAND_DIR/patches/fix_pipewire_utils_compile.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
  
 +git apply "$COMMAND_DIR/patches/hooks-opus.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 +git apply "$COMMAND_DIR/patches/hooks-vp9.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
@@ -149,7 +172,7 @@ index 52ebbad1..00cf01df 100755
  # Disable CREL (compact relocations). Chromium's build enables experimental
  # CREL via -Wa,--crel which causes segfaults on aarch64-linux (and is known
  # broken on arm32 and s390x too).
-@@ -125,12 +128,12 @@ args="is_debug=$debug  \
+@@ -136,12 +139,12 @@ args="is_debug=$debug  \
    enable_stripping=true \
    ffmpeg_branding=\"Chrome\" \
    rtc_use_h264=true \
@@ -165,7 +188,7 @@ index 52ebbad1..00cf01df 100755
  
  # generate ninja files
  gn gen "$OUTPUT_DIR" --root="src" --args="${args}"
-@@ -149,7 +152,7 @@ vpython3 "./src/tools_webrtc/libs/generate_licenses.py" \
+@@ -209,7 +212,7 @@ vpython3 "./src/tools_webrtc/libs/generate_licenses.py" \
    --target :default "$OUTPUT_DIR" "$OUTPUT_DIR" || echo "Warning: License generation failed (non-critical)"
  
  cp "$OUTPUT_DIR/obj/webrtc.ninja" "$ARTIFACTS_DIR"
@@ -174,16 +197,3 @@ index 52ebbad1..00cf01df 100755
  cp "$OUTPUT_DIR/args.gn" "$ARTIFACTS_DIR"
  
  cp "$OUTPUT_DIR/LICENSE.md" "$ARTIFACTS_DIR"
-diff --git a/webrtc-sys/libwebrtc/.gclient b/webrtc-sys/libwebrtc/.gclient
-index 6305d0cb..bbb57052 100644
---- a/webrtc-sys/libwebrtc/.gclient
-+++ b/webrtc-sys/libwebrtc/.gclient
-@@ -1,7 +1,7 @@
- solutions = [
-   {
-     "name": 'src',
--    "url": 'https://github.com/webrtc-sdk/webrtc.git@m144_release',
-+    "url": 'https://github.com/webrtc-sdk/webrtc.git@aaeeee8077eb0a4cad1c9494e9c6433c751ef663',
-     "custom_deps": {},
-     "deps_file": "DEPS",
-     "managed": False,

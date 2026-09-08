@@ -196,6 +196,7 @@ impl WebrtcCall {
             }],
             continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
             ice_transport_type: IceTransportsType::Relay,
+            enable_sctp_snap: false,
         };
         let observer = PeerConnectionObserverWrapper::new(Arc::new(Observer { tx }));
         let pc = factory

@@ -586,6 +586,7 @@ pub fn send_i420_video_frame(
             has_packet_trailer: false,
             user_timestamp: 0,
             frame_id: 0,
+            user_data: Vec::new(),
         },
     );
     if !ok {

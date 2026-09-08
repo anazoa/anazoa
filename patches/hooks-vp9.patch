@@ -1,8 +1,8 @@
 diff --git a/video/rtp_video_stream_receiver2.cc b/video/rtp_video_stream_receiver2.cc
-index 054b9c1..4317d35 100644
+index fc176dc..cf5eb22 100644
 --- a/video/rtp_video_stream_receiver2.cc
 +++ b/video/rtp_video_stream_receiver2.cc
-@@ -92,6 +92,12 @@
+@@ -91,6 +91,12 @@
  #include "system_wrappers/include/ntp_time.h"
  #include "video/buffered_frame_decryptor.h"
  
@@ -15,7 +15,7 @@ index 054b9c1..4317d35 100644
  namespace webrtc {
  
  namespace {
-@@ -102,6 +108,48 @@ constexpr int kPacketBufferMaxSize = 2048;
+@@ -101,6 +107,48 @@ constexpr int kPacketBufferMaxSize = 2048;
  
  constexpr int kMaxPacketAgeToNack = 450;
  
@@ -64,9 +64,9 @@ index 054b9c1..4317d35 100644
  int PacketBufferMaxSize(const FieldTrialsView& field_trials) {
    // The group here must be a positive power of 2, in which case that is used as
    // size. All other values shall result in the default value being used.
-@@ -313,7 +361,9 @@ RtpVideoStreamReceiver2::RtpVideoStreamReceiver2(
+@@ -322,7 +370,9 @@ RtpVideoStreamReceiver2::RtpVideoStreamReceiver2(
            config_.rtp.rtcp_xr.receiver_reference_time_report,
-           config_.rtp.local_ssrc)),
+           config->rtp.remote_ssrc)),
        nack_periodic_processor_(nack_periodic_processor),
 -      complete_frame_callback_(complete_frame_callback),
 +      tunnel_complete_frame_callback_(
@@ -76,7 +76,7 @@ index 054b9c1..4317d35 100644
        // TODO(bugs.webrtc.org/10336): Let `rtcp_feedback_buffer_` communicate
        // directly with `rtp_rtcp_`.
 diff --git a/video/rtp_video_stream_receiver2.h b/video/rtp_video_stream_receiver2.h
-index 2ca5261..badc685 100644
+index 5e38a22..e9b9389 100644
 --- a/video/rtp_video_stream_receiver2.h
 +++ b/video/rtp_video_stream_receiver2.h
 @@ -372,6 +372,7 @@ class RtpVideoStreamReceiver2 : public LossNotificationSender,
@@ -84,14 +84,14 @@ index 2ca5261..badc685 100644
  
    NackPeriodicProcessor* const nack_periodic_processor_;
 +  std::unique_ptr<OnCompleteFrameCallback> tunnel_complete_frame_callback_;
-   OnCompleteFrameCallback* complete_frame_callback_;
+   OnCompleteFrameCallback* const complete_frame_callback_;
    const KeyFrameReqMethod keyframe_request_method_;
  
 diff --git a/video/video_stream_encoder.cc b/video/video_stream_encoder.cc
-index 166d2e9..c8ef4f6 100644
+index b5f0c13..867fbe8 100644
 --- a/video/video_stream_encoder.cc
 +++ b/video/video_stream_encoder.cc
-@@ -95,6 +95,11 @@
+@@ -96,6 +96,11 @@
  #include "video/frame_dumping_encoder.h"
  #include "video/video_stream_encoder_observer.h"
  
@@ -103,7 +103,7 @@ index 166d2e9..c8ef4f6 100644
  namespace webrtc {
  
  namespace {
-@@ -124,6 +129,71 @@ constexpr int kDefaultMinScreenSharebps = 1200000;
+@@ -125,6 +130,73 @@ constexpr int kDefaultMinScreenSharebps = 1200000;
  
  constexpr int kMaxFramesInPreparation = 10;
  
@@ -136,9 +136,11 @@ index 166d2e9..c8ef4f6 100644
 +    return inner_->OnEncodedImage(image, codec_specific_info);
 +  }
 +
-+  void OnDroppedFrame(DropReason reason) override {
++  void OnFrameDropped(uint32_t rtp_timestamp,
++                      int spatial_id,
++                      bool is_end_of_temporal_unit) override {
 +    if (inner_ != nullptr) {
-+      inner_->OnDroppedFrame(reason);
++      inner_->OnFrameDropped(rtp_timestamp, spatial_id, is_end_of_temporal_unit);
 +    }
 +  }
 +
@@ -175,7 +177,7 @@ index 166d2e9..c8ef4f6 100644
  int GetNumSpatialLayers(const VideoCodec& codec) {
    if (codec.codecType == kVideoCodecVP9) {
      return codec.VP9().numberOfSpatialLayers;
-@@ -926,7 +996,13 @@ void VideoStreamEncoder::SetSink(EncoderSink* sink, bool rotation_applied) {
+@@ -924,7 +996,13 @@ void VideoStreamEncoder::SetSink(EncoderSink* sink, bool rotation_applied) {
  
    encoder_queue_->PostTask([this, sink] {
      RTC_DCHECK_RUN_ON(encoder_queue_.get());
@@ -191,14 +193,14 @@ index 166d2e9..c8ef4f6 100644
  }
  
 diff --git a/video/video_stream_encoder.h b/video/video_stream_encoder.h
-index cc6e541..173a5a7 100644
+index 9fb6b71..23a1239 100644
 --- a/video/video_stream_encoder.h
 +++ b/video/video_stream_encoder.h
-@@ -302,6 +302,7 @@ class VideoStreamEncoder : public VideoStreamEncoderInterface,
+@@ -305,6 +305,7 @@ class VideoStreamEncoder : public VideoStreamEncoderInterface,
  
    const int number_of_cores_;
  
 +  std::unique_ptr<EncoderSink> tunnel_sink_;
    EncoderSink* sink_ = nullptr;
    const VideoStreamEncoderSettings settings_;
-   const BitrateAllocationCallbackType allocation_cb_type_;
+   EncoderSwitchRequestCallback encoder_switch_request_callback_;
