@@ -204,6 +204,7 @@ async fn inner_handle_calls_request(
             "urls": [state.stun_url()],
         },
         "endpoint": state.caller_signaling_endpoint(&form.conversation_id),
+        "wtEndpoint": state.caller_signaling_endpoint(&form.conversation_id),
     });
     json_response(response)
 }
@@ -341,6 +342,7 @@ async fn handle_oneme_peer(
                             "urls": [state.stun_url()],
                         },
                         "endpoint": state.caller_signaling_endpoint(conversation_id),
+                        "wtEndpoint": state.caller_signaling_endpoint(conversation_id),
                     })).context("serialize mock internalCallerParams")?,
                 });
                 write_oneme_packet(
@@ -773,12 +775,13 @@ fn encode_quic_varint(value: u64) -> Result<Vec<u8>> {
 
 async fn read_quic_varint(recv: &mut wtransport::RecvStream) -> Result<Option<u64>> {
     let mut first = [0u8; 1];
-    let Some(read) = recv
-        .read(&mut first)
-        .await
-        .context("read mock signaling WT frame prefix")?
-    else {
-        return Ok(None);
+    // A peer that exits without finishing its stream (e.g. after `hangup()`)
+    // surfaces here as a connection-closed / reset error rather than a clean
+    // stream end. For the mock relay that's just EOF — `run_pair`'s `None` arm
+    // then forwards the hangup notification to the other peer.
+    let read = match recv.read(&mut first).await {
+        Ok(Some(read)) => read,
+        Ok(None) | Err(_) => return Ok(None),
     };
     if read != 1 {
         bail!("short mock signaling WT frame prefix read: {read}");
@@ -849,6 +852,7 @@ fn encode_vcp(
     let decoded = json!({
         "tkn": MOCK_SIGNALING_TOKEN,
         "wse": signaling_server,
+        "wte": signaling_server,
         "stne": stun_server,
         "trne": turn_server,
         "trnu": turn_user,

@@ -19,6 +19,9 @@ use wtransport::tls::WEBTRANSPORT_ALPN;
 use wtransport::{ClientConfig, Endpoint};
 
 const CUSTOM_DATA_INTERVAL: Duration = Duration::from_secs(5);
+/// How long `close()` waits for the peer to ack the finished send stream before
+/// tearing the connection down anyway.
+const WT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SIGNALING_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPTED_CALL_TIMEOUT: Duration = Duration::from_secs(60);
@@ -86,6 +89,12 @@ impl SignalingWire {
     async fn close(&mut self) -> Result<()> {
         match self {
             SignalingWire::Wt(wt) => {
+                // Finish the send stream and give the peer a moment to ack it
+                // before tearing down the connection — `Connection::close` emits
+                // CONNECTION_CLOSE immediately and would drop an unflushed final
+                // message (e.g. `hangup`).
+                let _ = wt.send.finish().await;
+                let _ = timeout(WT_CLOSE_DRAIN_TIMEOUT, wt.send.stopped()).await;
                 wt.conn.close(wtransport::VarInt::from_u32(0), b"");
             }
         }
