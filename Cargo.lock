@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "anazoa-auth"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anazoa-config",
  "anyhow",
@@ -84,7 +84,7 @@ dependencies = [
 
 [[package]]
 name = "anazoa-config"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde",
@@ -96,7 +96,7 @@ dependencies = [
 
 [[package]]
 name = "anazoa-ctl"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -105,7 +105,7 @@ dependencies = [
 
 [[package]]
 name = "anazoa-mock"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anazoa-auth",
  "anyhow",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "anazoa-tun"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anazoa-auth",
  "anazoa-config",
