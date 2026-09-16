@@ -18,3 +18,12 @@ opt-level = "z"
 [profile.android]
 inherits = "release"
 panic = "unwind"
+
+# Coverage builds: `cargo llvm-cov` needs symbols and the coverage map kept,
+# and works best without LTO/size optimization distorting the mapping.
+[profile.coverage]
+inherits = "release"
+strip = false
+lto = false
+codegen-units = 16
+opt-level = 1

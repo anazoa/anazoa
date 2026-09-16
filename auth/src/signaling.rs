@@ -20,13 +20,11 @@ use wtransport::config::QuicTransportConfig;
 use wtransport::tls::WEBTRANSPORT_ALPN;
 use wtransport::{ClientConfig, Endpoint};
 
-const CUSTOM_DATA_INTERVAL: Duration = Duration::from_secs(5);
 /// How long `close()` waits for the peer to ack the finished send stream before
 /// tearing the connection down anyway.
 const WT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SIGNALING_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
-const ACCEPTED_CALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Upper bound on a single (deflate-compressed) WebTransport frame read
 /// from the untrusted signaling server, before allocating a buffer for it.
 const MAX_SIGNALING_FRAME_LEN: usize = 1 << 20;
@@ -464,25 +462,6 @@ impl SignalingClient {
         })
     }
 
-    /// Drain messages until `accepted-call` arrives and `enable-feature-for-roles` is sent.
-    /// No-op if this client is not the caller (flag already false).
-    pub async fn wait_for_accepted_call(&mut self) -> Result<()> {
-        timeout(ACCEPTED_CALL_TIMEOUT, async {
-            while self.pending_add_participant_enable {
-                let msg = self.receive_json_value().await?;
-                maybe_log_signaling_notification(&msg);
-            }
-            Ok(())
-        })
-        .await
-        .map_err(|_| {
-            anyhow!(
-                "timed out waiting for accepted-call notification after {}s",
-                ACCEPTED_CALL_TIMEOUT.as_secs()
-            )
-        })?
-    }
-
     pub async fn send_signal<T: Serialize>(&mut self, data: T) -> Result<()> {
         let text = serde_json::to_string(&TransmitData {
             command: "transmit-data",
@@ -587,28 +566,6 @@ impl SignalingClient {
             .await
             .context("send signaling hangup")?;
         Ok(())
-    }
-
-    pub async fn wait_for_call_end(&mut self) -> Result<()> {
-        loop {
-            match timeout(CUSTOM_DATA_INTERVAL, self.receive_json_value()).await {
-                Ok(Ok(msg)) => {
-                    maybe_log_signaling_notification(&msg);
-                    if is_call_end_message(&msg) {
-                        return Ok(());
-                    }
-                }
-                Ok(Err(err)) => {
-                    debug!("signaling call-end watcher exiting: {err:#}");
-                    return Ok(());
-                }
-                Err(_) => {
-                    if let Err(err) = self.send_custom_data().await {
-                        debug!("custom-data send failed: {err:#}");
-                    }
-                }
-            }
-        }
     }
 
     pub async fn send_custom_data(&mut self) -> Result<()> {
@@ -837,37 +794,6 @@ impl RawSignalingClient {
                 CONNECTION_NOTIFICATION_TIMEOUT.as_secs()
             )
         })?
-    }
-}
-
-fn is_call_end_message(msg: &Value) -> bool {
-    matches!(msg.get("response").and_then(Value::as_str), Some("hangup"))
-        || matches!(
-            msg.get("notification").and_then(Value::as_str),
-            Some(
-                "hangup"
-                    | "hungup"
-                    | "closed-conversation"
-                    | "call-ended"
-                    | "participant-left"
-                    | "left-call"
-                    | "terminated-call"
-            )
-        )
-}
-
-fn maybe_log_signaling_notification(msg: &Value) {
-    if let Some(
-        "registered-peer" | "accepted-call" | "feature-set-changed" | "features-per-role-changed",
-    ) = msg.get("notification").and_then(Value::as_str)
-    {
-        let s = msg.to_string();
-        let (short, len) = s.unicode_truncate(200);
-        debug!(
-            "signaling notification: {}{}",
-            short,
-            if len < s.len() { "..." } else { "" }
-        );
     }
 }
 
