@@ -33,7 +33,7 @@ jobs:
         runs-on: ${{ matrix.runner }}
 
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
               with:
                   submodules: recursive
 
@@ -43,7 +43,7 @@ jobs:
 
             - name: Restore libwebrtc cache
               id: webrtc-cache
-              uses: actions/cache/restore@v5
+              uses: actions/cache/restore@v6
               with:
                   path: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
                   key: libwebrtc-${{ matrix.lk_arch }}-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
@@ -96,7 +96,7 @@ jobs:
 
             - name: Save libwebrtc cache
               if: steps.webrtc-cache.outputs.cache-hit != 'true'
-              uses: actions/cache/save@v5
+              uses: actions/cache/save@v6
               with:
                   path: livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
                   key: libwebrtc-${{ matrix.lk_arch }}-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
@@ -106,7 +106,7 @@ jobs:
                   targets: ${{ matrix.dynamic_target }},${{ matrix.static_target }}
 
             - name: Cache Cargo registry
-              uses: actions/cache@v5
+              uses: actions/cache@v6
               with:
                   path: |
                       ~/.cargo/registry/index
@@ -170,7 +170,7 @@ jobs:
         runs-on: ubuntu-latest
 
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
               with:
                   submodules: recursive
 
@@ -180,7 +180,7 @@ jobs:
 
             - name: Restore libwebrtc cache
               id: webrtc-cache
-              uses: actions/cache/restore@v5
+              uses: actions/cache/restore@v6
               with:
                   path: livekit/webrtc-sys/libwebrtc/android-arm64-release
                   key: libwebrtc-android-arm64-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
@@ -203,6 +203,8 @@ jobs:
                     "$AGENT_TOOLSDIRECTORY/go" \
                     "$AGENT_TOOLSDIRECTORY/node"
                   sudo docker image prune -af || true
+                  sudo mkdir -p /usr/local/lib/android
+                  sudo chown "$(id -u):$(id -g)" /usr/local/lib/android
                   df -h
 
             - name: Install WebRTC build dependencies
@@ -217,7 +219,7 @@ jobs:
                     pkg-config
 
             - name: Set up JDK
-              uses: actions/setup-java@v4
+              uses: actions/setup-java@v6
               with:
                   distribution: temurin
                   java-version: "17"
@@ -233,7 +235,7 @@ jobs:
 
             - name: Save libwebrtc cache
               if: steps.webrtc-cache.outputs.cache-hit != 'true'
-              uses: actions/cache/save@v5
+              uses: actions/cache/save@v6
               with:
                   path: livekit/webrtc-sys/libwebrtc/android-arm64-release
                   key: libwebrtc-android-arm64-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
@@ -243,7 +245,7 @@ jobs:
                   targets: aarch64-linux-android
 
             - name: Cache Cargo registry
-              uses: actions/cache@v5
+              uses: actions/cache@v6
               with:
                   path: |
                       ~/.cargo/registry/index
@@ -262,7 +264,7 @@ jobs:
                   ndk-version: r27c
 
             - name: Set up Android SDK
-              uses: android-actions/setup-android@v3
+              uses: android-actions/setup-android@v4
 
             - name: Build anazoa-tun and the Android APK
               env:
@@ -293,12 +295,12 @@ jobs:
                       dynamic_target: aarch64-unknown-linux-gnu
                       static_target: aarch64-unknown-linux-musl
         steps:
-            - uses: actions/download-artifact@v7
+            - uses: actions/download-artifact@v8
               with:
                   name: ${{ matrix.artifact }}
                   path: /tmp/artifact
 
-            - uses: actions/download-artifact@v7
+            - uses: actions/download-artifact@v8
               with:
                   name: libwebrtc-linux-${{ matrix.arch }}-dev
                   path: /tmp/artifact
@@ -328,7 +330,7 @@ jobs:
         permissions:
             contents: write
         steps:
-            - uses: actions/download-artifact@v7
+            - uses: actions/download-artifact@v8
               with:
                   name: anazoa-android
                   path: /tmp/artifact
@@ -359,9 +361,9 @@ jobs:
                       artifact: anazoa-aarch64
                       binary: aarch64-unknown-linux-gnu/release/anazoa-tun
         steps:
-            - uses: actions/checkout@v6
+            - uses: actions/checkout@v7
 
-            - uses: actions/download-artifact@v7
+            - uses: actions/download-artifact@v8
               with:
                   name: ${{ matrix.artifact }}
                   path: /tmp/artifact
