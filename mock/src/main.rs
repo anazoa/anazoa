@@ -2,7 +2,8 @@ mod server;
 
 use std::env;
 use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -31,6 +32,14 @@ const DEFAULT_MTU: u32 = 1280;
 const DEFAULT_PING_SIZE: u32 = 1200;
 const DEFAULT_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_VIDEO_RESOLUTION: &str = "1280x720";
+/// Short enough that a `--drop-session in-call` run sees the in-call
+/// heartbeat fail (and mark the session broken) well before the call ends;
+/// the production default (25s) could outlast the whole test call.
+const MOCK_ONEME_KEEPALIVE_SECS: u64 = 5;
+/// The calltaker daemon drops to this user:group after opening its TUN,
+/// log files and ctl socket (see tun/src/main.rs). The media file must be
+/// readable by it.
+const DEFAULT_PRIVDROP: &str = "nobody:nogroup";
 
 struct Cli {
     command: MockCommand,
@@ -39,6 +48,27 @@ struct Cli {
 enum MockCommand {
     Server(ServerCli),
     Test(TestCli),
+    DropOneme(DropOnemeCli),
+}
+
+/// `mock drop-oneme`: asks a running mock server to close one user's Oneme
+/// connection. The harness runs it under `ip netns exec`, since the server
+/// is only reachable from inside the test namespaces.
+struct DropOnemeCli {
+    addr: String,
+    user: String,
+}
+
+/// When `mock test --drop-session` cuts the calltaker's Oneme connection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DropSession {
+    /// Between calls: the daemon's idle wait sees the error and reconnects
+    /// right away.
+    Idle,
+    /// Mid-call: the in-call heartbeat fails and flags the session broken;
+    /// the tunnel must keep running and the daemon reconnects only once the
+    /// call ends.
+    InCall,
 }
 
 struct ServerCli {
@@ -49,6 +79,8 @@ struct ServerCli {
     turn_public_addr: String,
     turn_username: String,
     turn_password: String,
+    hello_delay: Duration,
+    start_call_delay: Duration,
 }
 
 struct TestCli {
@@ -82,6 +114,20 @@ struct TestCli {
     /// `mock test` never touches process-lifetime statics (TUNNEL_STATE,
     /// SHUTDOWN_TX, ...) more than once, since each peer is a fresh process.
     reconnect: bool,
+    /// Drop the calltaker's Oneme session server-side (`Idle`: after the
+    /// first call, `InCall`: during it), verify the daemon re-establishes
+    /// it in-process, then place a second call. Unlike `--reconnect` the
+    /// daemon is never restarted — this is the network going away under it.
+    drop_session: Option<DropSession>,
+    /// Hold the mock server's client_hello ack and start-call response this
+    /// long, and use those windows to check that `ctl` commands arriving
+    /// while the daemon is Connecting / Dialing get rejected (or, for
+    /// hangup while dialing, abandon the call) instead of hanging.
+    setup_delay: Option<Duration>,
+    /// `privdrop` spec written into the calltaker's config (the calltaker
+    /// is a plain `anazoa-tun` in every variant; the caller may be
+    /// reconnect-host, which has no privdrop). None disables it.
+    privdrop: Option<String>,
 }
 
 struct Harness {
@@ -168,6 +214,7 @@ async fn main() {
     let result = match cli.command {
         MockCommand::Server(cli) => run_server(cli).await,
         MockCommand::Test(cli) => run_mock_test(cli),
+        MockCommand::DropOneme(cli) => run_drop_oneme(cli),
     };
 
     if let Err(err) = result {
@@ -186,8 +233,40 @@ async fn run_server(cli: ServerCli) -> Result<()> {
         turn_public_addr: cli.turn_public_addr,
         turn_username: cli.turn_username,
         turn_password: cli.turn_password,
+        hello_delay: cli.hello_delay,
+        start_call_delay: cli.start_call_delay,
     })
     .await
+}
+
+/// Plain HTTP/1.1 over std, so the mock crate needs no HTTP client: the
+/// request is one line and the server's answer is the status line.
+fn run_drop_oneme(cli: DropOnemeCli) -> Result<()> {
+    let mut stream = TcpStream::connect(&cli.addr)
+        .with_context(|| format!("connect to mock calls server at {}", cli.addr))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    write!(
+        stream,
+        "POST /mock/drop-oneme?user={} HTTP/1.1\r\nHost: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        cli.user, cli.addr
+    )
+    .context("send drop-oneme request")?;
+    let mut response = String::new();
+    stream
+        .read_to_string(&mut response)
+        .context("read drop-oneme response")?;
+    let status_line = response.lines().next().unwrap_or_default();
+    if !status_line.starts_with("HTTP/1.1 200") {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .unwrap_or_default();
+        bail!(
+            "drop-oneme for user {} failed: {status_line} {body}",
+            cli.user
+        );
+    }
+    Ok(())
 }
 
 fn run_mock_test(cli: TestCli) -> Result<()> {
@@ -285,26 +364,36 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         &turn_log,
     )?;
 
+    let mut server_args = vec![
+        "server".to_string(),
+        "--signaling-listen".to_string(),
+        format!("{ctrl_a_ip}:{}", cli.signal_port),
+        "--calls-listen".to_string(),
+        format!("{ctrl_a_ip}:{}", cli.calls_port),
+        "--oneme-listen".to_string(),
+        format!("{ctrl_a_ip}:{}", cli.oneme_port),
+        "--signaling-public-addr".to_string(),
+        format!("{ctrl_a_ip}:{}", cli.signal_port),
+        "--turn-public-addr".to_string(),
+        format!("{ctrl_a_ip}:{}", cli.turn_port),
+        "--username".to_string(),
+        cli.turn_user.clone(),
+        "--password".to_string(),
+        cli.turn_pass.clone(),
+    ];
+    if let Some(delay) = cli.setup_delay {
+        let secs = delay.as_secs().to_string();
+        server_args.extend([
+            "--hello-delay".to_string(),
+            secs.clone(),
+            "--start-call-delay".to_string(),
+            secs,
+        ]);
+    }
     let server_child = spawn_logged(
         Some(&cli.ns_calltaker),
         &current_exe,
-        &[
-            "server".to_string(),
-            "--signaling-listen".to_string(),
-            format!("{ctrl_a_ip}:{}", cli.signal_port),
-            "--calls-listen".to_string(),
-            format!("{ctrl_a_ip}:{}", cli.calls_port),
-            "--oneme-listen".to_string(),
-            format!("{ctrl_a_ip}:{}", cli.oneme_port),
-            "--signaling-public-addr".to_string(),
-            format!("{ctrl_a_ip}:{}", cli.signal_port),
-            "--turn-public-addr".to_string(),
-            format!("{ctrl_a_ip}:{}", cli.turn_port),
-            "--username".to_string(),
-            cli.turn_user.clone(),
-            "--password".to_string(),
-            cli.turn_pass.clone(),
-        ],
+        &server_args,
         &server_log,
     )?;
     harness.add_child(server_child);
@@ -352,6 +441,7 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         &calltaker_sock,
         &calltaker_privkey,
         &caller_pubkey,
+        cli.privdrop.as_deref(),
     )?;
     write_tun_config(
         &caller_config,
@@ -364,6 +454,7 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         &caller_sock,
         &caller_privkey,
         &calltaker_pubkey,
+        None,
     )?;
 
     let calltaker_args = tun_args(&calltaker_config);
@@ -411,23 +502,73 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         "caller socket",
     )?;
 
-    Command::new(&ctl_exe)
+    if let Some(delay) = cli.setup_delay {
+        check_connecting_rejections(&cli, &mut harness, &ctl_exe, &caller_sock, caller_idx)?;
+        check_dialing_cmds(
+            &cli,
+            &mut harness,
+            &ctl_exe,
+            &caller_log,
+            &calltaker_log,
+            &caller_sock,
+            caller_idx,
+            calltaker_idx,
+            delay,
+        )?;
+    }
+
+    // The ctl socket comes up before the OneMe session does, and commands
+    // that arrive in between are refused ("not connected"), not queued —
+    // on a lossy control plane (--netem) the TLS connect can take long
+    // enough for answer/call below to hit that window.
+    wait_for_state(
+        &ctl_exe,
+        &calltaker_sock,
+        "idle",
+        cli.ready_timeout,
+        child_mut(&mut harness, calltaker_idx)?,
+        "calltaker (connected)",
+    )?;
+    wait_for_state(
+        &ctl_exe,
+        &caller_sock,
+        "idle",
+        cli.ready_timeout,
+        child_mut(&mut harness, caller_idx)?,
+        "caller (connected)",
+    )?;
+    if let Some(spec) = &cli.privdrop {
+        check_privdrop(child_mut(&mut harness, calltaker_idx)?, spec)?;
+    }
+
+    let answer_status = Command::new(&ctl_exe)
         .args([
             "-s",
             &calltaker_sock.display().to_string(),
             "answer",
-            // "always" persists across calls, so a --reconnect run's second
-            // call doesn't need the calltaker re-armed; "anytime" (a single
-            // armed window) matches the existing non-reconnect behavior.
-            if cli.reconnect { "always" } else { "anytime" },
+            // "always" persists across calls, so a --reconnect or
+            // --drop-session run's second call doesn't need the calltaker
+            // re-armed; "anytime" (a single armed window) matches the
+            // existing single-call behavior.
+            if cli.reconnect || cli.drop_session.is_some() {
+                "always"
+            } else {
+                "anytime"
+            },
         ])
         .status()
         .context("ctl answer")?;
+    if !answer_status.success() {
+        bail!("ctl answer failed");
+    }
 
-    Command::new(&ctl_exe)
+    let call_status = Command::new(&ctl_exe)
         .args(["-s", &caller_sock.display().to_string(), "call"])
         .status()
         .context("ctl call")?;
+    if !call_status.success() {
+        bail!("ctl call failed");
+    }
 
     wait_for_tun_device(
         &cli.ns_calltaker,
@@ -478,6 +619,35 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         child_mut(&mut harness, caller_idx)?,
         "caller tunnel readiness",
     )?;
+
+    // Cheap and deterministic, so checked on every run: a second call or a
+    // change of answer mode while a call is up must be refused, not queued.
+    ctl_expect_error(&ctl_exe, &caller_sock, &["call"], "already in a call")?;
+    ctl_expect_error(
+        &ctl_exe,
+        &caller_sock,
+        &["answer", "anytime"],
+        "cannot set answer mode during a call",
+    )?;
+
+    // Cut the calltaker's Oneme session before any traffic runs, so the
+    // ping/iperf below double as proof that the tunnel (WebRTC, not Oneme)
+    // outlives it. The heartbeat failure is what marks the session broken
+    // for the post-call reconnect check in run_daemon.
+    let mut drop_offset = None;
+    if cli.drop_session == Some(DropSession::InCall) {
+        eprintln!("Drop-session test: dropping calltaker Oneme session mid-call");
+        drop_offset = Some(file_len(&calltaker_log)?);
+        drop_oneme_session(&cli, &current_exe, ctrl_a_ip)?;
+        wait_for_log_contains_since(
+            &calltaker_log,
+            drop_offset.unwrap_or(0),
+            "OneMe interactive heartbeat during call failed",
+            Duration::from_secs(MOCK_ONEME_KEEPALIVE_SECS * 3),
+            child_mut(&mut harness, calltaker_idx)?,
+            "calltaker in-call heartbeat failure",
+        )?;
+    }
 
     eprintln!("Running IPv4 mock test in {}...", cli.ns_calltaker);
     let ping_size = cli.ping_size.to_string();
@@ -583,6 +753,36 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         )?;
     }
 
+    if let Some(mode) = cli.drop_session {
+        let drop_offset = match drop_offset {
+            Some(offset) => offset,
+            None => {
+                eprintln!("Drop-session test: dropping calltaker Oneme session while idle");
+                let offset = file_len(&calltaker_log)?;
+                drop_oneme_session(&cli, &current_exe, ctrl_a_ip)?;
+                offset
+            }
+        };
+        run_drop_session_cycle(
+            &cli,
+            &mut harness,
+            &ctl_exe,
+            &caller_log,
+            &calltaker_log,
+            drop_offset,
+            &caller_sock,
+            caller_idx,
+            calltaker_idx,
+        )?;
+        eprintln!(
+            "Drop-session ({}) test passed",
+            match mode {
+                DropSession::Idle => "idle",
+                DropSession::InCall => "in-call",
+            }
+        );
+    }
+
     harness.success();
     eprintln!("Mock test passed");
     Ok(())
@@ -607,8 +807,6 @@ fn run_reconnect_cycle(
     caller_idx: usize,
     calltaker_idx: usize,
 ) -> Result<()> {
-    let disconnect_offset = file_len(caller_log)?;
-
     eprintln!("Reconnect test: disconnecting caller daemon");
     let shutdown_status = Command::new(ctl_exe)
         .args(["-s", &caller_sock.display().to_string(), "shutdown"])
@@ -670,22 +868,73 @@ fn run_reconnect_cycle(
         thread::sleep(Duration::from_millis(100));
     }
 
-    eprintln!("Reconnect test: placing second call");
+    place_second_call(
+        cli,
+        harness,
+        ctl_exe,
+        caller_log,
+        caller_sock,
+        caller_idx,
+        calltaker_idx,
+        "Reconnect test",
+    )?;
+
+    // Lets reconnect-host's last cycle end and the process exit on its own,
+    // instead of leaving it idling until the harness's final SIGTERM/SIGKILL
+    // cleanup (which would still work, just noisier for no reason).
+    let shutdown_status = Command::new(ctl_exe)
+        .args(["-s", &caller_sock.display().to_string(), "shutdown"])
+        .status()
+        .context("ctl shutdown (cycle 2)")?;
+    if !shutdown_status.success() {
+        bail!("final ctl shutdown failed on reconnect cycle");
+    }
+
+    eprintln!("Reconnect test passed");
+    Ok(())
+}
+
+/// Second call over an already-running caller daemon, with traffic
+/// verified end to end. Fails loudly if the call doesn't establish real
+/// tunnel traffic — a same-process reconnect (either flavor) failing
+/// silently rather than crashing is exactly what the callers of this
+/// helper exist to catch, so a plain exit-code check on `ctl call` isn't
+/// enough on its own. Tunnel counters are compared against a baseline
+/// taken just before the call: after a `--reconnect` cycle they start from
+/// zero (fresh Arc<TunnelState>, see protozoa::tunnel's TUNNEL_STATE fix),
+/// after a `--drop-session` cycle they carry over from the first call.
+#[allow(clippy::too_many_arguments)]
+fn place_second_call(
+    cli: &TestCli,
+    harness: &mut Harness,
+    ctl_exe: &Path,
+    caller_log: &Path,
+    caller_sock: &Path,
+    caller_idx: usize,
+    calltaker_idx: usize,
+    label: &str,
+) -> Result<()> {
+    let call_offset = file_len(caller_log)?;
+    let before = status_json(ctl_exe, caller_sock)?;
+    let frames_tx_before = before["tunnel"]["frames_tx"].as_u64().unwrap_or(0);
+    let frames_rx_before = before["tunnel"]["frames_rx"].as_u64().unwrap_or(0);
+
+    eprintln!("{label}: placing second call");
     let call_status = Command::new(ctl_exe)
         .args(["-s", &caller_sock.display().to_string(), "call"])
         .status()
-        .context("ctl call (cycle 2)")?;
+        .context("ctl call (second call)")?;
     if !call_status.success() {
-        bail!("ctl call failed on reconnect cycle");
+        bail!("ctl call failed on second call");
     }
 
     wait_for_log_contains_since(
         caller_log,
-        disconnect_offset,
+        call_offset,
         "connection state = connected",
         cli.ready_timeout,
         child_mut(harness, caller_idx)?,
-        "caller tunnel readiness (cycle 2)",
+        "caller tunnel readiness (second call)",
     )?;
     wait_for_tun_device(
         &cli.ns_calltaker,
@@ -693,7 +942,7 @@ fn run_reconnect_cycle(
         child_mut(harness, calltaker_idx)?,
     )?;
 
-    eprintln!("Reconnect test: pinging over the second call");
+    eprintln!("{label}: pinging over the second call");
     let ping_size = cli.ping_size.to_string();
     run_ip_netns(
         &cli.ns_calltaker,
@@ -711,41 +960,315 @@ fn run_reconnect_cycle(
         ],
     )?;
 
-    // The fresh Arc<TunnelState> this cycle's start_tun_bridge installed
-    // (see protozoa::tunnel's TUNNEL_STATE fix) starts all counters at zero,
-    // so a nonzero frame count here can only come from *this* call, not a
-    // leftover from cycle 1 — the precise thing that bug would have broken.
     let status = status_json(ctl_exe, caller_sock)?;
     let frames_tx = status["tunnel"]["frames_tx"].as_u64().unwrap_or(0);
     let frames_rx = status["tunnel"]["frames_rx"].as_u64().unwrap_or(0);
-    eprintln!("Reconnect test: cycle 2 tunnel frames_tx={frames_tx} frames_rx={frames_rx}");
-    if frames_tx == 0 || frames_rx == 0 {
+    eprintln!(
+        "{label}: second call tunnel frames_tx={frames_tx} (was {frames_tx_before}) frames_rx={frames_rx} (was {frames_rx_before})"
+    );
+    if frames_tx <= frames_tx_before || frames_rx <= frames_rx_before {
         bail!(
-            "reconnect cycle produced no tunnel traffic (frames_tx={frames_tx}, frames_rx={frames_rx}); status={status}"
+            "second call produced no tunnel traffic (frames_tx={frames_tx}, frames_rx={frames_rx}); status={status}"
         );
     }
 
-    eprintln!("Reconnect test: sending second hangup");
+    eprintln!("{label}: sending second hangup");
     let hangup_status = Command::new(ctl_exe)
         .args(["-s", &caller_sock.display().to_string(), "hangup"])
         .status()
-        .context("ctl hangup (cycle 2)")?;
+        .context("ctl hangup (second call)")?;
     if !hangup_status.success() {
-        bail!("ctl hangup failed on reconnect cycle: caller was not in a call");
+        bail!("ctl hangup failed on second call: caller was not in a call");
     }
+    wait_for_log_contains_since(
+        caller_log,
+        call_offset,
+        "call ended",
+        Duration::from_secs(10),
+        child_mut(harness, caller_idx)?,
+        "caller call ended (second call)",
+    )?;
+    Ok(())
+}
 
-    // Lets reconnect-host's last cycle end and the process exit on its own,
-    // instead of leaving it idling until the harness's final SIGTERM/SIGKILL
-    // cleanup (which would still work, just noisier for no reason).
-    let shutdown_status = Command::new(ctl_exe)
-        .args(["-s", &caller_sock.display().to_string(), "shutdown"])
+/// The calltaker's Oneme session was just dropped server-side (at
+/// `drop_offset` in its log). Waits for the daemon to notice and rebuild it
+/// without restarting, then proves the rebuilt session works by placing a
+/// second call through it.
+#[allow(clippy::too_many_arguments)]
+fn run_drop_session_cycle(
+    cli: &TestCli,
+    harness: &mut Harness,
+    ctl_exe: &Path,
+    caller_log: &Path,
+    calltaker_log: &Path,
+    drop_offset: u64,
+    caller_sock: &Path,
+    caller_idx: usize,
+    calltaker_idx: usize,
+) -> Result<()> {
+    eprintln!("Drop-session test: waiting for calltaker to re-establish its Oneme session");
+    wait_for_log_contains_since(
+        calltaker_log,
+        drop_offset,
+        "OneMe session lost, re-establishing",
+        Duration::from_secs(10),
+        child_mut(harness, calltaker_idx)?,
+        "calltaker noticing lost session",
+    )?;
+    wait_for_log_contains_since(
+        calltaker_log,
+        drop_offset,
+        "OneMe session re-established",
+        cli.ready_timeout,
+        child_mut(harness, calltaker_idx)?,
+        "calltaker session re-established",
+    )?;
+
+    place_second_call(
+        cli,
+        harness,
+        ctl_exe,
+        caller_log,
+        caller_sock,
+        caller_idx,
+        calltaker_idx,
+        "Drop-session test",
+    )
+}
+
+/// Closes the calltaker's Oneme connection at the mock server (see
+/// `server::handle_drop_oneme`), from inside its namespace.
+fn drop_oneme_session(cli: &TestCli, current_exe: &Path, ctrl_a_ip: &str) -> Result<()> {
+    let status = Command::new("ip")
+        .args(["netns", "exec", &cli.ns_calltaker])
+        .arg(current_exe)
+        .args([
+            "drop-oneme",
+            "--addr",
+            &format!("{ctrl_a_ip}:{}", cli.calls_port),
+            "--user",
+            server::CALLTAKER_EXTERNAL_ID,
+        ])
         .status()
-        .context("ctl shutdown (cycle 2)")?;
-    if !shutdown_status.success() {
-        bail!("final ctl shutdown failed on reconnect cycle");
+        .context("run mock drop-oneme")?;
+    if !status.success() {
+        bail!("mock drop-oneme failed");
     }
+    Ok(())
+}
 
-    eprintln!("Reconnect test passed");
+/// The daemon must have actually switched uid/gid — a silently ignored
+/// `privdrop` key would otherwise pass every other check, since root can
+/// do everything the dropped process can.
+fn check_privdrop(child: &mut Child, spec: &str) -> Result<()> {
+    ensure_child_running(child, "calltaker (privdrop check)")?;
+    let status = fs::read_to_string(format!("/proc/{}/status", child.id()))
+        .context("read calltaker /proc status")?;
+    let ids = |key: &str| -> Result<Vec<u32>> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(key))
+            .with_context(|| format!("no {key} line in calltaker /proc status"))?
+            .split_whitespace()
+            .map(|v| v.parse::<u32>().context("parse id"))
+            .collect()
+    };
+    let uids = ids("Uid:")?;
+    let gids = ids("Gid:")?;
+    // real, effective, saved, filesystem — all four must have moved.
+    if uids.contains(&0) || gids.contains(&0) {
+        bail!("calltaker still has root ids after privdrop {spec:?}: uids={uids:?} gids={gids:?}");
+    }
+    eprintln!("calltaker dropped privileges to {spec}: uids={uids:?} gids={gids:?}");
+    Ok(())
+}
+
+/// Runs `ctl <args>` and requires it to fail with `needle` in its error
+/// message — the daemon answered with a JSON-RPC error rather than hanging
+/// or accepting.
+fn ctl_expect_error(ctl_exe: &Path, socket: &Path, args: &[&str], needle: &str) -> Result<()> {
+    let output = Command::new(ctl_exe)
+        .args(["-s", &socket.display().to_string()])
+        .args(args)
+        .output()
+        .with_context(|| format!("run ctl {}", args.join(" ")))?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        bail!(
+            "ctl {} unexpectedly succeeded (expected error containing {needle:?}): {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stdout).trim()
+        );
+    }
+    if !stderr.contains(needle) {
+        bail!(
+            "ctl {} failed without {needle:?} in its error: {}",
+            args.join(" "),
+            stderr.trim()
+        );
+    }
+    eprintln!(
+        "ctl {} rejected as expected: {}",
+        args.join(" "),
+        stderr.trim()
+    );
+    Ok(())
+}
+
+/// Polls `ctl status` until `state` is reported, or `timeout` passes.
+fn wait_for_state(
+    ctl_exe: &Path,
+    socket: &Path,
+    state: &str,
+    timeout: Duration,
+    child: &mut Child,
+    label: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        ensure_child_running(child, label)?;
+        let status = status_json(ctl_exe, socket)?;
+        if status.get("state").and_then(serde_json::Value::as_str) == Some(state) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for {label} to reach state {state:?}; last status={status}");
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// While the mock server holds the client_hello ack (`--hello-delay`), the
+/// caller daemon sits in `connect_session_with_retry`. Everything but
+/// status/shutdown must be refused with "not connected" — and answered at
+/// all, which is the point: before reject_offline existed these calls hung
+/// until the session came up.
+fn check_connecting_rejections(
+    cli: &TestCli,
+    harness: &mut Harness,
+    ctl_exe: &Path,
+    caller_sock: &Path,
+    caller_idx: usize,
+) -> Result<()> {
+    eprintln!("Setup-delay test: checking commands while connecting");
+    // The window opens as soon as the daemon polls cmd_rx (after the media
+    // load) and lasts at least the hello delay; if we're already idle the
+    // delay was too short for this machine.
+    wait_for_state(
+        ctl_exe,
+        caller_sock,
+        "connecting",
+        cli.ready_timeout,
+        child_mut(harness, caller_idx)?,
+        "caller (connecting)",
+    )?;
+    ctl_expect_error(ctl_exe, caller_sock, &["call"], "not connected")?;
+    ctl_expect_error(ctl_exe, caller_sock, &["hangup"], "not connected")?;
+    ctl_expect_error(
+        ctl_exe,
+        caller_sock,
+        &["answer", "anytime"],
+        "not connected",
+    )?;
+    Ok(())
+}
+
+/// With the mock server holding the start-call response
+/// (`--start-call-delay`), `ctl call` blocks in Dialing for that long.
+/// During the window: status must report dialing, a second call and an
+/// answer-mode change must be refused, and hangup must abandon the call —
+/// the blocked `ctl call` then fails with "call cancelled". Runs before the
+/// calltaker is armed, so the late-arriving ring is ignored there (which
+/// covers idle_loop's outside-answer-window branch too) rather than
+/// answered; the harness waits for that before arming.
+#[allow(clippy::too_many_arguments)]
+fn check_dialing_cmds(
+    cli: &TestCli,
+    harness: &mut Harness,
+    ctl_exe: &Path,
+    caller_log: &Path,
+    calltaker_log: &Path,
+    caller_sock: &Path,
+    caller_idx: usize,
+    calltaker_idx: usize,
+    delay: Duration,
+) -> Result<()> {
+    eprintln!("Setup-delay test: checking commands while dialing");
+    wait_for_state(
+        ctl_exe,
+        caller_sock,
+        "idle",
+        cli.ready_timeout,
+        child_mut(harness, caller_idx)?,
+        "caller (idle before dialing check)",
+    )?;
+    let call_offset = file_len(caller_log)?;
+    let ring_offset = file_len(calltaker_log)?;
+    let call = Command::new(ctl_exe)
+        .args(["-s", &caller_sock.display().to_string(), "call"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("spawn ctl call (dialing check)")?;
+    wait_for_state(
+        ctl_exe,
+        caller_sock,
+        "dialing",
+        delay,
+        child_mut(harness, caller_idx)?,
+        "caller (dialing)",
+    )?;
+    ctl_expect_error(ctl_exe, caller_sock, &["call"], "already in a call")?;
+    ctl_expect_error(
+        ctl_exe,
+        caller_sock,
+        &["answer", "anytime"],
+        "cannot set answer mode during a call",
+    )?;
+    let hangup_status = Command::new(ctl_exe)
+        .args(["-s", &caller_sock.display().to_string(), "hangup"])
+        .status()
+        .context("ctl hangup (dialing check)")?;
+    if !hangup_status.success() {
+        bail!("ctl hangup while dialing failed");
+    }
+    let output = call
+        .wait_with_output()
+        .context("wait for ctl call (dialing check)")?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() || !stderr.contains("call cancelled") {
+        bail!(
+            "ctl call was not cancelled by hangup while dialing: status={} stderr={}",
+            output.status,
+            stderr.trim()
+        );
+    }
+    eprintln!("ctl call abandoned as expected: {}", stderr.trim());
+    wait_for_log_contains_since(
+        caller_log,
+        call_offset,
+        "call abandoned while starting outgoing call",
+        Duration::from_secs(5),
+        child_mut(harness, caller_idx)?,
+        "caller abandoning call",
+    )?;
+    wait_for_log_contains_since(
+        calltaker_log,
+        ring_offset,
+        "outside answer window",
+        delay + Duration::from_secs(5),
+        child_mut(harness, calltaker_idx)?,
+        "calltaker ignoring the abandoned call",
+    )?;
+    wait_for_state(
+        ctl_exe,
+        caller_sock,
+        "idle",
+        Duration::from_secs(5),
+        child_mut(harness, caller_idx)?,
+        "caller (idle after abandoned call)",
+    )?;
     Ok(())
 }
 
@@ -870,9 +1393,13 @@ fn write_tun_config(
     daemon_socket: &Path,
     noise_privkey: &str,
     noise_peer_pubkey: &str,
+    privdrop: Option<&str>,
 ) -> Result<()> {
     let media_line = media_path
         .map(|p| format!("media = \"{}\"\n", p.display()))
+        .unwrap_or_default();
+    let privdrop_line = privdrop
+        .map(|spec| format!("privdrop = \"{spec}\"\n"))
         .unwrap_or_default();
 
     let fingerprint_section = r#"[fingerprint]
@@ -899,7 +1426,8 @@ device-id = "f211d3fd4bc2d9cf""#;
 signaling-user-id = "{signaling_user_id}"
 remote-peer-id = {peer_id}
 media-video-resolution = "{DEFAULT_VIDEO_RESOLUTION}"
-{media_line}ctl-socket = "{daemon_socket}"
+oneme-keepalive-secs = {MOCK_ONEME_KEEPALIVE_SECS}
+{media_line}{privdrop_line}ctl-socket = "{daemon_socket}"
 tun-name = "{tun_name}"
 
 noise-privkey = "{noise_privkey}"
@@ -1314,6 +1842,7 @@ fn parse_cli() -> Result<Cli, String> {
     let command = match args.next().as_deref() {
         Some("server") => MockCommand::Server(parse_server_args(args)?),
         Some("test") => MockCommand::Test(parse_test_args(args)?),
+        Some("drop-oneme") => MockCommand::DropOneme(parse_drop_oneme_args(args)?),
         Some("-h") | Some("--help") | None => print_usage_and_exit(0),
         Some(other) => return Err(format!("unknown command: {other}")),
     };
@@ -1328,9 +1857,18 @@ fn parse_server_args(mut args: impl Iterator<Item = String>) -> Result<ServerCli
     let mut turn_public_addr = None;
     let mut turn_username = None;
     let mut turn_password = None;
+    let mut hello_delay = Duration::ZERO;
+    let mut start_call_delay = Duration::ZERO;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => print_server_usage_and_exit(0),
+            "--hello-delay" => {
+                hello_delay = Duration::from_secs(parse_u64_arg(args.next(), "--hello-delay")?)
+            }
+            "--start-call-delay" => {
+                start_call_delay =
+                    Duration::from_secs(parse_u64_arg(args.next(), "--start-call-delay")?)
+            }
             "--signaling-listen" => signaling_listen = next_arg(&mut args, "--signaling-listen")?,
             "--calls-listen" => calls_listen = next_arg(&mut args, "--calls-listen")?,
             "--oneme-listen" => oneme_listen = next_arg(&mut args, "--oneme-listen")?,
@@ -1355,6 +1893,25 @@ fn parse_server_args(mut args: impl Iterator<Item = String>) -> Result<ServerCli
             .ok_or_else(|| "missing required --turn-public-addr".to_string())?,
         turn_username: turn_username.ok_or_else(|| "missing required --username".to_string())?,
         turn_password: turn_password.ok_or_else(|| "missing required --password".to_string())?,
+        hello_delay,
+        start_call_delay,
+    })
+}
+
+fn parse_drop_oneme_args(mut args: impl Iterator<Item = String>) -> Result<DropOnemeCli, String> {
+    let mut addr = None;
+    let mut user = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--addr" => addr = Some(next_arg(&mut args, "--addr")?),
+            "--user" => user = Some(next_arg(&mut args, "--user")?),
+            other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
+            other => return Err(format!("unexpected positional argument: {other}")),
+        }
+    }
+    Ok(DropOnemeCli {
+        addr: addr.ok_or_else(|| "missing required --addr".to_string())?,
+        user: user.ok_or_else(|| "missing required --user".to_string())?,
     })
 }
 
@@ -1381,6 +1938,9 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
     let mut media_path = None;
     let mut netem = None;
     let mut reconnect = false;
+    let mut drop_session = None;
+    let mut setup_delay = None;
+    let mut privdrop = Some(DEFAULT_PRIVDROP.to_string());
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1409,6 +1969,25 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
             "--media" => media_path = Some(PathBuf::from(next_arg(&mut args, "--media")?)),
             "--netem" => netem = Some(next_arg(&mut args, "--netem")?),
             "--reconnect" => reconnect = true,
+            "--privdrop" => privdrop = Some(next_arg(&mut args, "--privdrop")?),
+            "--no-privdrop" => privdrop = None,
+            "--setup-delay" => {
+                setup_delay = Some(Duration::from_secs(parse_u64_arg(
+                    args.next(),
+                    "--setup-delay",
+                )?))
+            }
+            "--drop-session" => {
+                drop_session = Some(match next_arg(&mut args, "--drop-session")?.as_str() {
+                    "idle" => DropSession::Idle,
+                    "in-call" => DropSession::InCall,
+                    other => {
+                        return Err(format!(
+                            "--drop-session must be idle or in-call, got {other}"
+                        ));
+                    }
+                })
+            }
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other => return Err(format!("unexpected positional argument: {other}")),
         }
@@ -1437,6 +2016,9 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
         media_path,
         netem,
         reconnect,
+        drop_session,
+        setup_delay,
+        privdrop,
     })
 }
 
@@ -1471,6 +2053,7 @@ fn print_usage_and_exit(code: i32) -> ! {
 Usage:
   mock server [options]
   sudo mock test [options]
+  mock drop-oneme --addr HOST:PORT --user ID
 
 Run `mock <subcommand> --help` for details.
 ";
@@ -1495,6 +2078,8 @@ Options:
   --turn-public-addr ADDR       Public TURN address embedded in call metadata
   -u, --username USER           Static TURN username
   -p, --password PASS           Static TURN password
+  --hello-delay SECONDS         Hold every client_hello ack this long (default: 0)
+  --start-call-delay SECONDS    Hold every start-outgoing-call response this long (default: 0)
   -h, --help                    Show this help message
 ";
     if code == 0 {
@@ -1534,6 +2119,14 @@ Options:
   --netem EXPR               tc-netem expression applied to both veth interfaces (e.g. \"loss 3%\")
   --reconnect                After the first call, fully disconnect and reconnect the caller
                              daemon (same process) and place a second call
+  --drop-session MODE        Drop the calltaker's Oneme session at the mock server (\"idle\":
+                             after the first call, \"in-call\": during it), wait for the daemon
+                             to re-establish it in-process, and place a second call
+  --setup-delay SECONDS      Hold the mock server's client_hello ack and start-call response
+                             this long, and check that ctl commands issued while the caller is
+                             connecting / dialing are rejected (or abandon the call) promptly
+  --privdrop USER[:GROUP]    privdrop spec for the calltaker daemon (default: nobody:nogroup)
+  --no-privdrop              Run the calltaker as root like the caller
   -h, --help                 Show this help message
 ";
     if code == 0 {

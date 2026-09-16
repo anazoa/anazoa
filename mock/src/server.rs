@@ -11,6 +11,7 @@ use rcgen::generate_simple_self_signed;
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use wtransport::tls::{Certificate as WtCertificate, CertificateChain, PrivateKey
 const MAX_ONEME_FRAME_LEN: usize = 1 << 20;
 const CALLTAKER_PARTICIPANT_ID: i64 = 1;
 const CALLER_PARTICIPANT_ID: i64 = 2;
-const CALLTAKER_EXTERNAL_ID: &str = "1001";
+pub(crate) const CALLTAKER_EXTERNAL_ID: &str = "1001";
 const CALLER_EXTERNAL_ID: &str = "1002";
 const MOCK_SIGNALING_TOKEN: &str = "mock-token";
 const MOCK_ONEME_VERSION: u8 = 10;
@@ -47,6 +48,12 @@ pub struct MockServerConfig {
     pub turn_public_addr: String,
     pub turn_username: String,
     pub turn_password: String,
+    /// Artificial latency for `mock test --setup-delay`: how long to hold
+    /// the client_hello ack (keeps the daemon in Connecting) and the
+    /// start-outgoing-call response (keeps the caller in Dialing). Zero
+    /// disables both.
+    pub hello_delay: Duration,
+    pub start_call_delay: Duration,
 }
 
 pub async fn run_mock_server(config: MockServerConfig) -> Result<()> {
@@ -55,6 +62,8 @@ pub async fn run_mock_server(config: MockServerConfig) -> Result<()> {
         config.turn_public_addr,
         config.turn_username,
         config.turn_password,
+        config.hello_delay,
+        config.start_call_delay,
     ));
     tokio::try_join!(
         run_mock_signaling_server(&config.signaling_listen),
@@ -71,6 +80,12 @@ struct MockServerState {
     turn_password: String,
     pending_incoming_call: AsyncMutex<Option<Value>>,
     pending_notify: Notify,
+    /// Live Oneme connections by user id, so `POST /mock/drop-oneme` can
+    /// close one from the outside (see `handle_oneme_peer`). A test-only
+    /// stand-in for the network dropping the session under the daemon.
+    drop_hooks: AsyncMutex<HashMap<i64, Arc<Notify>>>,
+    hello_delay: Duration,
+    start_call_delay: Duration,
 }
 
 impl MockServerState {
@@ -79,14 +94,19 @@ impl MockServerState {
         turn_public_addr: String,
         turn_username: String,
         turn_password: String,
+        hello_delay: Duration,
+        start_call_delay: Duration,
     ) -> Self {
         Self {
             signaling_public_addr,
             turn_public_addr,
             turn_username,
             turn_password,
+            hello_delay,
+            start_call_delay,
             pending_incoming_call: AsyncMutex::new(None),
             pending_notify: Notify::new(),
+            drop_hooks: AsyncMutex::new(HashMap::new()),
         }
     }
 
@@ -181,6 +201,9 @@ async fn inner_handle_calls_request(
     req: Request<Incoming>,
     state: Arc<MockServerState>,
 ) -> Result<Response<Full<Bytes>>> {
+    if req.method() == Method::POST && req.uri().path() == "/mock/drop-oneme" {
+        return handle_drop_oneme(req.uri().query().unwrap_or_default(), &state).await;
+    }
     if req.method() != Method::POST || req.uri().path() != "/fb.do" {
         return Ok(text_response(StatusCode::NOT_FOUND, "not found"));
     }
@@ -211,6 +234,30 @@ async fn inner_handle_calls_request(
         "wtEndpoint": state.caller_signaling_endpoint(&form.conversation_id),
     });
     json_response(response)
+}
+
+/// `POST /mock/drop-oneme?user=<id>`: closes that user's Oneme connection
+/// server-side, the way a lost network would from the daemon's point of
+/// view. 404 if the user has no connection registered (never did a chat
+/// sync, or already dropped).
+async fn handle_drop_oneme(query: &str, state: &MockServerState) -> Result<Response<Full<Bytes>>> {
+    let DropOnemeQuery { user } =
+        serde_urlencoded::from_str(query).context("decode drop-oneme query")?;
+    let hook = state.drop_hooks.lock().await.get(&user).cloned();
+    let Some(hook) = hook else {
+        return Ok(text_response(
+            StatusCode::NOT_FOUND,
+            format!("no mock Oneme connection for user {user}"),
+        ));
+    };
+    tracing::info!("dropping mock Oneme connection for user {user} on request");
+    hook.notify_one();
+    json_response(json!({ "dropped": user }))
+}
+
+#[derive(Deserialize)]
+struct DropOnemeQuery {
+    user: i64,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +303,24 @@ async fn handle_oneme_peer(
     tls_acceptor: TlsAcceptor,
     state: Arc<MockServerState>,
 ) -> Result<()> {
+    let drop_notify = Arc::new(Notify::new());
+    let result = handle_oneme_peer_inner(stream, tls_acceptor, &state, &drop_notify).await;
+    // Only our own registration: a reconnected peer for the same user may
+    // already have replaced it with its own hook.
+    state
+        .drop_hooks
+        .lock()
+        .await
+        .retain(|_, hook| !Arc::ptr_eq(hook, &drop_notify));
+    result
+}
+
+async fn handle_oneme_peer_inner(
+    stream: TcpStream,
+    tls_acceptor: TlsAcceptor,
+    state: &MockServerState,
+    drop_notify: &Arc<Notify>,
+) -> Result<()> {
     let tls = tls_acceptor
         .accept(stream)
         .await
@@ -276,6 +341,9 @@ async fn handle_oneme_peer(
     }
     let _ = payload;
     let mut user_id = None;
+    // The client sends nothing else until the ack, so nothing is queued
+    // behind this sleep.
+    tokio::time::sleep(state.hello_delay).await;
     write_oneme_packet(
         &mut write_half,
         MOCK_ONEME_CMD_SUCCESS,
@@ -353,6 +421,11 @@ async fn handle_oneme_peer(
                         Some(packet) => packet?,
                         None => bail!("mock Oneme connection closed"),
                     },
+                    // Returning drops the write half and aborts the reader,
+                    // so the daemon sees EOF on its next read.
+                    _ = drop_notify.notified() => {
+                        bail!("mock Oneme connection for user {user_id:?} dropped on request")
+                    }
                 }
             }
         };
@@ -360,6 +433,15 @@ async fn handle_oneme_peer(
             MOCK_ONEME_OPCODE_CHAT_SYNC => {
                 let sync_user_id = mock_user_id_from_chat_sync(&payload);
                 user_id = Some(sync_user_id);
+                // Registered here rather than at accept: the user is only
+                // known from the chat sync. Insert, not entry(): the previous
+                // connection for this user (if it wasn't dropped by us) is
+                // gone anyway once the daemon has opened a new one.
+                state
+                    .drop_hooks
+                    .lock()
+                    .await
+                    .insert(sync_user_id, Arc::clone(drop_notify));
                 write_oneme_packet(
                     &mut write_half,
                     MOCK_ONEME_CMD_SUCCESS,
@@ -381,6 +463,13 @@ async fn handle_oneme_peer(
                     .get("conversationId")
                     .and_then(Value::as_str)
                     .ok_or_else(|| anyhow!("mock outgoing call missing conversationId"))?;
+                // Before store_incoming_call, so a caller that gives up
+                // during the delay has still "rung" the calltaker by the
+                // time the (now unwanted) response goes out — the harness
+                // waits for the calltaker to log that it ignored the call.
+                // Blocks this connection's loop only; the caller's send-only
+                // heartbeats just queue in the reader channel meanwhile.
+                tokio::time::sleep(state.start_call_delay).await;
                 state.store_incoming_call(conversation_id).await?;
                 let response = json!({
                     "rejectedParticipants": [],

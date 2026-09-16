@@ -28,13 +28,13 @@ sudo target/release/mock test --media test/sample.opus --keep-logs --reconnect
 
 # The netem is applied to both veth interfaces symmetrically right after they
 # come up, before TURN and anazoa start — so packet loss hits everything:
-# DTLS handshake, ICE keepalives, and VP9/Opus RTP.
+# DTLS handshake, ICE keepalives, VP9/Opus RTP, and the OneMe TLS connect
+# (which is what the harness's wait-for-idle before answer/call is for).
+# Covers fragment-reassembly expiry and duplicate-fragment handling in
+# protozoa::tunnel that a clean link never exercises.
 #
-# mild, should adapt slowly
-# --netem "loss 1%"
-#
-# aggressive, should trigger rapid downscale
-# --netem "loss 5%"
-#
-# adds RTT which affects GCC's probing
-# --netem "loss 2% delay 30ms"
+# Other expressions worth trying by hand:
+#   mild, should adapt slowly:                 --netem "loss 1%"
+#   aggressive, should trigger rapid downscale: --netem "loss 5%"
+#   milder loss with RTT (affects GCC probing): --netem "loss 2% delay 30ms"
+sudo target/release/mock test --media test/sample.opus --keep-logs --netem "loss 5% delay 30ms"
