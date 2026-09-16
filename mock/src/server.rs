@@ -126,7 +126,11 @@ impl MockServerState {
             "conversationId": conversation_id,
         });
         *self.pending_incoming_call.lock().await = Some(incoming);
-        self.pending_notify.notify_waiters();
+        // notify_one, not notify_waiters: the waiter drops the mutex guard
+        // before its `Notified` future is first polled, so on a multi-thread
+        // runtime this can fire in that gap. notify_one stores a permit for
+        // the next `notified()` call; notify_waiters would be lost.
+        self.pending_notify.notify_one();
         Ok(())
     }
 

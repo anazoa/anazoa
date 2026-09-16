@@ -24,6 +24,12 @@ const ONE_ME_WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const SESSION_ID_MIN: u32 = 30;
 const SESSION_ID_RANGE: u32 = 171;
 const MAX_FRAME_LEN: usize = 1 << 20;
+/// Cap on a single LZ4-compressed OneMe frame once inflated. Frames are
+/// bounded by `MAX_FRAME_LEN` on the wire, but a large chat-sync or server
+/// push can legitimately inflate well past that; 8 MiB matches the signaling
+/// inflate cap and is far beyond anything the real client exchanges.
+const MAX_FRAME_DECOMPRESSED_LEN: usize = 8 << 20;
+/// Cap on the inflated vcp blob (a few KiB of JSON in practice).
 const MAX_DECOMPRESSED_LEN: usize = 64 << 10;
 /// Maximum nesting depth accepted when parsing msgpack from the wire,
 /// to bound recursion in `MsgParser::parse_value` against a hostile server.
@@ -809,7 +815,7 @@ fn truncate_json(value: &Value) -> String {
 
 fn decode_payload(cof: i8, payload: &[u8]) -> Result<Vec<u8>> {
     if cof > 0 {
-        return lz4_decompress_block(payload).context("decompress OneMe payload");
+        return lz4_decompress_block(payload, cof as usize).context("decompress OneMe payload");
     }
     Ok(payload.to_vec())
 }
@@ -1195,8 +1201,16 @@ impl<'a> MsgParser<'a> {
     }
 }
 
-fn lz4_decompress_block(input: &[u8]) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; MAX_DECOMPRESSED_LEN];
+/// Inflates a raw LZ4 block. The wire carries no explicit uncompressed size,
+/// but the client sets `cof = raw_len / compressed_len + 1` (see
+/// `reveng/max-26.30.1-changes.md`), so `cof * compressed_len` is a strict
+/// upper bound on the output — size the buffer from that instead of a fixed
+/// allocation, bounded by `MAX_FRAME_DECOMPRESSED_LEN`.
+fn lz4_decompress_block(input: &[u8], cof: usize) -> Result<Vec<u8>> {
+    let bound = cof
+        .saturating_mul(input.len())
+        .min(MAX_FRAME_DECOMPRESSED_LEN);
+    let mut out = vec![0u8; bound];
     let len = lz4_flex::block::decompress_into(input, &mut out)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
     out.truncate(len);
