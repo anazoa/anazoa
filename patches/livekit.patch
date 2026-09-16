@@ -39,7 +39,7 @@ index 0dc40648..1e5c4d51 100644
 -env_logger = { workspace = true }
 +env_logger = "0.11"
 diff --git a/webrtc-sys/build.rs b/webrtc-sys/build.rs
-index 6451740b..74d6f15f 100644
+index 6451740b..beba6d7c 100644
 --- a/webrtc-sys/build.rs
 +++ b/webrtc-sys/build.rs
 @@ -23,7 +23,8 @@ fn main() {
@@ -86,7 +86,22 @@ index 6451740b..74d6f15f 100644
                  }
              }
  
-@@ -396,6 +398,10 @@ fn main() {
+@@ -372,7 +374,13 @@ fn main() {
+                 .flag("-std=c++20");
+         }
+         "android" => {
+-            webrtc_sys_build::configure_jni_symbols().unwrap();
++            // JNI symbol force-keep/version-script generation now happens in
++            // anazoa-tun's own build.rs, not here — webrtc-sys is only a
++            // dependency of the actual cdylib target (anazoa-tun), so
++            // emitting cargo:rustc-link-arg-cdylib from this crate relied on
++            // an unintended-but-kept-for-compatibility Cargo propagation
++            // quirk (https://github.com/rust-lang/cargo/issues/9562) instead
++            // of applying to the crate it actually describes.
+ 
+             println!("cargo:rustc-link-lib=EGL");
+             println!("cargo:rustc-link-lib=OpenSLES");
+@@ -396,6 +404,10 @@ fn main() {
      builder.define("LIVEKIT_TEST", None);
      builder.warnings(false).compile("webrtcsys-cxx");
  
@@ -122,7 +137,7 @@ index 4e985b52..d3abf22b 100644
 -anyhow = { workspace = true }
 +anyhow = "1.0"
 diff --git a/webrtc-sys/build/src/lib.rs b/webrtc-sys/build/src/lib.rs
-index 586b6675..fcb8b837 100644
+index 586b6675..4aeb3a18 100644
 --- a/webrtc-sys/build/src/lib.rs
 +++ b/webrtc-sys/build/src/lib.rs
 @@ -118,12 +118,13 @@ pub fn webrtc_dir() -> path::PathBuf {
@@ -145,11 +160,39 @@ index 586b6675..fcb8b837 100644
  
      let mut seen = HashSet::new();
      let mut vec = Vec::new();
+@@ -178,9 +179,16 @@ pub fn configure_jni_symbols() -> Result<()> {
+         return Err(anyhow!("No JNI symbols found")); // Shouldn't happen
+     }
+ 
+-    // Keep JNI symbols
++    // Keep JNI symbols. Plain `cargo:rustc-link-arg` only applies when the
++    // *emitting* crate is the one directly producing the final artifact —
++    // webrtc-sys is a dependency of anazoa-tun (the actual cdylib), so those
++    // directives were silently dropped: this build script's own log showed
++    // all 224 --undefined= lines plus --version-script, correctly computed,
++    // but none of it ever reached the real link command (verified via
++    // `cargo build -v`). `-cdylib` is the variant designed to propagate from
++    // anywhere in the dependency graph to the final cdylib/bin target.
+     for symbol in &jni_symbols {
+-        println!("cargo:rustc-link-arg=-Wl,--undefined={}", symbol);
++        println!("cargo:rustc-link-arg-cdylib=-Wl,--undefined={}", symbol);
+     }
+ 
+     // Version script
+@@ -191,7 +199,7 @@ pub fn configure_jni_symbols() -> Result<()> {
+     write!(vs_file, "JNI_WEBRTC {{\n\tglobal: {}; \n}};", jni_symbols)
+         .context("Failed to write version script")?;
+ 
+-    println!("cargo:rustc-link-arg=-Wl,--version-script={}", vs_path.display());
++    println!("cargo:rustc-link-arg-cdylib=-Wl,--version-script={}", vs_path.display());
+ 
+     Ok(())
+ }
 diff --git a/webrtc-sys/libwebrtc/.gclient b/webrtc-sys/libwebrtc/.gclient
-index 490388b9..7462b3fc 100644
+index 490388b9..f5f0033b 100644
 --- a/webrtc-sys/libwebrtc/.gclient
 +++ b/webrtc-sys/libwebrtc/.gclient
-@@ -1,7 +1,7 @@
+@@ -1,9 +1,10 @@
  solutions = [
    {
      "name": 'src',
@@ -158,6 +201,9 @@ index 490388b9..7462b3fc 100644
      "custom_deps": {},
      "deps_file": "DEPS",
      "managed": False,
+   },
+ ]
++target_os = ['android', 'linux']
 diff --git a/webrtc-sys/libwebrtc/build_linux.sh b/webrtc-sys/libwebrtc/build_linux.sh
 index 417c9b9f..a78bba6a 100755
 --- a/webrtc-sys/libwebrtc/build_linux.sh

@@ -6,7 +6,9 @@ use tokio::net::UnixStream;
 const DEFAULT_SOCKET: &str = "/run/anazoa.sock";
 
 fn usage() -> ! {
-    eprintln!("usage: ctl [-s socket] <call [peer_id] | hangup | status | answer <secs>|always>");
+    eprintln!(
+        "usage: ctl [-s socket] <call [peer_id] | hangup | status | answer <secs>|anytime|always | shutdown>"
+    );
     std::process::exit(1);
 }
 
@@ -44,15 +46,17 @@ async fn main() -> Result<()> {
                 json!(null)
             }
         }
-        "hangup" | "status" => json!(null),
+        "hangup" | "status" | "shutdown" => json!(null),
         "answer" => {
             let arg = args.next().unwrap_or_else(|| usage());
-            if arg == "always" {
+            if arg == "anytime" {
                 json!({})
+            } else if arg == "always" {
+                json!({"forever": true})
             } else {
-                let secs: u64 = arg
-                    .parse()
-                    .map_err(|_| anyhow!("answer: expected a number of seconds or 'always'"))?;
+                let secs: u64 = arg.parse().map_err(|_| {
+                    anyhow!("answer: expected a number of seconds, 'anytime', or 'always'")
+                })?;
                 json!({"secs": secs})
             }
         }

@@ -1,6 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use super::media::{VIDEO_HEIGHT, VIDEO_WIDTH};
 use super::noise::{
@@ -15,7 +15,7 @@ pub use super::noise::{NoiseRole, init_noise_keys, noise_auth_failed};
 /// Reset noise and tunnel auth state for a new call.
 pub fn prepare_noise_for_call(role: NoiseRole) {
     noise_reset_state(role);
-    if let Some(ts) = TUNNEL_STATE.get()
+    if let Some(ts) = tunnel_state()
         && NOISE_KEYS.get().is_some()
     {
         ts.authenticated.store(false, Ordering::Relaxed);
@@ -50,7 +50,44 @@ pub const WHOLE_HEADER_LEN: usize = 8;
 pub const FRAGMENT_HEADER_LEN: usize = 16;
 pub const VP9_SHOW_EXISTING_FRAME_SLOT_0: &[u8] = &[0x88];
 
-pub static TUNNEL_STATE: OnceLock<Arc<TunnelState>> = OnceLock::new();
+// A plain OnceLock can only ever be set once for the life of the process,
+// which is fine for the desktop CLI (fresh process per call) but not for
+// Android: `libanazoa_tun.so` stays loaded across disconnect/reconnect, so a
+// second `start_tun_bridge` call after `nativeStop`/`nativeStart` would find
+// this already set and bail with "tunnel state already initialized",
+// breaking every reconnect. An RwLock lets each new call session overwrite
+// the previous (already-torn-down) state instead.
+static TUNNEL_STATE: RwLock<Option<Arc<TunnelState>>> = RwLock::new(None);
+
+/// Current tunnel state, if a call session has initialized one. Recovers
+/// from a poisoned lock (a panic elsewhere shouldn't permanently break
+/// every subsequent reconnect attempt).
+pub fn tunnel_state() -> Option<Arc<TunnelState>> {
+    TUNNEL_STATE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+fn set_tunnel_state(state: Arc<TunnelState>) {
+    *TUNNEL_STATE.write().unwrap_or_else(|e| e.into_inner()) = Some(state);
+}
+
+/// Clears the global only if it still holds `state`. A bridge whose engine
+/// task outlived its `nativeStop` (see `host::TunnelSession::stop`'s
+/// bounded wait) can be dropped *after* the next session's
+/// `start_tun_bridge` has installed a fresh state; unconditionally clearing
+/// here would silently disable that new session's tunnel (every hook
+/// treats `tunnel_state() == None` as "no tunnel", with no error logged).
+fn clear_tunnel_state_if(state: &Arc<TunnelState>) {
+    let mut slot = TUNNEL_STATE.write().unwrap_or_else(|e| e.into_inner());
+    if slot
+        .as_ref()
+        .is_some_and(|current| Arc::ptr_eq(current, state))
+    {
+        *slot = None;
+    }
+}
 
 /// Number of one-second buckets kept for utilization history (covers 5 minutes).
 pub const UTILIZATION_HISTORY_SECS: usize = 300;
@@ -214,12 +251,21 @@ pub struct TunBridge {
     pub _tun: Arc<AsyncDevice>,
     pub reader: tokio::task::JoinHandle<()>,
     pub writer: tokio::task::JoinHandle<()>,
+    /// The state this bridge installed into `TUNNEL_STATE`, so `drop` can
+    /// tell whether the global is still ours to clear.
+    state: Arc<TunnelState>,
 }
 
 impl Drop for TunBridge {
     fn drop(&mut self) {
         self.reader.abort();
         self.writer.abort();
+        // Matches this bridge's lifetime to TUNNEL_STATE's: both span exactly
+        // one `start_tun_bridge` call, so tearing down the bridge is the
+        // right point to drop the global too, rather than leaving a stale
+        // Arc around until the next connect overwrites it — but only if a
+        // later bridge hasn't already replaced it.
+        clear_tunnel_state_if(&self.state);
     }
 }
 
@@ -249,9 +295,7 @@ pub async fn start_tun_bridge(
         video_height,
     ));
 
-    TUNNEL_STATE
-        .set(Arc::clone(&state))
-        .map_err(|_| anyhow!("tunnel state already initialized"))?;
+    set_tunnel_state(Arc::clone(&state));
 
     let reader_tun = Arc::clone(&tun);
     let reader_state = Arc::clone(&state);
@@ -304,12 +348,19 @@ pub async fn start_tun_bridge(
         }
     });
 
+    // `.name()` is only implemented where tun-rs owns interface creation
+    // (Linux DeviceBuilder path); on Android the fd (and its name) come from
+    // VpnService, which tun-rs's from_fd() wrapper doesn't expose here.
+    #[cfg(target_os = "linux")]
     let tun_name = tun.name().unwrap_or_else(|_| "<unknown>".to_string());
+    #[cfg(not(target_os = "linux"))]
+    let tun_name = "vpn".to_string();
     info!("TUN bridge initialized on {tun_name}");
     Ok(TunBridge {
         _tun: tun,
         reader,
         writer,
+        state,
     })
 }
 
@@ -318,7 +369,7 @@ pub fn next_tunnel_frame(
     is_key_frame: bool,
     sender_res: (u16, u16),
 ) -> Option<Vec<u8>> {
-    let state = TUNNEL_STATE.get()?;
+    let state = tunnel_state()?;
     if carrier_len == 0 {
         return None;
     }
@@ -412,7 +463,7 @@ pub fn pop_cached_frame_that_fits(
 
 /// Returns `Some((is_key_frame, sender_width, sender_height))` from the last data frame parsed.
 pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
-    let state = TUNNEL_STATE.get()?;
+    let state = tunnel_state()?;
     let mut last_data: Option<(bool, u16, u16)> = None;
     let mut offset = 0usize;
 
@@ -751,7 +802,7 @@ pub unsafe extern "C" fn hook_after_vp9_encode(
     }
     let buf = unsafe { std::slice::from_raw_parts_mut(payload, len) };
 
-    if let Some(state) = TUNNEL_STATE.get() {
+    if let Some(state) = tunnel_state() {
         state.hook_encode_calls.fetch_add(1, Ordering::Relaxed);
 
         // Read the original frame before overwriting, for webm mux and keyframe cache.
@@ -822,7 +873,7 @@ pub unsafe extern "C" fn hook_before_vp9_reference_find(
             *output_is_key_frame = is_key_frame;
         }
     }
-    let Some(state) = TUNNEL_STATE.get() else {
+    let Some(state) = tunnel_state() else {
         return 0;
     };
     state.hook_reference_calls.fetch_add(1, Ordering::Relaxed);
@@ -915,7 +966,7 @@ fn after_opus_encode(payload: &mut [u8]) -> bool {
         return true;
     }
     // WebM logging (side effect only; no payload change).
-    if let Some(state) = TUNNEL_STATE.get()
+    if let Some(state) = tunnel_state()
         && let Ok(mut mux) = state.webm_mux.lock()
         && let Some(ref mut webm) = *mux
     {
@@ -925,7 +976,7 @@ fn after_opus_encode(payload: &mut [u8]) -> bool {
 }
 
 fn before_opus_decode(payload: &mut [u8]) -> usize {
-    let Some(tunnel) = TUNNEL_STATE.get() else {
+    let Some(tunnel) = tunnel_state() else {
         return 0;
     };
     let authenticated = tunnel.authenticated.load(Ordering::Relaxed);
@@ -1097,7 +1148,7 @@ impl WebmMuxer {
 }
 
 pub fn finalize_webm() {
-    if let Some(state) = TUNNEL_STATE.get()
+    if let Some(state) = tunnel_state()
         && let Ok(mut mux) = state.webm_mux.lock()
         && let Some(webm) = mux.take()
     {

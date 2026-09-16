@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
 use tracing::debug;
 use unicode_truncate::UnicodeTruncateStr;
+use webpki_roots::TLS_SERVER_ROOTS;
 use wtransport::config::QuicTransportConfig;
 use wtransport::tls::WEBTRANSPORT_ALPN;
 use wtransport::{ClientConfig, Endpoint};
@@ -243,9 +244,27 @@ fn build_wt_client_config(tc: QuicTransportConfig, skip_tls_verify: bool) -> Cli
             .build();
     }
 
+    // wtransport's default (.with_custom_transport's implicit TLS) loads
+    // roots via rustls-native-certs, which on Android has no platform
+    // implementation at all (it only special-cases windows/macos and falls
+    // back to probing Linux-distro paths like /etc/ssl/certs on every other
+    // unix, Android included) — that finds nothing, so the root store ends
+    // up empty and every real server cert fails as UnknownIssuer. Bundling
+    // Mozilla's root list via webpki-roots sidesteps the OS store entirely,
+    // matching the same fix oneme.rs already uses for its own TLS config.
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(TLS_SERVER_ROOTS.iter().cloned());
+    let mut tls = rustls::ClientConfig::builder_with_provider(provider)
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("valid TLS 1.3 client config")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![WEBTRANSPORT_ALPN.to_vec()];
+
     ClientConfig::builder()
         .with_bind_default()
-        .with_custom_transport(tc)
+        .with_custom_tls_and_transport(tls, tc)
         .build()
 }
 

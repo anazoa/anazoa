@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use tokio_rustls::TlsAcceptor;
 use wtransport::Endpoint;
 use wtransport::Identity;
@@ -252,18 +252,28 @@ async fn handle_oneme_peer(
     tls_acceptor: TlsAcceptor,
     state: Arc<MockServerState>,
 ) -> Result<()> {
-    let mut tls = tls_acceptor
+    let tls = tls_acceptor
         .accept(stream)
         .await
         .context("accept mock Oneme TLS connection")?;
-    let (seq, opcode, payload) = read_oneme_packet(&mut tls).await?;
+    // Split for concurrent read/push below: the real client (see
+    // auth/src/oneme.rs's wait_for_incoming_call) never asks for the next
+    // incoming call, it just expects the server to push CMD_EVENT/
+    // OPCODE_INCOMING_CALL packets over this same persistent connection
+    // whenever one arrives, indefinitely — while also still reading
+    // whatever else the client sends (heartbeats, ...) on the same
+    // connection. One `&mut tls` can't be borrowed by two concurrent
+    // futures at once, hence the split.
+    let (mut read_half, mut write_half) = tokio::io::split(tls);
+
+    let (seq, opcode, payload) = read_oneme_packet(&mut read_half).await?;
     if opcode != MOCK_ONEME_OPCODE_CLIENT_HELLO {
         bail!("expected mock Oneme client_hello opcode 6, got opcode={opcode}");
     }
     let _ = payload;
     let mut user_id = None;
     write_oneme_packet(
-        &mut tls,
+        &mut write_half,
         MOCK_ONEME_CMD_SUCCESS,
         seq,
         MOCK_ONEME_OPCODE_CLIENT_HELLO,
@@ -272,35 +282,82 @@ async fn handle_oneme_peer(
     .await
     .context("send mock Oneme client_hello ack")?;
 
-    let mut next_packet =
-        match tokio::time::timeout(Duration::from_secs(1), read_oneme_packet(&mut tls)).await {
-            Ok(packet) => Some(packet?),
-            Err(_) => {
-                let incoming = state.wait_for_incoming_call().await;
-                write_oneme_packet(
-                    &mut tls,
-                    MOCK_ONEME_CMD_EVENT,
-                    0,
-                    MOCK_ONEME_OPCODE_INCOMING_CALL,
-                    incoming,
-                )
-                .await
-                .context("send mock incoming call")?;
-                return Ok(());
+    // Packets arrive through a dedicated reader task rather than being read
+    // inline in the select!/timeout below: `read_oneme_packet` is built on
+    // `read_exact`, which is not cancellation-safe — if another branch won
+    // while it had consumed part of a header or payload, those bytes were
+    // simply lost and the stream desynced (next iteration parsed garbage
+    // and bailed). An mpsc `recv()` *is* cancel-safe, so the reader owns
+    // the read half outright and the loop only ever waits on the channel.
+    let (packet_tx, mut packet_rx) = mpsc::channel(4);
+    let reader = tokio::spawn(async move {
+        loop {
+            let packet = read_oneme_packet(&mut read_half).await;
+            let is_err = packet.is_err();
+            if packet_tx.send(packet).await.is_err() || is_err {
+                return;
             }
-        };
+        }
+    });
+    // Whatever ends this handler (error, or the early return below) takes
+    // the reader with it rather than leaving it blocked on a dead socket.
+    let _reader = AbortOnDrop(reader);
 
+    let mut next_packet = match tokio::time::timeout(Duration::from_secs(1), packet_rx.recv()).await
+    {
+        Ok(Some(packet)) => Some(packet?),
+        Ok(None) => bail!("mock Oneme connection closed after client_hello"),
+        Err(_) => {
+            let incoming = state.wait_for_incoming_call().await;
+            write_oneme_packet(
+                &mut write_half,
+                MOCK_ONEME_CMD_EVENT,
+                0,
+                MOCK_ONEME_OPCODE_INCOMING_CALL,
+                incoming,
+            )
+            .await
+            .context("send mock incoming call")?;
+            return Ok(());
+        }
+    };
+
+    let calltaker_id = CALLTAKER_EXTERNAL_ID.parse::<i64>().expect("valid id");
     loop {
+        let is_calltaker = user_id == Some(calltaker_id);
         let (seq, opcode, payload) = match next_packet.take() {
             Some(packet) => packet,
-            None => read_oneme_packet(&mut tls).await?,
+            None => {
+                tokio::select! {
+                    // Repeats for as long as this connection stays open, so a
+                    // calltaker that's already handled one call keeps
+                    // receiving later ones too (e.g. a --reconnect test's
+                    // second call) instead of only ever getting the first.
+                    incoming = state.wait_for_incoming_call(), if is_calltaker => {
+                        write_oneme_packet(
+                            &mut write_half,
+                            MOCK_ONEME_CMD_EVENT,
+                            0,
+                            MOCK_ONEME_OPCODE_INCOMING_CALL,
+                            incoming,
+                        )
+                        .await
+                        .context("send mock incoming call")?;
+                        continue;
+                    }
+                    packet = packet_rx.recv() => match packet {
+                        Some(packet) => packet?,
+                        None => bail!("mock Oneme connection closed"),
+                    },
+                }
+            }
         };
         match opcode {
             MOCK_ONEME_OPCODE_CHAT_SYNC => {
                 let sync_user_id = mock_user_id_from_chat_sync(&payload);
                 user_id = Some(sync_user_id);
                 write_oneme_packet(
-                    &mut tls,
+                    &mut write_half,
                     MOCK_ONEME_CMD_SUCCESS,
                     seq,
                     MOCK_ONEME_OPCODE_CHAT_SYNC,
@@ -308,18 +365,9 @@ async fn handle_oneme_peer(
                 )
                 .await
                 .context("send mock chat sync response")?;
-                if sync_user_id == CALLTAKER_EXTERNAL_ID.parse::<i64>().expect("valid id") {
-                    let incoming = state.wait_for_incoming_call().await;
-                    write_oneme_packet(
-                        &mut tls,
-                        MOCK_ONEME_CMD_EVENT,
-                        0,
-                        MOCK_ONEME_OPCODE_INCOMING_CALL,
-                        incoming,
-                    )
-                    .await
-                    .context("send mock incoming call")?;
-                }
+                // A newly-true `is_calltaker` takes effect on the loop's next
+                // pass through the `select!` above, which delivers as many
+                // incoming calls as arrive rather than just the first one.
             }
             MOCK_ONEME_OPCODE_START_OUTGOING_CALL => {
                 if user_id != Some(CALLER_EXTERNAL_ID.parse::<i64>().expect("valid id")) {
@@ -346,7 +394,7 @@ async fn handle_oneme_peer(
                     })).context("serialize mock internalCallerParams")?,
                 });
                 write_oneme_packet(
-                    &mut tls,
+                    &mut write_half,
                     MOCK_ONEME_CMD_SUCCESS,
                     seq,
                     MOCK_ONEME_OPCODE_START_OUTGOING_CALL,
@@ -357,11 +405,26 @@ async fn handle_oneme_peer(
             }
             _ => {
                 tracing::debug!("ignoring mock Oneme opcode {opcode}");
-                write_oneme_packet(&mut tls, MOCK_ONEME_CMD_SUCCESS, seq, opcode, Value::Null)
-                    .await
-                    .context("send generic mock Oneme response")?;
+                write_oneme_packet(
+                    &mut write_half,
+                    MOCK_ONEME_CMD_SUCCESS,
+                    seq,
+                    opcode,
+                    Value::Null,
+                )
+                .await
+                .context("send generic mock Oneme response")?;
             }
         }
+    }
+}
+
+/// Aborts the wrapped task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

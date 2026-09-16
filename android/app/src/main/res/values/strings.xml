@@ -1,0 +1,26 @@
+<resources>
+    <string name="app_name">Anazoa VPN</string>
+    <string name="status_idle">Disconnected</string>
+    <string name="status_connecting">Connecting…</string>
+    <string name="status_connected">Connected</string>
+    <string name="status_failed">Failed to connect</string>
+    <string name="error_no_config">Import or write a config first</string>
+    <string name="label_config">Engine Configuration</string>
+    <string name="action_load_config">Load from file…</string>
+    <string name="action_import_config">Import config…</string>
+    <string name="toast_config_imported">Config imported</string>
+    <string name="error_load_config">Could not read that file</string>
+    <string name="hint_config">anazoa.toml</string>
+    <string name="label_cidr">Local TUN address / prefix</string>
+    <string name="default_cidr">10.77.0.2/30</string>
+    <string name="error_invalid_cidr">Invalid address/prefix, keeping previous value</string>
+    <string name="action_connect">Connect</string>
+    <string name="action_disconnect">Disconnect</string>
+    <string name="action_config">Config</string>
+    <string name="action_log">Log</string>
+    <string name="label_media">Audio .opus</string>
+    <string name="action_load_media">Load media file…</string>
+    <string name="media_status_none">none</string>
+    <string name="media_status_loaded">%1$s loaded</string>
+    <string name="error_load_media">Could not read that file</string>
+</resources>

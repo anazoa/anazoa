@@ -2,7 +2,7 @@ mod server;
 
 use std::env;
 use std::fs::{self, File};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -75,6 +75,13 @@ struct TestCli {
     /// Optional tc-netem expression applied symmetrically to both veth interfaces,
     /// e.g. "loss 3%" or "loss 5% delay 20ms".
     netem: Option<String>,
+    /// After the first call ends, fully disconnect and reconnect the caller
+    /// daemon (via `ctl shutdown` + `reconnect-host --cycles 2`, all within
+    /// the same process) and place a second call. Reproduces what Android's
+    /// nativeStart/nativeStop cycle does in the same loaded .so — a plain
+    /// `mock test` never touches process-lifetime statics (TUNNEL_STATE,
+    /// SHUTDOWN_TX, ...) more than once, since each peer is a fresh process.
+    reconnect: bool,
 }
 
 struct Harness {
@@ -200,6 +207,11 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
     let current_exe = env::current_exe().context("resolve mock path")?;
     let tun_exe = sibling_binary(&current_exe, "anazoa-tun")?;
     let ctl_exe = sibling_binary(&current_exe, "anazoa-ctl")?;
+    let reconnect_host_exe = if cli.reconnect {
+        Some(sibling_binary(&current_exe, "reconnect-host")?)
+    } else {
+        None
+    };
     let media_path = cli
         .media_path
         .as_ref()
@@ -364,8 +376,25 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
     harness.add_child(calltaker_child);
     let calltaker_idx = harness.children.len() - 1;
 
-    let caller_args = tun_args(&caller_config);
-    let caller_child = spawn_logged(Some(&cli.ns_caller), &tun_exe, &caller_args, &caller_log)?;
+    // Matches Android's nativeStart/nativeStop cycle: the caller (always the
+    // caller side, same as the real app) disconnects and reconnects within
+    // one process instead of a fresh `anazoa-tun` per call. reconnect-host
+    // is a separate test-only binary (see mock/src/bin/reconnect_host.rs)
+    // built on the same TunnelSession the desktop CLI and android.rs use —
+    // production `anazoa-tun` has no reconnect-loop flag of its own.
+    let (caller_exe, caller_args): (&Path, Vec<String>) = match &reconnect_host_exe {
+        Some(exe) => (
+            exe,
+            vec![
+                "-c".to_string(),
+                caller_config.display().to_string(),
+                "--cycles".to_string(),
+                "2".to_string(),
+            ],
+        ),
+        None => (&tun_exe, tun_args(&caller_config)),
+    };
+    let caller_child = spawn_logged(Some(&cli.ns_caller), caller_exe, &caller_args, &caller_log)?;
     harness.add_child(caller_child);
     let caller_idx = harness.children.len() - 1;
 
@@ -387,7 +416,10 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
             "-s",
             &calltaker_sock.display().to_string(),
             "answer",
-            "always",
+            // "always" persists across calls, so a --reconnect run's second
+            // call doesn't need the calltaker re-armed; "anytime" (a single
+            // armed window) matches the existing non-reconnect behavior.
+            if cli.reconnect { "always" } else { "anytime" },
         ])
         .status()
         .context("ctl answer")?;
@@ -539,8 +571,165 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         "caller call ended",
     )?;
 
+    if cli.reconnect {
+        run_reconnect_cycle(&cli, &mut harness, &ctl_exe, &caller_log, &caller_sock, caller_idx, calltaker_idx)?;
+    }
+
     harness.success();
     eprintln!("Mock test passed");
+    Ok(())
+}
+
+/// Disconnects the caller daemon entirely (`ctl shutdown`, the RPC
+/// equivalent of Android's `nativeStop`) and places a second call once it
+/// reconnects (`reconnect-host` loops back to a fresh session in the same
+/// process, matching `nativeStart` being called again on the same loaded
+/// .so). Fails loudly if the second call doesn't establish real
+/// tunnel traffic — the failure mode of the bug this reproduces is a
+/// same-process reconnect either erroring immediately (stale OnceLock global)
+/// or silently exiting (stale "shutdown already requested" state), not a
+/// crash, so a plain exit-code check on `ctl call` isn't enough on its own.
+#[allow(clippy::too_many_arguments)]
+fn run_reconnect_cycle(
+    cli: &TestCli,
+    harness: &mut Harness,
+    ctl_exe: &Path,
+    caller_log: &Path,
+    caller_sock: &Path,
+    caller_idx: usize,
+    calltaker_idx: usize,
+) -> Result<()> {
+    let disconnect_offset = file_len(caller_log)?;
+
+    eprintln!("Reconnect test: disconnecting caller daemon");
+    let shutdown_status = Command::new(ctl_exe)
+        .args(["-s", &caller_sock.display().to_string(), "shutdown"])
+        .status()
+        .context("ctl shutdown")?;
+    if !shutdown_status.success() {
+        bail!("ctl shutdown failed");
+    }
+
+    // Unique to the second cycle (see reconnect_host.rs): proves the process
+    // looped back into a fresh session instead of exiting.
+    wait_for_log_contains(
+        caller_log,
+        "reconnect-host: starting cycle 1",
+        Duration::from_secs(10),
+        child_mut(harness, caller_idx)?,
+        "caller reconnect-host cycle 1 started",
+    )?;
+
+    wait_for_socket(
+        caller_sock,
+        cli.ready_timeout,
+        child_mut(harness, caller_idx)?,
+        "caller socket (cycle 2)",
+    )?;
+    wait_for_tun_device(&cli.ns_caller, &cli.tun_name, child_mut(harness, caller_idx)?)?;
+    configure_tun(
+        &cli.ns_caller,
+        &cli.tun_name,
+        cli.mtu,
+        DEFAULT_TUN_IPV4_B,
+        "10.77.0.1",
+        DEFAULT_TUN_IPV6_B,
+        "fd00:77::1",
+    )?;
+
+    // The reopened session's connect_session_with_retry (cycle 2) takes a
+    // moment; "OneMe session established" isn't a usable marker for it since
+    // it already appeared once in cycle 1's log. Poll `ctl status` instead:
+    // reject_not_connected reports "connecting" until the session is up.
+    eprintln!("Reconnect test: waiting for OneMe session to re-establish");
+    let deadline = Instant::now() + cli.ready_timeout;
+    loop {
+        ensure_child_running(child_mut(harness, caller_idx)?, "caller (cycle 2)")?;
+        if status_json(ctl_exe, caller_sock)?
+            .get("state")
+            .and_then(|s| s.as_str())
+            != Some("connecting")
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out waiting for caller OneMe session to re-establish");
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+
+    eprintln!("Reconnect test: placing second call");
+    let call_status = Command::new(ctl_exe)
+        .args(["-s", &caller_sock.display().to_string(), "call"])
+        .status()
+        .context("ctl call (cycle 2)")?;
+    if !call_status.success() {
+        bail!("ctl call failed on reconnect cycle");
+    }
+
+    wait_for_log_contains_since(
+        caller_log,
+        disconnect_offset,
+        "connection state = connected",
+        cli.ready_timeout,
+        child_mut(harness, caller_idx)?,
+        "caller tunnel readiness (cycle 2)",
+    )?;
+    wait_for_tun_device(&cli.ns_calltaker, &cli.tun_name, child_mut(harness, calltaker_idx)?)?;
+
+    eprintln!("Reconnect test: pinging over the second call");
+    let ping_size = cli.ping_size.to_string();
+    run_ip_netns(
+        &cli.ns_calltaker,
+        &[
+            "ping",
+            "-i",
+            "0.5",
+            "-c",
+            "10",
+            "-W",
+            "1",
+            "-s",
+            ping_size.as_str(),
+            "10.77.0.2",
+        ],
+    )?;
+
+    // The fresh Arc<TunnelState> this cycle's start_tun_bridge installed
+    // (see protozoa::tunnel's TUNNEL_STATE fix) starts all counters at zero,
+    // so a nonzero frame count here can only come from *this* call, not a
+    // leftover from cycle 1 — the precise thing that bug would have broken.
+    let status = status_json(ctl_exe, caller_sock)?;
+    let frames_tx = status["tunnel"]["frames_tx"].as_u64().unwrap_or(0);
+    let frames_rx = status["tunnel"]["frames_rx"].as_u64().unwrap_or(0);
+    eprintln!("Reconnect test: cycle 2 tunnel frames_tx={frames_tx} frames_rx={frames_rx}");
+    if frames_tx == 0 || frames_rx == 0 {
+        bail!(
+            "reconnect cycle produced no tunnel traffic (frames_tx={frames_tx}, frames_rx={frames_rx}); status={status}"
+        );
+    }
+
+    eprintln!("Reconnect test: sending second hangup");
+    let hangup_status = Command::new(ctl_exe)
+        .args(["-s", &caller_sock.display().to_string(), "hangup"])
+        .status()
+        .context("ctl hangup (cycle 2)")?;
+    if !hangup_status.success() {
+        bail!("ctl hangup failed on reconnect cycle: caller was not in a call");
+    }
+
+    // Lets reconnect-host's last cycle end and the process exit on its own,
+    // instead of leaving it idling until the harness's final SIGTERM/SIGKILL
+    // cleanup (which would still work, just noisier for no reason).
+    let shutdown_status = Command::new(ctl_exe)
+        .args(["-s", &caller_sock.display().to_string(), "shutdown"])
+        .status()
+        .context("ctl shutdown (cycle 2)")?;
+    if !shutdown_status.success() {
+        bail!("final ctl shutdown failed on reconnect cycle");
+    }
+
+    eprintln!("Reconnect test passed");
     Ok(())
 }
 
@@ -924,6 +1113,20 @@ fn dump_stats(ctl_exe: &Path, label: &str, socket: &Path) {
     }
 }
 
+fn status_json(ctl_exe: &Path, socket: &Path) -> Result<serde_json::Value> {
+    let out = Command::new(ctl_exe)
+        .args(["-s", &socket.display().to_string(), "status"])
+        .output()
+        .context("ctl status")?;
+    if !out.status.success() {
+        bail!(
+            "ctl status failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    serde_json::from_slice(&out.stdout).context("parse ctl status JSON")
+}
+
 fn run_ip_netns(ns: &str, args: &[&str]) -> Result<()> {
     let status = Command::new("ip")
         .args(["netns", "exec", ns])
@@ -1006,6 +1209,53 @@ fn file_contains(path: &Path, needle: &str) -> Result<bool> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(err) => Err(err).with_context(|| format!("open {}", path.display())),
     }
+}
+
+fn file_len(path: &Path) -> Result<u64> {
+    match fs::metadata(path) {
+        Ok(meta) => Ok(meta.len()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(err) => Err(err).with_context(|| format!("stat {}", path.display())),
+    }
+}
+
+/// Like `file_contains`, but only searches bytes written after `since` — a
+/// `--reconnect` cycle reuses the same log file across cycles, so a plain
+/// whole-file search would false-positive on a marker (e.g. "connection
+/// state = connected") that already appeared in an earlier cycle, well
+/// before the second cycle actually reaches it.
+fn file_contains_since(path: &Path, since: u64, needle: &str) -> Result<bool> {
+    match File::open(path) {
+        Ok(mut file) => {
+            file.seek(SeekFrom::Start(since))
+                .with_context(|| format!("seek {}", path.display()))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .with_context(|| format!("read {}", path.display()))?;
+            Ok(String::from_utf8_lossy(&bytes).contains(needle))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err).with_context(|| format!("open {}", path.display())),
+    }
+}
+
+fn wait_for_log_contains_since(
+    log_path: &Path,
+    since: u64,
+    needle: &str,
+    timeout: Duration,
+    child: &mut Child,
+    label: &str,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        ensure_child_running(child, label)?;
+        if file_contains_since(log_path, since, needle)? {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    bail!("timed out waiting for {label}")
 }
 
 fn generate_noise_keypairs() -> (String, String, String, String) {
@@ -1114,6 +1364,7 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
     let mut keep_logs = false;
     let mut media_path = None;
     let mut netem = None;
+    let mut reconnect = false;
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1141,6 +1392,7 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
             "--keep-logs" => keep_logs = true,
             "--media" => media_path = Some(PathBuf::from(next_arg(&mut args, "--media")?)),
             "--netem" => netem = Some(next_arg(&mut args, "--netem")?),
+            "--reconnect" => reconnect = true,
             other if other.starts_with('-') => return Err(format!("unknown option: {other}")),
             other => return Err(format!("unexpected positional argument: {other}")),
         }
@@ -1168,6 +1420,7 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
         keep_logs,
         media_path,
         netem,
+        reconnect,
     })
 }
 
@@ -1263,6 +1516,8 @@ Options:
   --keep-logs                Preserve temp logs on success
   --media FILE               WebM/MP4 media file to stream from anazoa peers
   --netem EXPR               tc-netem expression applied to both veth interfaces (e.g. \"loss 3%\")
+  --reconnect                After the first call, fully disconnect and reconnect the caller
+                             daemon (same process) and place a second call
   -h, --help                 Show this help message
 ";
     if code == 0 {

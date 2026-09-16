@@ -1,7 +1,14 @@
+pub mod daemon;
+pub mod engine;
+pub mod host;
 pub mod privdrop;
+pub mod protozoa;
+
+#[cfg(target_os = "android")]
+pub mod android;
 
 use serde::Deserialize;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 use tokio::signal;
 #[cfg(unix)]
 use tokio::signal::unix::{SignalKind, signal as unix_signal};
@@ -11,7 +18,7 @@ use tokio::time::{Duration, MissedTickBehavior, interval, sleep};
 use anazoa_auth::oneme::SessionClient;
 use anazoa_config::AuthConfig;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct Config {
     #[serde(flatten)]
     pub auth: AuthConfig,
@@ -93,13 +100,26 @@ pub async fn call_keepalive_loop(
     }
 }
 
-static SHUTDOWN_TX: OnceLock<watch::Sender<bool>> = OnceLock::new();
+// Same lifetime mismatch as TUNNEL_STATE (see protozoa::tunnel): a plain
+// OnceLock can only ever be set once, but Android's nativeStart/nativeStop
+// can run this many times in the same process. Worse than TUNNEL_STATE's
+// failure mode: `.set()` silently no-opped on a re-init, so the *previous*
+// session's channel stuck around — and since watch channels retain their
+// last value, a leftover `true` from the prior nativeStop's trigger_shutdown()
+// made the new session's very first shutdown_signal() poll resolve
+// immediately, exiting run_with_tun right away with no error at all.
+static SHUTDOWN_TX: RwLock<Option<watch::Sender<bool>>> = RwLock::new(None);
+
+fn shutdown_tx() -> Option<watch::Sender<bool>> {
+    SHUTDOWN_TX
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
 
 pub fn init_shutdown_watcher() {
     let (tx, _) = watch::channel(false);
-    if SHUTDOWN_TX.set(tx).is_err() {
-        return;
-    }
+    *SHUTDOWN_TX.write().unwrap_or_else(|e| e.into_inner()) = Some(tx);
     tokio::spawn(async {
         #[cfg(unix)]
         {
@@ -115,12 +135,19 @@ pub fn init_shutdown_watcher() {
         {
             let _ = signal::ctrl_c().await;
         }
-        let _ = SHUTDOWN_TX.get().unwrap().send(true);
+        trigger_shutdown();
     });
 }
 
+/// Non-blocking check of the shutdown flag, for callers that want to bail
+/// out early rather than start (or log) work that `shutdown_signal()` would
+/// cancel on its very first poll anyway.
+pub fn shutdown_requested() -> bool {
+    shutdown_tx().is_some_and(|tx| *tx.borrow())
+}
+
 pub async fn shutdown_signal() {
-    let tx = SHUTDOWN_TX.get().expect("init_shutdown_watcher not called");
+    let tx = shutdown_tx().expect("init_shutdown_watcher not called");
     let mut rx = tx.subscribe();
     if *rx.borrow() {
         return;
@@ -132,5 +159,25 @@ pub async fn shutdown_signal() {
         if *rx.borrow() {
             return;
         }
+    }
+}
+
+/// Programmatic counterpart to the signal-driven shutdown in
+/// [`init_shutdown_watcher`]. Used where there's no process signal to catch,
+/// e.g. Android calling back into the library to tear down the tunnel.
+///
+/// Deliberately `send_replace` rather than `send`: `send` is a no-op (silently
+/// drops the value, doesn't even store it) when there are zero live receivers
+/// at that exact instant, which `shutdown_signal()` guarantees for an instant
+/// on every `idle_loop` iteration (each one subscribes fresh and drops that
+/// subscription if some other select! branch wins the race first). A
+/// same-instant `trigger_shutdown()` could land in that gap and be silently
+/// swallowed, leaving nothing to shut anything down — this was observed
+/// firsthand as a ~10s stall (until an unrelated later event happened to
+/// create a receiver) before switching to `send_replace`, which stores the
+/// value unconditionally regardless of receiver count.
+pub fn trigger_shutdown() {
+    if let Some(tx) = shutdown_tx() {
+        tx.send_replace(true);
     }
 }

@@ -16,7 +16,7 @@ use webrtc_sys::video_frame_buffer::ffi::{
 use webrtc_sys::video_track::ffi::{FrameMetadata, VideoTrackSource};
 
 use super::raylib::{Canvas, Color};
-use super::tunnel::TUNNEL_STATE;
+use super::tunnel::tunnel_state;
 
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
 pub const AUDIO_CHANNELS: u32 = 1;
@@ -37,7 +37,7 @@ const CN_INTERVAL_MAX: Duration = Duration::from_millis(480);
 const REMOTE_VAD_WINDOW_MS: u64 = 300;
 
 fn remote_is_speaking() -> bool {
-    let Some(state) = TUNNEL_STATE.get() else {
+    let Some(state) = tunnel_state() else {
         return false;
     };
     let last_ms = state.remote_vad_last_speech_ms.load(Ordering::Relaxed);

@@ -1,3 +1,13 @@
 /target
 /test
 __pycache__
+/.scratch
+
+# Android: machine-local SDK path and Gradle build/cache output.
+/android/local.properties
+/android/.gradle/
+/android/app/build/
+/android/build/
+# Compiled native libs: rebuilt from source by scripts/build-android.sh/CI,
+# not tracked (unlike android/app/libs/libwebrtc.jar, which is committed).
+/android/app/src/main/jniLibs/

@@ -39,7 +39,7 @@ use webrtc_sys::video_track::ffi::{
 use webrtc_sys::webrtc::ffi::{MediaType, RtpTransceiverDirection};
 
 use super::media::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
-use super::tunnel::TUNNEL_STATE;
+use super::tunnel::tunnel_state;
 
 pub enum LocalEvent {
     IceCandidate {
@@ -140,7 +140,7 @@ impl webrtc_sys::audio_track::AudioSink for VadAudioSink {
         }
         let sum_sq: i64 = data.iter().map(|&s| (s as i64) * (s as i64)).sum();
         if sum_sq / n as i64 >= REMOTE_VAD_THRESHOLD_SQ
-            && let Some(state) = TUNNEL_STATE.get()
+            && let Some(state) = tunnel_state()
         {
             let now_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

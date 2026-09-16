@@ -18,6 +18,14 @@ pub enum DaemonCmd {
     },
     Answer {
         secs: Option<u64>,
+        forever: bool,
+        resp: oneshot::Sender<Result<Value>>,
+    },
+    /// Full daemon teardown, not just the current call — the RPC equivalent
+    /// of Android's `nativeStop` (which calls `trigger_shutdown()` directly).
+    /// Exists so a local test harness can drive the same disconnect/reconnect
+    /// cycle Android does without needing a real device: see `mock reconnect-test`.
+    Shutdown {
         resp: oneshot::Sender<Result<Value>>,
     },
 }
@@ -99,11 +107,17 @@ async fn dispatch(
         "status" => DaemonCmd::Status { resp: resp_tx },
         "answer" => {
             let secs = params.get("secs").and_then(Value::as_u64);
+            let forever = params
+                .get("forever")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             DaemonCmd::Answer {
                 secs,
+                forever,
                 resp: resp_tx,
             }
         }
+        "shutdown" => DaemonCmd::Shutdown { resp: resp_tx },
         other => return Err(format!("method not found: {other}")),
     };
 

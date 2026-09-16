@@ -3,6 +3,12 @@ name = "anazoa-tun"
 version.workspace = true
 edition = "2024"
 
+[lib]
+name = "anazoa_tun"
+# cdylib is only actually consumed on Android (JNI entry points in src/android.rs);
+# harmless extra output elsewhere.
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 anazoa-auth = { path = "../auth" }
 anazoa-config = { path = "../config" }
@@ -29,3 +35,17 @@ webrtc-sys = { path = "../livekit/webrtc-sys" }
 ogg = "0.9.2"
 opus = "0.4"
 webm = "2.2.0"
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+# Plain (not target-gated), matching livekit/webrtc-sys/Cargo.toml: build.rs
+# is always compiled for the host, so a `[target.'cfg(target_os =
+# "android")'.build-dependencies]` table here would only be non-empty when
+# actually cross-compiling to Android — but #[cfg(target_os = "android")] in
+# build.rs's own source evaluates against the *host* it's compiled on, not
+# the crate's target, so gating the dependency that way would leave no
+# correct way to reference it from build.rs. Runtime-branch on the `TARGET`
+# env var (as build.rs already does for raylib's cross-compile args) instead.
+[build-dependencies]
+webrtc-sys-build = { path = "../livekit/webrtc-sys/build" }

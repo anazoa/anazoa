@@ -166,6 +166,115 @@ jobs:
                       target/${{ matrix.static_target }}/release/anazoa-ctl
                       target/${{ matrix.dynamic_target }}/release/anazoa-tun
 
+    android:
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v6
+              with:
+                  submodules: recursive
+
+            - name: Compute livekit submodule SHA
+              id: lk-sha
+              run: echo "sha=$(git -C livekit rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+            - name: Restore libwebrtc cache
+              id: webrtc-cache
+              uses: actions/cache/restore@v5
+              with:
+                  path: livekit/webrtc-sys/libwebrtc/android-arm64-release
+                  key: libwebrtc-android-arm64-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
+
+            - name: Patch livekit/webrtc-sys
+              run: |
+                  cp patches/hooks-opus.patch patches/hooks-vp9.patch livekit/webrtc-sys/libwebrtc/patches/
+                  git -C livekit apply ../patches/livekit.patch
+
+            - name: Free disk space
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              run: |
+                  sudo rm -rf \
+                    /usr/local/lib/android \
+                    /usr/local/share/powershell \
+                    /usr/share/dotnet \
+                    /usr/share/swift \
+                    /opt/ghc \
+                    /opt/hostedtoolcache/CodeQL \
+                    "$AGENT_TOOLSDIRECTORY/go" \
+                    "$AGENT_TOOLSDIRECTORY/node"
+                  sudo docker image prune -af || true
+                  df -h
+
+            - name: Install WebRTC build dependencies
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              run: |
+                  sudo apt update
+                  sudo apt install -y \
+                    python3 python3-pip \
+                    build-essential \
+                    git curl lsb-release \
+                    ninja-build \
+                    pkg-config
+
+            - name: Set up JDK
+              uses: actions/setup-java@v4
+              with:
+                  distribution: temurin
+                  java-version: "17"
+
+            - name: Build libwebrtc for Android
+              # Also produces android-arm64-release/libwebrtc.jar via the
+              # prefixed-jni subproject's own Gradle build, but that's not
+              # used here: android/app/libs/libwebrtc.jar is committed
+              # (see android/app/build.gradle.kts) rather than rebuilt each run.
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              working-directory: livekit/webrtc-sys/libwebrtc
+              run: bash build_android.sh --arch arm64 --profile release
+
+            - name: Save libwebrtc cache
+              if: steps.webrtc-cache.outputs.cache-hit != 'true'
+              uses: actions/cache/save@v5
+              with:
+                  path: livekit/webrtc-sys/libwebrtc/android-arm64-release
+                  key: libwebrtc-android-arm64-${{ steps.lk-sha.outputs.sha }}-${{ hashFiles('patches/*.patch') }}
+
+            - uses: dtolnay/rust-toolchain@stable
+              with:
+                  targets: aarch64-linux-android
+
+            - name: Cache Cargo registry
+              uses: actions/cache@v5
+              with:
+                  path: |
+                      ~/.cargo/registry/index
+                      ~/.cargo/registry/cache
+                      ~/.cargo/git/db
+                  key: cargo-android-arm64-${{ hashFiles('Cargo.lock') }}
+                  restore-keys: cargo-android-arm64-
+
+            # A standalone NDK, not whatever gclient vendored for the
+            # libwebrtc build above: Chromium's bundled Android toolchain is
+            # CIPD-only/incomplete and can't drive a plain `cargo build`.
+            - name: Set up Android NDK
+              id: ndk
+              uses: nttld/setup-ndk@v1
+              with:
+                  ndk-version: r27c
+
+            - name: Set up Android SDK
+              uses: android-actions/setup-android@v3
+
+            - name: Build anazoa-tun and the Android APK
+              env:
+                  ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+                  LK_CUSTOM_WEBRTC: ${{ github.workspace }}/livekit/webrtc-sys/libwebrtc/android-arm64-release
+              run: bash scripts/build-android.sh
+
+            - uses: actions/upload-artifact@v7
+              with:
+                  name: anazoa-android
+                  path: android/app/build/outputs/apk/debug/app-debug.apk
+
     release:
         needs: build
         runs-on: ubuntu-latest
@@ -211,6 +320,25 @@ jobs:
                   files: |
                       anazoa-${{ matrix.arch }}.tar.gz
                       libwebrtc-linux-${{ matrix.arch }}-dev.tar.gz
+
+    release-android:
+        needs: android
+        runs-on: ubuntu-latest
+        if: startsWith(github.ref, 'refs/tags/')
+        permissions:
+            contents: write
+        steps:
+            - uses: actions/download-artifact@v7
+              with:
+                  name: anazoa-android
+                  path: /tmp/artifact
+
+            - name: Stage APK release asset
+              run: cp /tmp/artifact/app-debug.apk "anazoa-${GITHUB_REF_NAME#v}.apk"
+
+            - uses: softprops/action-gh-release@v3
+              with:
+                  files: anazoa-*.apk
 
     docker:
         needs: build

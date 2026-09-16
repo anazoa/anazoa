@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only one scrolling ancestor here (unlike the old nested-ScrollView
+     layout on the main screen, which fought itself over scroll position
+     whenever the log text updated). -->
+<org.anazoa.vpn.NoAutoScrollScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:id="@+id/log_scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#1a1a1a">
+
+    <TextView
+        android:id="@+id/log_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:padding="8dp"
+        android:fontFamily="monospace"
+        android:textSize="10sp"
+        android:textColor="#e0e0e0"
+        android:textIsSelectable="true" />
+
+</org.anazoa.vpn.NoAutoScrollScrollView>

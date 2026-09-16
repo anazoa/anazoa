@@ -7,8 +7,14 @@ edition = "2024"
 name = "mock"
 path = "src/main.rs"
 
+[[bin]]
+name = "reconnect-host"
+path = "src/bin/reconnect_host.rs"
+
 [dependencies]
 anazoa-auth = { path = "../auth" }
+anazoa-config = { path = "../config" }
+anazoa-tun = { path = "../tun" }
 anyhow = "1"
 base64 = "0.23"
 bytes = "1"
@@ -30,3 +36,4 @@ flate2 = "1"
 lz4_flex = "0.14"
 serde_urlencoded = "0.7"
 wtransport = { version = "0.7", default-features = false, features = ["ring", "quinn"] }
+tun-rs = { version = "2", features = ["async"] }
