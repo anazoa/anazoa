@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 const NOISE_PATTERN: &str = "Noise_KK_25519_ChaChaPoly_BLAKE2s";
 
@@ -107,25 +107,42 @@ impl NoiseCallState {
     }
 }
 
-pub static NOISE_KEYS: OnceLock<NoiseKeys> = OnceLock::new();
-/// Initialized once; inner Option replaced by reset_noise_state each call.
-pub static NOISE_STATE: OnceLock<Mutex<Option<NoiseCallState>>> = OnceLock::new();
+// Replaceable, not a OnceLock: Android runs nativeStart repeatedly in one
+// process, each time from the config as it is *now*. With a OnceLock the
+// first session's keys stuck for the life of the process — editing or
+// removing them in the app changed nothing until the process was killed,
+// and every call failed Noise authentication with no hint why.
+static NOISE_KEYS: RwLock<Option<Arc<NoiseKeys>>> = RwLock::new(None);
+/// Per-call handshake state; replaced by `noise_reset_state` each call.
+static NOISE_STATE: Mutex<Option<NoiseCallState>> = Mutex::new(None);
 
+/// Installs the key pair for subsequent calls, replacing any previous one.
 pub fn init_noise_keys(privkey: Vec<u8>, peer_pubkey: Vec<u8>) {
-    let _ = NOISE_KEYS.set(NoiseKeys {
+    *NOISE_KEYS.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(NoiseKeys {
         privkey,
         peer_pubkey,
-    });
-    let _ = NOISE_STATE.set(Mutex::new(None));
+    }));
+}
+
+/// Disables Noise authentication for subsequent calls.
+pub fn clear_noise_keys() {
+    *NOISE_KEYS.write().unwrap_or_else(|e| e.into_inner()) = None;
+    *NOISE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+pub fn noise_keys() -> Option<Arc<NoiseKeys>> {
+    NOISE_KEYS.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// True when a key pair is installed, i.e. calls must authenticate.
+pub fn noise_enabled() -> bool {
+    noise_keys().is_some()
 }
 
 /// Build a fresh handshake state for a new call. Does not touch TunnelState —
 /// callers are responsible for re-arming TunnelState::authenticated.
 pub fn noise_reset_state(role: NoiseRole) {
-    let Some(keys) = NOISE_KEYS.get() else { return };
-    let Some(state_mu) = NOISE_STATE.get() else {
-        return;
-    };
+    let Some(keys) = noise_keys() else { return };
 
     let pattern: snow::params::NoiseParams = NOISE_PATTERN.parse().expect("valid noise pattern");
     let builder = snow::Builder::new(pattern)
@@ -151,7 +168,7 @@ pub fn noise_reset_state(role: NoiseRole) {
         }
     };
 
-    *state_mu.lock().unwrap() = Some(NoiseCallState {
+    *NOISE_STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(NoiseCallState {
         role,
         handshake: Mutex::new(Some(hs)),
         outgoing_msg: Mutex::new(outgoing_msg),
@@ -165,21 +182,21 @@ pub fn noise_reset_state(role: NoiseRole) {
 
 pub fn noise_try_inject(payload: &mut [u8]) -> bool {
     NOISE_STATE
-        .get()
-        .and_then(|mu| mu.lock().ok())
+        .lock()
+        .ok()
         .and_then(|g| g.as_ref().map(|s| s.try_inject(payload)))
         .unwrap_or(false)
 }
 
 pub fn noise_process_incoming(payload: &mut [u8], authenticated: bool) -> Option<(usize, bool)> {
-    let guard = NOISE_STATE.get()?.lock().ok()?;
+    let guard = NOISE_STATE.lock().ok()?;
     Some(guard.as_ref()?.process_incoming(payload, authenticated))
 }
 
 pub fn noise_auth_failed() -> bool {
     NOISE_STATE
-        .get()
-        .and_then(|mu| mu.lock().ok())
+        .lock()
+        .ok()
         .and_then(|g| g.as_ref().map(|s| s.auth_failed.load(Ordering::Relaxed)))
         .unwrap_or(false)
 }

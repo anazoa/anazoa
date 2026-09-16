@@ -11,3 +11,10 @@ lto = true
 codegen-units = 1
 panic = "abort"
 opt-level = "z"
+
+# The Android cdylib: identical to release except panics unwind, so the JNI
+# entry points' catch_unwind (tun/src/android.rs) can turn a Rust panic into
+# a Java exception instead of aborting the whole app process.
+[profile.android]
+inherits = "release"
+panic = "unwind"

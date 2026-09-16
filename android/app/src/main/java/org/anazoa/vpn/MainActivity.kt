@@ -23,8 +23,29 @@ class MainActivity : AppCompatActivity() {
     private lateinit var connectButton: Button
 
     private val handler = Handler(Looper.getMainLooper())
-    private var polling = false
     private var connected = false
+
+    // A single Runnable instance, so stopPolling() can remove exactly the
+    // tick that is queued. The previous per-startPolling() object plus a
+    // `polling` flag leaked one poller per pause/resume: onPause cleared the
+    // flag but left the old tick queued, onResume re-set the flag before that
+    // tick ran, so it passed its own `if (!polling) return` and kept going
+    // alongside the new one.
+    private val statusTick = object : Runnable {
+        override fun run() {
+            val state = AnazoaVpnService.engineState(runCatching { TunnelNative.nativeStatus() }.getOrNull())
+            if (state == null) {
+                setConnected(false)
+            } else {
+                setStatus(describeState(state))
+                handler.postDelayed(this, STATUS_POLL_MS)
+            }
+        }
+    }
+
+    companion object {
+        private const val STATUS_POLL_MS = 2000L
+    }
 
     private val vpnPermission =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -68,7 +89,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onPause() {
         super.onPause()
-        polling = false
+        stopPolling()
     }
 
     private fun connect() {
@@ -120,27 +141,20 @@ class MainActivity : AppCompatActivity() {
         if (value) {
             startPolling()
         } else {
-            polling = false
+            stopPolling()
             setStatus(getString(R.string.status_idle))
         }
     }
 
     private fun startPolling() {
-        if (polling) return
-        polling = true
-        val tick = object : Runnable {
-            override fun run() {
-                if (!polling) return
-                val state = AnazoaVpnService.engineState(runCatching { TunnelNative.nativeStatus() }.getOrNull())
-                if (state == null) {
-                    setConnected(false)
-                } else {
-                    setStatus(describeState(state))
-                    handler.postDelayed(this, 2000)
-                }
-            }
-        }
-        handler.postDelayed(tick, 2000)
+        // Remove-then-post keeps exactly one tick queued regardless of how
+        // many times this is called.
+        handler.removeCallbacks(statusTick)
+        handler.postDelayed(statusTick, STATUS_POLL_MS)
+    }
+
+    private fun stopPolling() {
+        handler.removeCallbacks(statusTick)
     }
 
     private fun setStatus(text: String) {

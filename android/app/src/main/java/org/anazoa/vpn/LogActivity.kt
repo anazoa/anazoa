@@ -15,7 +15,15 @@ class LogActivity : AppCompatActivity() {
     private lateinit var logText: TextView
 
     private val handler = Handler(Looper.getMainLooper())
-    private var polling = false
+
+    // One instance so onPause can dequeue it; see MainActivity.statusTick
+    // for why a fresh Runnable per onResume multiplied the pollers.
+    private val logTick = object : Runnable {
+        override fun run() {
+            updateLog()
+            handler.postDelayed(this, 2000)
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -27,20 +35,13 @@ class LogActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
-        polling = true
-        val tick = object : Runnable {
-            override fun run() {
-                if (!polling) return
-                updateLog()
-                handler.postDelayed(this, 2000)
-            }
-        }
-        handler.post(tick)
+        handler.removeCallbacks(logTick)
+        handler.post(logTick)
     }
 
     override fun onPause() {
         super.onPause()
-        polling = false
+        handler.removeCallbacks(logTick)
     }
 
     private fun updateLog() {

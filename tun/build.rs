@@ -117,7 +117,6 @@ fn main() {
             .arg(format!("-DCMAKE_C_COMPILER={c_compiler}"));
     }
 
-
     run(&mut cmake_configure);
 
     run(Command::new("cmake")

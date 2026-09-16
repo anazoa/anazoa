@@ -630,10 +630,18 @@ async fn run_pair(calltaker: PeerConn, caller: PeerConn) -> Result<()> {
     .await?;
     send_json(&mut caller.send, connection_notification(&conversation_id)).await?;
 
+    // Same shape as the OneMe handler above: `read_client_message` is
+    // `read_exact`-based and not cancel-safe, so selecting on it directly
+    // for both peers lost the losing peer's partial frame whenever the
+    // other one won. Each receive stream gets its own reader task and the
+    // loop only selects on (cancel-safe) channel receives.
+    let (mut calltaker_rx, _calltaker_reader) = spawn_message_reader(calltaker.recv);
+    let (mut caller_rx, _caller_reader) = spawn_message_reader(caller.recv);
+
     loop {
         tokio::select! {
-            msg = read_client_message(&mut calltaker.recv) => {
-                match msg? {
+            msg = calltaker_rx.recv() => {
+                match msg.transpose()?.flatten() {
                     Some(value) => handle_message(PeerRole::Calltaker, value, &mut calltaker.send, &mut caller.send).await?,
                     None => {
                         send_json(&mut caller.send, hangup_notification()).await?;
@@ -641,8 +649,8 @@ async fn run_pair(calltaker: PeerConn, caller: PeerConn) -> Result<()> {
                     }
                 }
             }
-            msg = read_client_message(&mut caller.recv) => {
-                match msg? {
+            msg = caller_rx.recv() => {
+                match msg.transpose()?.flatten() {
                     Some(value) => handle_message(PeerRole::Caller, value, &mut caller.send, &mut calltaker.send).await?,
                     None => {
                         send_json(&mut calltaker.send, hangup_notification()).await?;
@@ -652,6 +660,24 @@ async fn run_pair(calltaker: PeerConn, caller: PeerConn) -> Result<()> {
             }
         }
     }
+}
+
+/// Owns `recv` on a task, forwarding each decoded message. Stops after the
+/// first error or EOF (`Ok(None)`), which closes the channel.
+fn spawn_message_reader(
+    mut recv: wtransport::RecvStream,
+) -> (mpsc::Receiver<Result<Option<Value>>>, AbortOnDrop) {
+    let (tx, rx) = mpsc::channel(4);
+    let reader = tokio::spawn(async move {
+        loop {
+            let msg = read_client_message(&mut recv).await;
+            let done = !matches!(msg, Ok(Some(_)));
+            if tx.send(msg).await.is_err() || done {
+                return;
+            }
+        }
+    });
+    (rx, AbortOnDrop(reader))
 }
 
 async fn read_client_message(recv: &mut wtransport::RecvStream) -> Result<Option<Value>> {

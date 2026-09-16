@@ -74,15 +74,18 @@ enum PlaybackState {
 // OpusMedia
 // ---------------------------------------------------------------------------
 
+type OggReader = ogg::PacketReader<BufReader<File>>;
+/// Speech intervals as (start_frame, end_frame) inclusive frame indices.
+type VadMap = Vec<(usize, usize)>;
+
 pub struct OpusMedia {
     path: String,
-    reader: ogg::PacketReader<BufReader<File>>,
+    reader: OggReader,
     decoder: opus::Decoder,
     decode_buf: Vec<i16>,
     /// Absolute frame index the reader is currently positioned at.
     reader_frame: usize,
-    /// Speech intervals as (start_frame, end_frame) inclusive frame indices.
-    vad_map: Vec<(usize, usize)>,
+    vad_map: VadMap,
     state: PlaybackState,
     rng: SmallRng,
 }
@@ -265,7 +268,7 @@ impl OpusMedia {
 // Use vad.sh to embed the map before using a file with this binary.
 // ---------------------------------------------------------------------------
 
-fn build_vad_map(path: &str) -> Result<(Vec<(usize, usize)>, ogg::PacketReader<BufReader<File>>)> {
+fn build_vad_map(path: &str) -> Result<(VadMap, OggReader)> {
     let file = File::open(path).with_context(|| format!("open {path}"))?;
     let mut reader = ogg::PacketReader::new(BufReader::new(file));
     reader

@@ -4,19 +4,19 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use super::media::{VIDEO_HEIGHT, VIDEO_WIDTH};
 use super::noise::{
-    NOISE_KEYS, NOISE_MSG_SIZE, noise_process_incoming, noise_reset_state, noise_try_inject,
+    NOISE_MSG_SIZE, noise_enabled, noise_process_incoming, noise_reset_state, noise_try_inject,
 };
 use super::vp9::VP9_BLACK_KEYFRAMES;
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
 // Re-export the noise public API so callers only need to import from this module.
-pub use super::noise::{NoiseRole, init_noise_keys, noise_auth_failed};
+pub use super::noise::{NoiseRole, clear_noise_keys, init_noise_keys, noise_auth_failed};
 
 /// Reset noise and tunnel auth state for a new call.
 pub fn prepare_noise_for_call(role: NoiseRole) {
     noise_reset_state(role);
     if let Some(ts) = tunnel_state()
-        && NOISE_KEYS.get().is_some()
+        && noise_enabled()
     {
         ts.authenticated.store(false, Ordering::Relaxed);
     }
@@ -206,7 +206,7 @@ impl TunnelState {
             webm_mux: Mutex::new(webm_mux),
             next_packet_id: AtomicU32::new(rand::random()),
             vp9_replacement_needs_keyframe: AtomicBool::new(true),
-            authenticated: AtomicBool::new(NOISE_KEYS.get().is_none()),
+            authenticated: AtomicBool::new(!noise_enabled()),
             hook_encode_calls: AtomicU64::new(0),
             hook_reference_calls: AtomicU64::new(0),
             tun_read_packets: AtomicU64::new(0),
@@ -399,7 +399,12 @@ pub fn next_tunnel_frame(
             }?;
 
             if packet.len() <= carrier_len.saturating_sub(WHOLE_HEADER_LEN) {
-                let frame = encode_whole_frame(&packet, is_key_frame, sender_res)?;
+                // Popped packets always give their queue slot back, whether
+                // they're sent, requeued or dropped — see `requeue_packet`.
+                let Some(frame) = encode_whole_frame(&packet, is_key_frame, sender_res) else {
+                    state.outbound_semaphore.add_permits(1);
+                    return None;
+                };
                 state.outbound_semaphore.add_permits(1);
                 frame
             } else if carrier_len > FRAGMENT_HEADER_LEN {
@@ -416,9 +421,7 @@ pub fn next_tunnel_frame(
                             packet_len = packet.len(),
                             carrier_len, "failed to fragment TUN packet for carrier: {err:#}"
                         );
-                        if let Ok(mut packets) = state.outbound_packets.try_lock() {
-                            packets.push_front(packet);
-                        }
+                        requeue_packet(&state, packet);
                         return None;
                     }
                 };
@@ -428,9 +431,7 @@ pub fn next_tunnel_frame(
                 cached_frames.extend(remaining_frames);
                 first
             } else {
-                if let Ok(mut packets) = state.outbound_packets.try_lock() {
-                    packets.push_front(packet);
-                }
+                requeue_packet(&state, packet);
                 return None;
             }
         };
@@ -459,6 +460,24 @@ pub fn next_tunnel_frame(
     }
 
     Some(out)
+}
+
+/// Puts a packet popped from `outbound_packets` back at the head of the
+/// queue. If the queue is momentarily locked by the TUN reader, the packet
+/// is dropped instead — but its semaphore permit is still returned. Before
+/// that, a failed push-back silently lost the permit too, so each one
+/// permanently shrank the queue; after 64 the reader blocked in `acquire()`
+/// for good and no outbound traffic moved.
+fn requeue_packet(state: &TunnelState, packet: Vec<u8>) {
+    match state.outbound_packets.try_lock() {
+        Ok(mut packets) => packets.push_front(packet),
+        Err(_) => {
+            state
+                .tunnel_fragments_dropped
+                .fetch_add(1, Ordering::Relaxed);
+            state.outbound_semaphore.add_permits(1);
+        }
+    }
 }
 
 pub fn pop_cached_frame_that_fits(

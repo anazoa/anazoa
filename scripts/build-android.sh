@@ -35,10 +35,11 @@ if [ "$skip_rust" = 0 ]; then
     export AR_aarch64_linux_android="$TOOLCHAIN/bin/llvm-ar"
     export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$TOOLCHAIN/bin/aarch64-linux-android23-clang"
 
-    (cd "$REPO_ROOT" && cargo build -p anazoa-tun --target aarch64-linux-android --lib --release)
+    # `android` profile = release + panic=unwind (see Cargo.toml).
+    (cd "$REPO_ROOT" && cargo build -p anazoa-tun --target aarch64-linux-android --lib --profile android)
 
     mkdir -p "$ANDROID_DIR/app/src/main/jniLibs/arm64-v8a"
-    cp "$REPO_ROOT/target/aarch64-linux-android/release/libanazoa_tun.so" \
+    cp "$REPO_ROOT/target/aarch64-linux-android/android/libanazoa_tun.so" \
         "$ANDROID_DIR/app/src/main/jniLibs/arm64-v8a/libanazoa_tun.so"
 
     # NDK's C++ runtime is dynamically linked by default and Android doesn't

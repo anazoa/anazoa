@@ -117,6 +117,14 @@ impl SessionClient {
     pub fn user_id(&self) -> Option<i64> {
         self.inner.user_id
     }
+
+    /// True once the underlying connection has failed (I/O error, EOF or a
+    /// frame that couldn't be decoded — i.e. the stream is desynced). A
+    /// broken session never recovers; the owner should re-establish it.
+    /// Server-level error responses do not count.
+    pub fn is_broken(&self) -> bool {
+        self.inner.broken
+    }
 }
 
 #[derive(Debug)]
@@ -150,8 +158,19 @@ pub struct OnemeClient {
     /// START_AUTH integrity token (see `integrity`).
     calls_seed: Option<i64>,
     queue: VecDeque<Packet>,
+    /// Bytes read from the TLS stream that don't yet form a whole frame.
+    /// Kept on the client (not on the stack of an in-flight read) so that
+    /// cancelling `read_packet_once` — `recv_packet` wraps it in a keepalive
+    /// `timeout`, and the daemon's idle loop drops it to service commands —
+    /// never loses partially received frames and desyncs the stream.
+    rx_buf: Vec<u8>,
     keepalive_interval: Duration,
+    /// Set on the first transport-level failure; see [`SessionClient::is_broken`].
+    broken: bool,
 }
+
+/// Fixed-size OneMe frame header: ver, cmd, seq(2), opcode(2), len(4).
+const FRAME_HEADER_LEN: usize = 10;
 
 impl OnemeClient {
     pub async fn with_endpoints(
@@ -183,7 +202,9 @@ impl OnemeClient {
             user_id: None,
             calls_seed: None,
             queue: VecDeque::new(),
+            rx_buf: Vec::new(),
             keepalive_interval,
+            broken: false,
         };
         client.do_client_hello().await?;
         Ok(client)
@@ -195,6 +216,14 @@ impl OnemeClient {
     }
 
     async fn send_bytes(&mut self, opcode: u16, payload: Vec<u8>) -> Result<u16> {
+        let result = self.send_bytes_inner(opcode, payload).await;
+        if result.is_err() {
+            self.broken = true;
+        }
+        result
+    }
+
+    async fn send_bytes_inner(&mut self, opcode: u16, payload: Vec<u8>) -> Result<u16> {
         let seq = self.seq;
         self.seq = self.seq.wrapping_add(1);
 
@@ -289,13 +318,38 @@ impl OnemeClient {
         }
     }
 
+    /// Cancel-safe: only `read_buf` (which never loses data on cancellation)
+    /// touches the stream, and everything read lands in `rx_buf`.
     async fn read_packet_once(&mut self) -> Result<Packet> {
-        let mut header = [0u8; 10];
-        self.tls
-            .read_exact(&mut header)
-            .await
-            .context("read OneMe header")?;
+        let result = self.read_packet_once_inner().await;
+        if result.is_err() {
+            self.broken = true;
+        }
+        result
+    }
 
+    async fn read_packet_once_inner(&mut self) -> Result<Packet> {
+        loop {
+            if let Some(pkt) = self.take_buffered_packet()? {
+                return Ok(pkt);
+            }
+            let n = self
+                .tls
+                .read_buf(&mut self.rx_buf)
+                .await
+                .context("read OneMe frame")?;
+            if n == 0 {
+                bail!("OneMe connection closed");
+            }
+        }
+    }
+
+    /// Decodes and removes the first complete frame from `rx_buf`, if any.
+    fn take_buffered_packet(&mut self) -> Result<Option<Packet>> {
+        if self.rx_buf.len() < FRAME_HEADER_LEN {
+            return Ok(None);
+        }
+        let header = &self.rx_buf[..FRAME_HEADER_LEN];
         let cmd = header[1];
         let seq = u16::from_be_bytes([header[2], header[3]]);
         let opcode = u16::from_be_bytes([header[4], header[5]]);
@@ -305,28 +359,27 @@ impl OnemeClient {
         if wire_len > MAX_FRAME_LEN {
             bail!("OneMe frame length {wire_len} exceeds limit of {MAX_FRAME_LEN} bytes");
         }
-
-        let mut wire_payload = vec![0u8; wire_len];
-        if wire_len > 0 {
-            self.tls
-                .read_exact(&mut wire_payload)
-                .await
-                .context("read OneMe payload")?;
+        let frame_len = FRAME_HEADER_LEN + wire_len;
+        if self.rx_buf.len() < frame_len {
+            self.rx_buf.reserve(frame_len - self.rx_buf.len());
+            return Ok(None);
         }
 
-        let payload = if wire_payload.is_empty() {
+        let payload = if wire_len == 0 {
             Value::Null
         } else {
-            let decoded = decode_payload(cof, &wire_payload)?;
+            let wire_payload = &self.rx_buf[FRAME_HEADER_LEN..frame_len];
+            let decoded = decode_payload(cof, wire_payload)?;
             parse_msgpack_json(&decoded)?
         };
+        self.rx_buf.drain(..frame_len);
 
-        Ok(Packet {
+        Ok(Some(Packet {
             cmd,
             seq,
             opcode,
             payload,
-        })
+        }))
     }
 
     async fn do_client_hello(&mut self) -> Result<()> {

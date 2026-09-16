@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 use tracing::debug;
 use unicode_truncate::UnicodeTruncateStr;
@@ -43,59 +44,128 @@ enum SignalingWire {
     Wt(WtConn),
 }
 
+/// Bound on decoded messages buffered between the reader task and the
+/// client. Small: the reader only needs to stay ahead of a consumer that is
+/// momentarily busy elsewhere in a `select!`.
+const WT_INBOUND_QUEUE: usize = 64;
+
 struct WtConn {
     conn: wtransport::Connection,
-    send: wtransport::SendStream,
-    recv: wtransport::RecvStream,
+    /// Shared with the reader task so it can answer `ping` itself; the client
+    /// otherwise has exclusive use of it.
+    send: Arc<Mutex<wtransport::SendStream>>,
+    /// Decoded inbound messages from [`wt_reader`]. `mpsc::Receiver::recv` is
+    /// cancel-safe, so callers may freely drop `recv_text` inside `select!`
+    /// or `timeout` — the raw `RecvStream` reads are not (a frame partially
+    /// consumed by a dropped `read_exact` is lost and the stream desyncs),
+    /// which is why the stream is owned by a dedicated task instead.
+    inbound: mpsc::Receiver<Result<String>>,
+    reader: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for WtConn {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
+impl WtConn {
+    fn new(
+        conn: wtransport::Connection,
+        send: wtransport::SendStream,
+        recv: wtransport::RecvStream,
+    ) -> Self {
+        let send = Arc::new(Mutex::new(send));
+        let (tx, inbound) = mpsc::channel(WT_INBOUND_QUEUE);
+        let reader = tokio::spawn(wt_reader(recv, Arc::clone(&send), tx));
+        Self {
+            conn,
+            send,
+            inbound,
+            reader,
+        }
+    }
+}
+
+/// Owns the WebTransport receive stream for the connection's lifetime,
+/// decoding frames and forwarding them to the client. Keepalive `ping`s are
+/// answered here so a consumer cancelled between the read and the reply can't
+/// swallow one. The first error (or EOF) is forwarded and the task exits,
+/// which closes the channel and makes every later `recv_text` return `None`.
+async fn wt_reader(
+    mut recv: wtransport::RecvStream,
+    send: Arc<Mutex<wtransport::SendStream>>,
+    tx: mpsc::Sender<Result<String>>,
+) {
+    loop {
+        let text = match read_wt_text(&mut recv).await {
+            Ok(text) => text,
+            Err(err) => {
+                let _ = tx.send(Err(err)).await;
+                return;
+            }
+        };
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.eq_ignore_ascii_case("ping") {
+            debug!("received signaling ping");
+            log_signaling_ws("rx", "ping");
+            if let Err(err) = write_wt_text(&mut *send.lock().await, "pong").await {
+                let _ = tx.send(Err(err.context("send signaling pong"))).await;
+                return;
+            }
+            log_signaling_ws("tx", "pong");
+            continue;
+        }
+        if tx.send(Ok(text)).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn write_wt_text(send: &mut wtransport::SendStream, text: &str) -> Result<()> {
+    let compressed = deflate_compress(text.as_bytes())?;
+    let len = encode_quic_varint(
+        u64::try_from(compressed.len()).context("WT frame length does not fit into u64")?,
+    )?;
+    send.write_all(&len)
+        .await
+        .map_err(|e| anyhow!("WT write length: {e}"))?;
+    send.write_all(&compressed)
+        .await
+        .map_err(|e| anyhow!("WT write payload: {e}"))?;
+    send.flush().await.map_err(|e| anyhow!("WT flush: {e}"))?;
+    Ok(())
+}
+
+async fn read_wt_text(recv: &mut wtransport::RecvStream) -> Result<String> {
+    let len = read_quic_varint(recv).await?;
+    let len = usize::try_from(len).context("WT frame length too large")?;
+    if len > MAX_SIGNALING_FRAME_LEN {
+        bail!("signaling WT frame length {len} exceeds limit of {MAX_SIGNALING_FRAME_LEN} bytes");
+    }
+    let mut buf = vec![0u8; len];
+    recv.read_exact(&mut buf)
+        .await
+        .map_err(|e| anyhow!("WT recv read_exact: {e}"))?;
+    String::from_utf8(deflate_decompress(&buf)?).context("WT recv message not valid UTF-8")
 }
 
 impl SignalingWire {
     /// Send one text message (compressed with deflate-raw for WT).
     async fn send_text(&mut self, text: &str) -> Result<()> {
         match self {
-            SignalingWire::Wt(wt) => {
-                let compressed = deflate_compress(text.as_bytes())?;
-                let len = encode_quic_varint(
-                    u64::try_from(compressed.len())
-                        .context("WT frame length does not fit into u64")?,
-                )?;
-                wt.send
-                    .write_all(&len)
-                    .await
-                    .map_err(|e| anyhow!("WT write length: {e}"))?;
-                wt.send
-                    .write_all(&compressed)
-                    .await
-                    .map_err(|e| anyhow!("WT write payload: {e}"))?;
-                wt.send
-                    .flush()
-                    .await
-                    .map_err(|e| anyhow!("WT flush: {e}"))?;
-            }
+            SignalingWire::Wt(wt) => write_wt_text(&mut *wt.send.lock().await, text).await,
         }
-        Ok(())
     }
 
-    /// Receive the next text message over WebTransport.
+    /// Receive the next text message. `None` once the connection is closed
+    /// (the reader task has exited). Cancel-safe.
     async fn recv_text(&mut self) -> Result<Option<String>> {
         match self {
-            SignalingWire::Wt(wt) => {
-                let len = read_quic_varint(&mut wt.recv).await?;
-                let len = usize::try_from(len).context("WT frame length too large")?;
-                if len > MAX_SIGNALING_FRAME_LEN {
-                    bail!(
-                        "signaling WT frame length {len} exceeds limit of {MAX_SIGNALING_FRAME_LEN} bytes"
-                    );
-                }
-                let mut buf = vec![0u8; len];
-                wt.recv
-                    .read_exact(&mut buf)
-                    .await
-                    .map_err(|e| anyhow!("WT recv read_exact: {e}"))?;
-                let text = String::from_utf8(deflate_decompress(&buf)?)
-                    .context("WT recv message not valid UTF-8")?;
-                Ok(Some(text))
-            }
+            SignalingWire::Wt(wt) => wt.inbound.recv().await.transpose(),
         }
     }
 
@@ -106,8 +176,9 @@ impl SignalingWire {
                 // before tearing down the connection — `Connection::close` emits
                 // CONNECTION_CLOSE immediately and would drop an unflushed final
                 // message (e.g. `hangup`).
-                let _ = wt.send.finish().await;
-                let _ = timeout(WT_CLOSE_DRAIN_TIMEOUT, wt.send.stopped()).await;
+                let mut send = wt.send.lock().await;
+                let _ = send.finish().await;
+                let _ = timeout(WT_CLOSE_DRAIN_TIMEOUT, send.stopped()).await;
                 wt.conn.close(wtransport::VarInt::from_u32(0), b"");
             }
         }
@@ -189,7 +260,7 @@ async fn read_quic_varint(recv: &mut wtransport::RecvStream) -> Result<u64> {
 async fn connect_signaling(url: &str, skip_tls_verify: bool) -> Result<SignalingWire> {
     tracing::info!("connecting to signaling via WebTransport");
     let (conn, send, recv) = connect_wt(url, skip_tls_verify).await?;
-    Ok(SignalingWire::Wt(WtConn { conn, send, recv }))
+    Ok(SignalingWire::Wt(WtConn::new(conn, send, recv)))
 }
 
 /// Build a WebTransport endpoint configured to match the Android Kwik QUIC fingerprint.
@@ -572,16 +643,6 @@ impl SignalingClient {
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed.eq_ignore_ascii_case("ping") {
-                debug!("received signaling ping");
-                log_signaling_ws("rx", "ping");
-                self.wire
-                    .send_text("pong")
-                    .await
-                    .context("send signaling pong")?;
-                log_signaling_ws("tx", "pong");
-                continue;
-            }
             log_signaling_ws("rx", trimmed);
             let value: Value = serde_json::from_str(trimmed).with_context(|| {
                 let (short, len) = trimmed.unicode_truncate(200);
@@ -728,15 +789,6 @@ impl RawSignalingClient {
                 .ok_or_else(|| anyhow!("signaling connection closed"))?;
             let trimmed = text.trim();
             if trimmed.is_empty() {
-                continue;
-            }
-            if trimmed.eq_ignore_ascii_case("ping") {
-                log_signaling_ws("rx", "ping");
-                self.wire
-                    .send_text("pong")
-                    .await
-                    .context("send signaling pong")?;
-                log_signaling_ws("tx", "pong");
                 continue;
             }
             log_signaling_ws("rx", trimmed);

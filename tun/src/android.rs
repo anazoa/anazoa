@@ -44,6 +44,32 @@ fn slot() -> &'static Mutex<Option<TunnelSession>> {
     RUNNING.get_or_init(|| Mutex::new(None))
 }
 
+/// Poison-tolerant: a panic while holding the slot (now survivable, see
+/// `catch_jni`) must not turn every later JNI call into another panic.
+fn lock_slot() -> MutexGuard<'static, Option<TunnelSession>> {
+    slot().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Runs a JNI entry point body, converting a Rust panic into a Java
+/// `IllegalStateException` plus `fallback` instead of tearing down the app
+/// process. Only meaningful because the Android library is built with
+/// `panic = "unwind"` (`[profile.android]`); under the workspace release
+/// profile's `panic = "abort"` a panic would never reach this.
+fn catch_jni<T>(env: &mut JNIEnv, fallback: T, body: impl FnOnce(&mut JNIEnv) -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(env))) {
+        Ok(value) => value,
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "unknown panic".to_string());
+            warn!("anazoa-tun panicked: {msg}");
+            throw_and(env, anyhow!("anazoa-tun panicked: {msg}"), fallback)
+        }
+    }
+}
+
 /// Drops a `TunnelSession` whose engine task already finished on its own.
 /// Only call this from a plain JNI-calling thread (any of the functions in
 /// this file) — never from within the runtime's own async context (see
@@ -72,13 +98,12 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeStart<'local>(
     tun_fd: jint,
     app_context: JObject<'local>,
 ) -> jboolean {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        start(&mut env, &config_path, tun_fd as RawFd, &app_context)
-    })) {
-        Ok(Ok(())) => JNI_TRUE,
-        Ok(Err(err)) => throw_and(&mut env, err, JNI_FALSE),
-        Err(_) => throw_and(&mut env, anyhow!("anazoa-tun panicked"), JNI_FALSE),
-    }
+    catch_jni(&mut env, JNI_FALSE, |env| {
+        match start(env, &config_path, tun_fd as RawFd, &app_context) {
+            Ok(()) => JNI_TRUE,
+            Err(err) => throw_and(env, err, JNI_FALSE),
+        }
+    })
 }
 
 fn start(
@@ -95,7 +120,7 @@ fn start(
     // is a valid, open fd whose ownership transfers here.
     let tun_fd = unsafe { OwnedFd::from_raw_fd(tun_fd) };
 
-    let mut guard = slot().lock().unwrap();
+    let mut guard = lock_slot();
     reap_finished(&mut guard);
     if guard.is_some() {
         bail!("tunnel already running");
@@ -124,10 +149,10 @@ fn start(
         .into();
 
     let cfg: crate::Config = anazoa_config::load_config(&config_path)?;
+    // Both re-applied on every start: this process outlives sessions, so
+    // config edits between them must take effect.
     anazoa_config::init_logging(&cfg.auth.debug.level);
-    if cfg.auth.debug.log_signaling_ws {
-        anazoa_auth::signaling::set_log_signaling_ws(true);
-    }
+    anazoa_auth::signaling::set_log_signaling_ws(cfg.auth.debug.log_signaling_ws);
     keep_vp9_hooks_linked();
     keep_opus_hooks_linked();
     engine::init_noise_from_config(&cfg)?;
@@ -179,22 +204,24 @@ fn start(
 /// calling Java thread indefinitely.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeStop<'local>(
-    _env: JNIEnv<'local>,
+    mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) {
-    let mut guard = slot().lock().unwrap();
-    reap_finished(&mut guard);
-    let session = guard.take();
-    drop(guard);
-    if let Some(session) = session {
-        session.stop();
-    }
+    catch_jni(&mut env, (), |_| {
+        let mut guard = lock_slot();
+        reap_finished(&mut guard);
+        let session = guard.take();
+        drop(guard);
+        if let Some(session) = session {
+            session.stop();
+        }
+    })
 }
 
 fn send_cmd(
     make: impl FnOnce(oneshot::Sender<Result<serde_json::Value>>) -> DaemonCmd,
 ) -> Result<serde_json::Value> {
-    let mut guard = slot().lock().unwrap();
+    let mut guard = lock_slot();
     reap_finished(&mut guard);
     let session = guard
         .as_ref()
@@ -209,10 +236,12 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeCall<'local>(
     peer_id: jlong,
 ) -> jboolean {
     let peer_id = if peer_id == 0 { None } else { Some(peer_id) };
-    match send_cmd(|resp| DaemonCmd::Call { peer_id, resp }) {
-        Ok(_) => JNI_TRUE,
-        Err(err) => throw_and(&mut env, err, JNI_FALSE),
-    }
+    catch_jni(&mut env, JNI_FALSE, |env| {
+        match send_cmd(|resp| DaemonCmd::Call { peer_id, resp }) {
+            Ok(_) => JNI_TRUE,
+            Err(err) => throw_and(env, err, JNI_FALSE),
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -224,14 +253,16 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeAnswer<'local>(
 ) -> jboolean {
     let secs = if secs < 0 { None } else { Some(secs as u64) };
     let forever = forever == JNI_TRUE;
-    match send_cmd(|resp| DaemonCmd::Answer {
-        secs,
-        forever,
-        resp,
-    }) {
-        Ok(_) => JNI_TRUE,
-        Err(err) => throw_and(&mut env, err, JNI_FALSE),
-    }
+    catch_jni(&mut env, JNI_FALSE, |env| {
+        match send_cmd(|resp| DaemonCmd::Answer {
+            secs,
+            forever,
+            resp,
+        }) {
+            Ok(_) => JNI_TRUE,
+            Err(err) => throw_and(env, err, JNI_FALSE),
+        }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -239,10 +270,12 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeHangup<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jboolean {
-    match send_cmd(|resp| DaemonCmd::Hangup { resp }) {
-        Ok(_) => JNI_TRUE,
-        Err(err) => throw_and(&mut env, err, JNI_FALSE),
-    }
+    catch_jni(&mut env, JNI_FALSE, |env| {
+        match send_cmd(|resp| DaemonCmd::Hangup { resp }) {
+            Ok(_) => JNI_TRUE,
+            Err(err) => throw_and(env, err, JNI_FALSE),
+        }
+    })
 }
 
 /// Reads the engine's published state snapshot rather than sending a
@@ -268,7 +301,9 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeStatus<'local>(
             reap_finished(&mut guard);
             guard.as_ref().map(TunnelSession::status)
         }
-        Err(std::sync::TryLockError::WouldBlock) => Some(serde_json::json!({"state": "connecting"})),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            Some(serde_json::json!({"state": "connecting"}))
+        }
     }
     .unwrap_or_else(|| serde_json::json!({"state": "error", "error": "tunnel not running"}));
     match env.new_string(value.to_string()) {

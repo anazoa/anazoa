@@ -572,7 +572,15 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
     )?;
 
     if cli.reconnect {
-        run_reconnect_cycle(&cli, &mut harness, &ctl_exe, &caller_log, &caller_sock, caller_idx, calltaker_idx)?;
+        run_reconnect_cycle(
+            &cli,
+            &mut harness,
+            &ctl_exe,
+            &caller_log,
+            &caller_sock,
+            caller_idx,
+            calltaker_idx,
+        )?;
     }
 
     harness.success();
@@ -626,7 +634,11 @@ fn run_reconnect_cycle(
         child_mut(harness, caller_idx)?,
         "caller socket (cycle 2)",
     )?;
-    wait_for_tun_device(&cli.ns_caller, &cli.tun_name, child_mut(harness, caller_idx)?)?;
+    wait_for_tun_device(
+        &cli.ns_caller,
+        &cli.tun_name,
+        child_mut(harness, caller_idx)?,
+    )?;
     configure_tun(
         &cli.ns_caller,
         &cli.tun_name,
@@ -675,7 +687,11 @@ fn run_reconnect_cycle(
         child_mut(harness, caller_idx)?,
         "caller tunnel readiness (cycle 2)",
     )?;
-    wait_for_tun_device(&cli.ns_calltaker, &cli.tun_name, child_mut(harness, calltaker_idx)?)?;
+    wait_for_tun_device(
+        &cli.ns_calltaker,
+        &cli.tun_name,
+        child_mut(harness, calltaker_idx)?,
+    )?;
 
     eprintln!("Reconnect test: pinging over the second call");
     let ping_size = cli.ping_size.to_string();

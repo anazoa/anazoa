@@ -3,7 +3,6 @@ use serde::Deserialize;
 use std::collections::VecDeque;
 use std::fs;
 use std::sync::{Mutex, OnceLock};
-use tracing_subscriber::Layer;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::prelude::*;
 
@@ -74,17 +73,27 @@ fn default_log_level() -> String {
     "info".to_string()
 }
 
+/// Applies a new level to the already-installed subscriber. A global
+/// subscriber can only be installed once per process, but Android calls
+/// `init_logging` on every `nativeStart` with whatever the config says now;
+/// without this a changed `[debug] level` was silently ignored until the
+/// app process died.
+static LOG_LEVEL_RELOAD: OnceLock<Box<dyn Fn(LevelFilter) + Send + Sync>> = OnceLock::new();
+
 pub fn init_logging(default_level: &str) {
     let level_str = std::env::var("RUST_LOG").unwrap_or_else(|_| default_level.to_string());
     let level = parse_log_level(&level_str);
-    let stdout_targets = tracing_subscriber::filter::Targets::new().with_default(level);
-    let ring_targets = tracing_subscriber::filter::Targets::new().with_default(level);
+    if let Some(reload) = LOG_LEVEL_RELOAD.get() {
+        reload(level);
+        return;
+    }
+    let targets = tracing_subscriber::filter::Targets::new().with_default(level);
+    let (targets, reload_handle) = tracing_subscriber::reload::Layer::new(targets);
     if let Err(err) = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_level(true)
-                .with_filter(stdout_targets),
+                .with_level(true),
         )
         // Mirrors formatted lines into an in-memory ring buffer alongside
         // stdout, purely additive — desktop behavior is unchanged. Read back
@@ -95,13 +104,21 @@ pub fn init_logging(default_level: &str) {
                 .with_target(false)
                 .with_level(true)
                 .with_ansi(false)
-                .with_writer(|| RingWriter)
-                .with_filter(ring_targets),
+                .with_writer(|| RingWriter),
         )
+        // One global, reloadable level filter for both layers.
+        .with(targets)
         .try_init()
     {
         eprintln!("logging already initialized; keeping existing subscriber: {err}");
+        return;
     }
+    let _ = LOG_LEVEL_RELOAD.set(Box::new(move |level| {
+        let targets = tracing_subscriber::filter::Targets::new().with_default(level);
+        if let Err(err) = reload_handle.reload(targets) {
+            eprintln!("warning: failed to change log level: {err}");
+        }
+    }));
 }
 
 const LOG_RING_CAPACITY: usize = 300;

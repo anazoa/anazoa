@@ -4,6 +4,7 @@
 //! belongs to the caller; this module only knows how to drive calls once a
 //! TUN device and a command channel exist.
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,8 +27,8 @@ use crate::protozoa::media::{
     send_i420_video_frame,
 };
 use crate::protozoa::tunnel::{
-    NoiseRole, OUTBOUND_QUEUE_MAX_PACKETS, finalize_webm, init_noise_keys, noise_auth_failed,
-    prepare_noise_for_call, start_tun_bridge, tunnel_state, unpack_resolution,
+    NoiseRole, OUTBOUND_QUEUE_MAX_PACKETS, clear_noise_keys, finalize_webm, init_noise_keys,
+    noise_auth_failed, prepare_noise_for_call, start_tun_bridge, tunnel_state, unpack_resolution,
 };
 use crate::protozoa::vp9::{VP9_BLACK_KEYFRAMES, parse_resolution};
 use crate::protozoa::webrtc::{
@@ -41,12 +42,18 @@ use webrtc_sys::peer_connection::ffi::PeerConnectionState;
 
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(60);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
+/// Bound on each half of post-call signaling teardown (hangup+close, then
+/// the keepalive join). This runs on the shutdown path too — Android's
+/// Disconnect — where `TunnelSession::stop` only waits `STOP_TIMEOUT` (5 s)
+/// for the engine; a dead network must not eat all of that here.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // NOISE_CHECK_FRAMES covers ~4 s at 50 fps; 10 s leaves headroom for slow ICE/DTLS
 // before audio begins. noise_auth_failed() via custom_tick is the normal failure path.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Parses `noise-privkey`/`noise-peer-pubkey` (if both set) and registers them
-/// for Noise KK authentication. A no-op if neither is set.
+/// for Noise KK authentication; clears any previously registered pair if
+/// neither is set, so a config edit between Android sessions takes effect.
 pub fn init_noise_from_config(cfg: &Config) -> Result<()> {
     match (
         cfg.noise_privkey.as_deref().filter(|s| !s.is_empty()),
@@ -59,7 +66,10 @@ pub fn init_noise_from_config(cfg: &Config) -> Result<()> {
             info!("Noise KK authentication enabled");
             Ok(())
         }
-        (None, None) => Ok(()),
+        (None, None) => {
+            clear_noise_keys();
+            Ok(())
+        }
         _ => bail!("noise-privkey and noise-peer-pubkey must both be set or both omitted"),
     }
 }
@@ -119,25 +129,46 @@ pub async fn run_with_tun(
                 "spawning RaylibMedia from {p:?} (this blocks on building a VAD map over the whole file)"
             );
             let started = std::time::Instant::now();
-            let m = RaylibMedia::spawn(p, video_width, video_height)?;
-            info!("RaylibMedia ready in {:?}", started.elapsed());
-            Some(m)
+            // spawn_blocking rather than inline: building the VAD map can
+            // take seconds for a large file, and doing it on this task
+            // pinned a runtime worker and left shutdown unobserved until
+            // it finished — a Disconnect during media load stalled for
+            // the whole STOP_TIMEOUT.
+            let path = p.to_string();
+            let spawn = tokio::task::spawn_blocking(move || {
+                RaylibMedia::spawn(&path, video_width, video_height)
+            });
+            let m = tokio::select! {
+                _ = shutdown_signal() => {
+                    info!("shutdown requested during media load");
+                    None
+                }
+                m = spawn => Some(m.context("media load task")??),
+            };
+            if m.is_some() {
+                info!("RaylibMedia ready in {:?}", started.elapsed());
+            }
+            m
         }
         None => {
             info!("no media_path; audio ticks will send silence");
             None
         }
     };
-    let result = run_daemon(
-        cfg,
-        &mut media,
-        &mut cmd_rx,
-        video_width,
-        video_height,
-        auto_call,
-        status,
-    )
-    .await;
+    let result = if shutdown_requested() {
+        Ok(())
+    } else {
+        run_daemon(
+            cfg,
+            &mut media,
+            &mut cmd_rx,
+            video_width,
+            video_height,
+            auto_call,
+            status,
+        )
+        .await
+    };
     status.send_replace(EngineState::Stopped);
     finalize_webm();
     result
@@ -180,7 +211,15 @@ async fn run_call(
             signaling.send_change_media_settings().await?;
             signaling.send_change_participant_state().await?;
             info!("waiting for remote SDP offer");
-            let (sdp, early_signals) = wait_for_sdp(signaling).await?;
+            let in_call = EngineState::InCall {
+                peer_id,
+                started_at,
+            };
+            let Some(waited) = setup_step(wait_for_sdp(signaling), cmd_rx, &in_call).await else {
+                info!("call abandoned while waiting for remote SDP offer");
+                return Ok(());
+            };
+            let (sdp, early_signals) = waited?;
             log_sdp_negotiation("remote offer", &sdp);
             set_remote_sdp(&call.pc, SdpType::Offer, &sdp).await?;
             // Replay any signals (typically trickle ICE candidates) that arrived
@@ -670,18 +709,24 @@ async fn run_incoming_call(
         keepalive_stop_rx,
     ));
 
-    let mut signaling =
-        match SignalingClient::from_incoming(&incoming, signaling_user_id, endpoints, fingerprint)
-            .await
-        {
-            Ok(s) => s,
-            Err(err) => {
-                warn!("signaling connect: {err:#}");
-                let _ = keepalive_stop_tx.send(true);
-                let _ = keepalive.await;
-                return;
-            }
-        };
+    let connect =
+        SignalingClient::from_incoming(&incoming, signaling_user_id, endpoints, fingerprint);
+    let answering = EngineState::Answering {
+        peer_id: incoming.caller_id,
+    };
+    let mut signaling = match setup_step(connect, cmd_rx, &answering).await {
+        Some(Ok(s)) => s,
+        Some(Err(err)) => {
+            warn!("signaling connect: {err:#}");
+            stop_keepalive(keepalive_stop_tx, keepalive).await;
+            return;
+        }
+        None => {
+            info!("call abandoned during signaling connect");
+            stop_keepalive(keepalive_stop_tx, keepalive).await;
+            return;
+        }
+    };
 
     let (hangup_tx, hangup_rx) = watch::channel(false);
     let started_at = Instant::now();
@@ -705,10 +750,7 @@ async fn run_incoming_call(
     .await;
 
     let _ = hangup_tx.send(true);
-    let _ = signaling.hangup().await;
-    let _ = signaling.close().await;
-    let _ = keepalive_stop_tx.send(true);
-    let _ = keepalive.await;
+    teardown_call(&mut signaling, keepalive_stop_tx, keepalive).await;
 
     match call_result {
         Ok(()) => info!("call ended"),
@@ -732,13 +774,20 @@ async fn run_outgoing_call(
     info!("placing call to {peer_id}");
     status.send_replace(EngineState::Dialing { peer_id });
     prepare_noise_for_call(NoiseRole::Initiator);
-    let started = match oneme.lock().await.start_outgoing_call(peer_id).await {
-        Ok(s) => s,
-        Err(err) => {
+    let dialing = EngineState::Dialing { peer_id };
+    let start = async { oneme.lock().await.start_outgoing_call(peer_id).await };
+    let started = match setup_step(start, cmd_rx, &dialing).await {
+        Some(Ok(s)) => s,
+        Some(Err(err)) => {
             // Logged as well as returned: with auto_call nobody reads the
             // response, so this would otherwise vanish without a trace.
             warn!("start_outgoing_call: {err:#}");
             let _ = call_resp.send(Err(anyhow!("start_outgoing_call: {err:#}")));
+            return;
+        }
+        None => {
+            info!("call abandoned while starting outgoing call");
+            let _ = call_resp.send(Err(anyhow!("call cancelled")));
             return;
         }
     };
@@ -747,18 +796,22 @@ async fn run_outgoing_call(
     let _ = call_resp.send(Ok(json!({"state": "dialing", "peer_id": peer_id})));
 
     let turn = started.turn_server.clone();
-    let mut signaling = match SignalingClient::from_outgoing(
+    let calltaker_id = peer_id.to_string();
+    let connect = SignalingClient::from_outgoing(
         &started,
-        &peer_id.to_string(),
+        &calltaker_id,
         &cfg.signaling_user_id,
         endpoints,
         &cfg.auth.fingerprint,
-    )
-    .await
-    {
-        Ok(s) => s,
-        Err(err) => {
+    );
+    let mut signaling = match setup_step(connect, cmd_rx, &dialing).await {
+        Some(Ok(s)) => s,
+        Some(Err(err)) => {
             warn!("signaling connect: {err:#}");
+            return;
+        }
+        None => {
+            info!("call abandoned during signaling connect");
             return;
         }
     };
@@ -792,14 +845,101 @@ async fn run_outgoing_call(
     .await;
 
     let _ = hangup_tx.send(true);
-    let _ = signaling.hangup().await;
-    let _ = signaling.close().await;
-    let _ = keepalive_stop_tx.send(true);
-    let _ = keepalive.await;
+    teardown_call(&mut signaling, keepalive_stop_tx, keepalive).await;
 
     match call_result {
         Ok(()) => info!("call ended"),
         Err(err) => warn!("call ended with error: {err:#}"),
+    }
+}
+
+/// Runs one call-setup step (session request, signaling connect, waiting
+/// for the remote offer) while staying responsive: shutdown and a `Hangup`
+/// or `Shutdown` command abandon the step and return `None`; other
+/// commands are answered with `state` and the step keeps going. Without
+/// this, none of those phases polled `cmd_rx` or the shutdown signal, so
+/// `anazoa-ctl` hung and Android's Disconnect waited out `STOP_TIMEOUT`
+/// whenever the network had gone away mid-setup.
+///
+/// Dropping `step` must be acceptable to the caller: a half-made signaling
+/// connection is simply discarded, and a OneMe request cut mid-write shows
+/// up as a broken session on the next use (see `SessionClient::is_broken`).
+async fn setup_step<T>(
+    step: impl Future<Output = T>,
+    cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
+    state: &EngineState,
+) -> Option<T> {
+    tokio::pin!(step);
+    loop {
+        tokio::select! {
+            _ = shutdown_signal() => return None,
+            Some(cmd) = cmd_rx.recv() => {
+                if answer_during_setup(cmd, state) {
+                    return None;
+                }
+            }
+            out = &mut step => return Some(out),
+        }
+    }
+}
+
+/// Answers a command that arrived during call setup. Returns true if the
+/// setup should be abandoned.
+fn answer_during_setup(cmd: DaemonCmd, state: &EngineState) -> bool {
+    match cmd {
+        DaemonCmd::Status { resp } => {
+            let _ = resp.send(Ok(status_json(state)));
+            false
+        }
+        DaemonCmd::Hangup { resp } => {
+            info!("hangup requested via RPC during call setup");
+            let _ = resp.send(Ok(json!({"state": "ok"})));
+            true
+        }
+        DaemonCmd::Call { resp, .. } => {
+            let _ = resp.send(Err(anyhow!("already in a call")));
+            false
+        }
+        DaemonCmd::Answer { resp, .. } => {
+            let _ = resp.send(Err(anyhow!("cannot set answer mode during a call")));
+            false
+        }
+        DaemonCmd::Shutdown { resp } => {
+            info!("shutdown requested via RPC");
+            let _ = resp.send(Ok(json!({"state": "ok"})));
+            trigger_shutdown();
+            true
+        }
+    }
+}
+
+/// Post-call signaling teardown, each half bounded by `TEARDOWN_TIMEOUT`.
+async fn teardown_call(
+    signaling: &mut SignalingClient,
+    keepalive_stop_tx: watch::Sender<bool>,
+    keepalive: JoinHandle<()>,
+) {
+    let bye = async {
+        let _ = signaling.hangup().await;
+        let _ = signaling.close().await;
+    };
+    if tokio::time::timeout(TEARDOWN_TIMEOUT, bye).await.is_err() {
+        warn!("signaling teardown timed out after {TEARDOWN_TIMEOUT:?}");
+    }
+    stop_keepalive(keepalive_stop_tx, keepalive).await;
+}
+
+/// Stops the in-call heartbeat task, waiting at most `TEARDOWN_TIMEOUT`. A
+/// heartbeat stuck in a write on a dead socket is left to finish on its
+/// own (its write timeout marks the session broken), rather than aborted
+/// mid-write with the session lock held.
+async fn stop_keepalive(keepalive_stop_tx: watch::Sender<bool>, keepalive: JoinHandle<()>) {
+    let _ = keepalive_stop_tx.send(true);
+    if tokio::time::timeout(TEARDOWN_TIMEOUT, keepalive)
+        .await
+        .is_err()
+    {
+        debug!("keepalive task still busy after {TEARDOWN_TIMEOUT:?}; leaving it to finish");
     }
 }
 
@@ -890,6 +1030,28 @@ async fn wait_answering_cmds(
             Some(cmd) = cmd_rx.recv() => reject_offline(cmd, state),
         }
     }
+}
+
+/// Replaces the session in `oneme` with a freshly established one, after
+/// `RECONNECT_DELAY`. Returns true if shutdown fired instead.
+async fn reconnect_session(
+    oneme: &Mutex<SessionClient>,
+    cfg: &Config,
+    endpoints: &ServiceEndpoints,
+    cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
+    status: &watch::Sender<EngineState>,
+) -> bool {
+    warn!("OneMe session lost, re-establishing");
+    status.send_replace(EngineState::Connecting);
+    if wait_answering_cmds(RECONNECT_DELAY, cmd_rx, &EngineState::Connecting).await {
+        return true;
+    }
+    let Some(client) = connect_session_with_retry(cfg, endpoints, cmd_rx).await else {
+        return true;
+    };
+    *oneme.lock().await = client;
+    info!("OneMe session re-established");
+    false
 }
 
 /// `auto_call`: see [`run_with_tun`]. Not one-shot — every time the daemon
@@ -985,17 +1147,22 @@ pub async fn run_daemon(
             }
             IdleOutcome::Shutdown => return Ok(()),
             IdleOutcome::SessionError => {
-                warn!("OneMe session lost, re-establishing");
-                status.send_replace(EngineState::Connecting);
-                if wait_answering_cmds(RECONNECT_DELAY, cmd_rx, &EngineState::Connecting).await {
+                if reconnect_session(&oneme, cfg, &endpoints, cmd_rx, status).await {
                     return Ok(());
                 }
-                let Some(client) = connect_session_with_retry(cfg, &endpoints, cmd_rx).await else {
-                    return Ok(());
-                };
-                *oneme.lock().await = client;
-                info!("OneMe session re-established");
+                continue;
             }
+        }
+
+        // A call can leave the session dead behind it (the in-call
+        // heartbeat failed, or start_outgoing_call hit a broken socket
+        // after e.g. a Wi-Fi→LTE switch). idle_loop would notice via its
+        // wait task, but auto_call never enters idle_loop: without this
+        // check Android would redial forever on the same dead client.
+        if oneme.lock().await.is_broken()
+            && reconnect_session(&oneme, cfg, &endpoints, cmd_rx, status).await
+        {
+            return Ok(());
         }
     }
 }
