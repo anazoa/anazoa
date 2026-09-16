@@ -254,10 +254,21 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeStatus<'local>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jstring {
-    let value = {
-        let mut guard = slot().lock().unwrap();
-        reap_finished(&mut guard);
-        guard.as_ref().map(TunnelSession::status)
+    // try_lock, never lock: the UI thread polls this, and a concurrent
+    // start() holds the slot for the whole runtime/engine spin-up (stop()
+    // releases it before its bounded wait, but still takes it briefly).
+    // Blocking here would be an ANR; report a transient "connecting" instead.
+    let value = match slot().try_lock() {
+        Ok(mut guard) => {
+            reap_finished(&mut guard);
+            guard.as_ref().map(TunnelSession::status)
+        }
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+            let mut guard = poisoned.into_inner();
+            reap_finished(&mut guard);
+            guard.as_ref().map(TunnelSession::status)
+        }
+        Err(std::sync::TryLockError::WouldBlock) => Some(serde_json::json!({"state": "connecting"})),
     }
     .unwrap_or_else(|| serde_json::json!({"state": "error", "error": "tunnel not running"}));
     match env.new_string(value.to_string()) {

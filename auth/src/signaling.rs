@@ -26,6 +26,12 @@ const WT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SIGNALING_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
 const ACCEPTED_CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// Upper bound on a single (deflate-compressed) WebTransport frame read
+/// from the untrusted signaling server, before allocating a buffer for it.
+const MAX_SIGNALING_FRAME_LEN: usize = 1 << 20;
+/// Upper bound on the inflated size of a signaling frame, to defend against
+/// a decompression bomb from the signaling server.
+const MAX_SIGNALING_DECOMPRESSED_LEN: usize = 8 << 20;
 
 use crate::{
     FingerprintConfig, ServiceEndpoints, calls::StartedConversationInfo, oneme::IncomingCall,
@@ -75,7 +81,13 @@ impl SignalingWire {
         match self {
             SignalingWire::Wt(wt) => {
                 let len = read_quic_varint(&mut wt.recv).await?;
-                let mut buf = vec![0u8; usize::try_from(len).context("WT frame length too large")?];
+                let len = usize::try_from(len).context("WT frame length too large")?;
+                if len > MAX_SIGNALING_FRAME_LEN {
+                    bail!(
+                        "signaling WT frame length {len} exceeds limit of {MAX_SIGNALING_FRAME_LEN} bytes"
+                    );
+                }
+                let mut buf = vec![0u8; len];
                 wt.recv
                     .read_exact(&mut buf)
                     .await
@@ -112,9 +124,16 @@ fn deflate_compress(data: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn deflate_decompress(data: &[u8]) -> Result<Vec<u8>> {
-    let mut dec = DeflateDecoder::new(data);
+    // Cap the inflated output: the signaling server is untrusted, so a small
+    // compressed frame must not be able to expand into an unbounded allocation.
+    let mut dec = DeflateDecoder::new(data).take((MAX_SIGNALING_DECOMPRESSED_LEN as u64) + 1);
     let mut out = Vec::new();
     dec.read_to_end(&mut out).context("deflate decompress")?;
+    if out.len() > MAX_SIGNALING_DECOMPRESSED_LEN {
+        bail!(
+            "decompressed signaling frame exceeds limit of {MAX_SIGNALING_DECOMPRESSED_LEN} bytes"
+        );
+    }
     Ok(out)
 }
 
@@ -297,6 +316,7 @@ impl SignalingClient {
         endpoints: &ServiceEndpoints,
         fingerprint: &FingerprintConfig,
     ) -> Result<Self> {
+        validate_signaling_user_id(signaling_user_id)?;
         let peer_id = rand::random::<u64>() >> 1;
         let base = incoming_call.signaling.wt_url.as_deref().ok_or_else(|| {
             anyhow!("incoming call vcp has no `wte` WebTransport endpoint (only `wse`)")
@@ -342,6 +362,7 @@ impl SignalingClient {
         endpoints: &ServiceEndpoints,
         fingerprint: &FingerprintConfig,
     ) -> Result<Self> {
+        validate_signaling_user_id(signaling_user_id)?;
         let wt = started.wt_endpoint.as_deref().ok_or_else(|| {
             anyhow!("start-call response has no `wtEndpoint` (only WebSocket `endpoint`)")
         })?;
@@ -614,7 +635,39 @@ impl SignalingClient {
     }
 }
 
+/// Percent-encode a value for a URL query component (RFC 3986 unreserved set).
+/// Used for the opaque, server-issued values (signaling token, conversation id,
+/// user id) that could otherwise contain `&`/`=`/`#` and corrupt the query.
+fn percent_encode_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for &b in value.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
+}
+
+/// The signaling `userId` is interpolated into the endpoint URL without
+/// escaping, relying on it being a plain decimal number. Enforce that here so a
+/// malformed config value fails loudly instead of silently corrupting the query.
+fn validate_signaling_user_id(id: &str) -> Result<()> {
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        bail!("signaling user id must be a non-empty decimal number, got {id:?}");
+    }
+    Ok(())
+}
+
 fn signaling_endpoint(base: &str, signaling_user_id: &str, fp: &FingerprintConfig) -> String {
+    // `device` keeps its bespoke space->%2F substitution to match the exact
+    // wire format the Android Max client sends (a fingerprinting detail).
+    // `userId` is always a decimal number, so it needs no encoding.
     let device = fp.device_name.replace(' ', "%2F");
     let os_api = fp.os_api_level;
     let suffix = format!(
@@ -639,8 +692,13 @@ fn calltaker_signaling_endpoint(
     peer_id: u64,
     token: &str,
 ) -> String {
+    // See signaling_endpoint: `device` keeps its exact wire format and `userId`
+    // is a decimal number. The opaque server-issued `conversationId`/`token`
+    // are percent-encoded so they can't corrupt the query.
     let device = fp.device_name.replace(' ', "%2F");
     let os_api = fp.os_api_level;
+    let conversation_id = percent_encode_query(conversation_id);
+    let token = percent_encode_query(token);
     let sep = if base.contains('?') { '&' } else { '?' };
     format!(
         "{base}{sep}appVersion=sdk-0.1.10.1&capabilities=3c57f&clientType=ONE_ME\

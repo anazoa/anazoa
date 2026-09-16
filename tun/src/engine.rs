@@ -180,9 +180,14 @@ async fn run_call(
             signaling.send_change_media_settings().await?;
             signaling.send_change_participant_state().await?;
             info!("waiting for remote SDP offer");
-            let sdp = wait_for_sdp(signaling).await?;
+            let (sdp, early_signals) = wait_for_sdp(signaling).await?;
             log_sdp_negotiation("remote offer", &sdp);
             set_remote_sdp(&call.pc, SdpType::Offer, &sdp).await?;
+            // Replay any signals (typically trickle ICE candidates) that arrived
+            // before the offer, now that the remote description exists.
+            for data in early_signals {
+                handle_remote_signal(&mut call, data, role).await?;
+            }
             ensure_local_senders(&call, "after remote offer")?;
             let answer = create_answer(&call.pc).await.context("create SDP answer")?;
             let local_sdp = answer.stringify();
@@ -1143,7 +1148,13 @@ async fn send_sdp(signaling: &mut SignalingClient, ty: &str, sdp: &str) -> Resul
         .await
 }
 
-async fn wait_for_sdp(signaling: &mut SignalingClient) -> Result<String> {
+/// Waits for the remote SDP, returning it together with any other signals
+/// (e.g. trickle ICE candidates) that arrived before it. Those can't be
+/// applied until the remote description is set, so they're buffered here and
+/// replayed by the caller once `set_remote_sdp` has run — previously they were
+/// silently dropped.
+async fn wait_for_sdp(signaling: &mut SignalingClient) -> Result<(String, Vec<Value>)> {
+    let mut buffered = Vec::new();
     loop {
         let data = tokio::time::timeout(SIGNAL_TIMEOUT, signaling.receive_signal_value())
             .await
@@ -1153,8 +1164,9 @@ async fn wait_for_sdp(signaling: &mut SignalingClient) -> Result<String> {
             .and_then(|v| v.get("sdp"))
             .and_then(Value::as_str)
         {
-            return Ok(sdp.to_string());
+            return Ok((sdp.to_string(), buffered));
         }
+        buffered.push(data);
     }
 }
 

@@ -38,6 +38,12 @@ pub const MAX_REASSEMBLED_PACKET_LEN: usize = 65_535;
 pub const MAX_REASSEMBLY_PACKETS: usize = 256;
 pub const FRAGMENT_REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(2);
 pub const OUTBOUND_QUEUE_MAX_PACKETS: usize = 64;
+/// Cap on cached (not-yet-sent) fragment frames. A resolution down-step
+/// shrinks the carrier, so fragments sized for a larger carrier may never
+/// fit the current one; without a bound they would accumulate. Their
+/// packet is best-effort anyway (the peer's reassembly times out), so the
+/// oldest beyond this cap are dropped.
+pub const OUTBOUND_FRAMES_MAX: usize = MAX_REASSEMBLY_PACKETS * 2;
 pub const INBOUND_QUEUE_MAX_PACKETS: usize = 256;
 
 pub const FRAME_KIND_PADDING: u8 = 0x00;
@@ -375,6 +381,12 @@ pub fn next_tunnel_frame(
     }
 
     let mut cached_frames = state.outbound_frames.try_lock().ok()?;
+    while cached_frames.len() > OUTBOUND_FRAMES_MAX {
+        cached_frames.pop_front();
+        state
+            .tunnel_fragments_dropped
+            .fetch_add(1, Ordering::Relaxed);
+    }
 
     // Build first frame from cache or fresh packet.
     let mut out: Vec<u8> =
@@ -464,6 +476,13 @@ pub fn pop_cached_frame_that_fits(
 /// Returns `Some((is_key_frame, sender_width, sender_height))` from the last data frame parsed.
 pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
     let state = tunnel_state()?;
+    // Only decapsulated packets from an authenticated peer are injected into
+    // the TUN device. The sender already withholds tunnel data until the Noise
+    // KK handshake completes (engine video_tick), but enforcing it here as well
+    // stops a peer that answered the WebRTC call without ever completing the
+    // handshake from injecting IP packets during the pre-auth window. Resolution
+    // tracking below still runs so a keyframe replacement can be selected.
+    let authenticated = state.authenticated.load(Ordering::Relaxed);
     let mut last_data: Option<(bool, u16, u16)> = None;
     let mut offset = 0usize;
 
@@ -479,11 +498,13 @@ pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
                 sender_height,
                 packet,
             }) => {
-                state
-                    .tunnel_packets_reassembled
-                    .fetch_add(1, Ordering::Relaxed);
                 let packet_len = packet.len();
-                let _ = state.inbound_packets.try_send(packet.to_vec());
+                if authenticated {
+                    state
+                        .tunnel_packets_reassembled
+                        .fetch_add(1, Ordering::Relaxed);
+                    let _ = state.inbound_packets.try_send(packet.to_vec());
+                }
                 last_data = Some((is_key_frame, sender_width, sender_height));
                 offset += WHOLE_HEADER_LEN + packet_len;
             }
@@ -510,7 +531,9 @@ pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
                         .tunnel_fragments_dropped
                         .fetch_add(expired, Ordering::Relaxed);
                 }
-                if let Some(packet) = reassembled {
+                if let Some(packet) = reassembled
+                    && authenticated
+                {
                     state
                         .tunnel_packets_reassembled
                         .fetch_add(1, Ordering::Relaxed);

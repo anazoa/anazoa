@@ -25,6 +25,9 @@ const SESSION_ID_MIN: u32 = 30;
 const SESSION_ID_RANGE: u32 = 171;
 const MAX_FRAME_LEN: usize = 1 << 20;
 const MAX_DECOMPRESSED_LEN: usize = 64 << 10;
+/// Maximum nesting depth accepted when parsing msgpack from the wire,
+/// to bound recursion in `MsgParser::parse_value` against a hostile server.
+const MAX_MSGPACK_DEPTH: usize = 128;
 const CMD_EVENT: u8 = 0;
 const CMD_SUCCESS: u8 = 1;
 const CMD_ERROR: u8 = 3;
@@ -657,11 +660,20 @@ fn decode_vcp(vcp: &str) -> Result<VcpDecoded> {
         .split_once(':')
         .ok_or_else(|| anyhow!("invalid vcp format"))?;
     let expected_size: usize = uncompressed_size.parse().context("parse vcp size")?;
+    // The vcp comes from the (untrusted) OneMe server; refuse to preallocate an
+    // arbitrarily large buffer for a decompressed size it fully controls.
+    if expected_size > MAX_DECOMPRESSED_LEN {
+        bail!(
+            "vcp uncompressed size {expected_size} exceeds limit of {MAX_DECOMPRESSED_LEN} bytes"
+        );
+    }
     let compressed = base64::engine::general_purpose::STANDARD
         .decode(compressed_b64)
         .context("base64 decode vcp")?;
-    let decompressed =
-        lz4_flex::block::decompress(&compressed, expected_size).context("lz4 decompress vcp")?;
+    let mut decompressed = vec![0u8; expected_size];
+    let len = lz4_flex::block::decompress_into(&compressed, &mut decompressed)
+        .map_err(|err| anyhow!("lz4 decompress vcp: {err}"))?;
+    decompressed.truncate(len);
     debug!("decoded vcp: {}", String::from_utf8_lossy(&decompressed));
     serde_json::from_slice(&decompressed).context("deserialize vcp")
 }
@@ -805,7 +817,7 @@ fn decode_payload(cof: i8, payload: &[u8]) -> Result<Vec<u8>> {
 pub fn parse_msgpack_json(payload: &[u8]) -> Result<Value> {
     let mut parser = MsgParser::new(payload);
     let value = parser
-        .parse_value()
+        .parse_value(0)
         .map_err(|err| anyhow!("failed to decode OneMe msgpack payload: {err}"))?;
     Ok(msg_value_to_json(&value))
 }
@@ -1024,12 +1036,17 @@ impl<'a> MsgParser<'a> {
         Self { input, pos: 0 }
     }
 
-    fn parse_value(&mut self) -> Result<MsgValue, String> {
+    fn parse_value(&mut self, depth: usize) -> Result<MsgValue, String> {
+        if depth > MAX_MSGPACK_DEPTH {
+            return Err(format!(
+                "msgpack nesting exceeds depth limit of {MAX_MSGPACK_DEPTH}"
+            ));
+        }
         let marker = self.read_u8()?;
         match marker {
             0x00..=0x7f => Ok(MsgValue::Int(marker as i128)),
-            0x80..=0x8f => self.parse_map((marker & 0x0f) as usize),
-            0x90..=0x9f => self.parse_array((marker & 0x0f) as usize),
+            0x80..=0x8f => self.parse_map((marker & 0x0f) as usize, depth),
+            0x90..=0x9f => self.parse_array((marker & 0x0f) as usize, depth),
             0xa0..=0xbf => self.parse_string((marker & 0x1f) as usize),
             0xc0 => Ok(MsgValue::Nil),
             0xc2 => Ok(MsgValue::Bool(false)),
@@ -1085,37 +1102,42 @@ impl<'a> MsgParser<'a> {
             }
             0xdc => {
                 let len = self.read_u16()? as usize;
-                self.parse_array(len)
+                self.parse_array(len, depth)
             }
             0xdd => {
                 let len = self.read_u32()? as usize;
-                self.parse_array(len)
+                self.parse_array(len, depth)
             }
             0xde => {
                 let len = self.read_u16()? as usize;
-                self.parse_map(len)
+                self.parse_map(len, depth)
             }
             0xdf => {
                 let len = self.read_u32()? as usize;
-                self.parse_map(len)
+                self.parse_map(len, depth)
             }
             0xe0..=0xff => Ok(MsgValue::Int((marker as i8) as i128)),
             other => Err(format!("unsupported msgpack marker 0x{other:02x}")),
         }
     }
 
-    fn parse_array(&mut self, len: usize) -> Result<MsgValue, String> {
-        let mut out = Vec::with_capacity(len);
+    fn parse_array(&mut self, len: usize, depth: usize) -> Result<MsgValue, String> {
+        // Cap the preallocation at the bytes actually remaining: every element
+        // needs at least one byte, so a hostile huge `len` can't force a giant
+        // allocation before the per-element reads fail with EOF.
+        let mut out = Vec::with_capacity(len.min(self.remaining()));
         for _ in 0..len {
-            out.push(self.parse_value()?);
+            out.push(self.parse_value(depth + 1)?);
         }
         Ok(MsgValue::Array(out))
     }
 
-    fn parse_map(&mut self, len: usize) -> Result<MsgValue, String> {
-        let mut out = Vec::with_capacity(len);
+    fn parse_map(&mut self, len: usize, depth: usize) -> Result<MsgValue, String> {
+        // See parse_array: each entry needs at least two bytes, so `remaining`
+        // is a safe upper bound on the preallocation.
+        let mut out = Vec::with_capacity(len.min(self.remaining()));
         for _ in 0..len {
-            out.push((self.parse_value()?, self.parse_value()?));
+            out.push((self.parse_value(depth + 1)?, self.parse_value(depth + 1)?));
         }
         Ok(MsgValue::Map(out))
     }
@@ -1128,6 +1150,10 @@ impl<'a> MsgParser<'a> {
 
     fn parse_binary(&mut self, len: usize) -> Result<MsgValue, String> {
         Ok(MsgValue::Binary(self.read_bytes(len)?.to_vec()))
+    }
+
+    fn remaining(&self) -> usize {
+        self.input.len().saturating_sub(self.pos)
     }
 
     fn read_u8(&mut self) -> Result<u8, String> {
