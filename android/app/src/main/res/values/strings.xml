@@ -1,5 +1,5 @@
 <resources>
-    <string name="app_name">Anazoa VPN</string>
+    <string name="app_name">Anazoa</string>
     <string name="status_idle">Disconnected</string>
     <string name="status_connecting">Connecting…</string>
     <string name="status_connected">Connected</string>
