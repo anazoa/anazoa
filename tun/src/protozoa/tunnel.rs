@@ -2,10 +2,11 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use super::media::{VIDEO_HEIGHT, VIDEO_WIDTH};
+use super::media::DEFAULT_RESOLUTION;
 use super::noise::{
     NOISE_MSG_SIZE, noise_enabled, noise_process_incoming, noise_reset_state, noise_try_inject,
 };
+use super::resolution::Resolution;
 use super::vp9::VP9_BLACK_KEYFRAMES;
 use std::time::{Duration, Instant as StdInstant, SystemTime, UNIX_EPOCH};
 
@@ -169,7 +170,7 @@ pub struct TunnelState {
     /// Keyframe cache: one VP9 black keyframe per resolution.
     /// Pre-populated at startup with the 4 known VideoAdapter down-step resolutions.
     /// Updated on every outbound keyframe with the actual encoder output.
-    pub vp9_keyframe_cache: Mutex<HashMap<(u16, u16), Vec<u8>>>,
+    pub vp9_keyframe_cache: Mutex<HashMap<Resolution, Vec<u8>>>,
 
     /// Set to true once the Noise KK handshake completes successfully.
     /// Always true when Noise authentication is not configured.
@@ -194,8 +195,7 @@ impl TunnelState {
     fn new(
         inbound_tx: mpsc::Sender<Vec<u8>>,
         webm_mux: Option<WebmMuxer>,
-        video_width: u32,
-        video_height: u32,
+        resolution: Resolution,
     ) -> Self {
         Self {
             outbound_packets: Mutex::new(VecDeque::new()),
@@ -221,18 +221,12 @@ impl TunnelState {
             tunnel_fragments_dropped: AtomicU64::new(0),
             utilization: Mutex::new(UtilizationHistory::default()),
             remote_vad_last_speech_ms: AtomicU64::new(0),
-            encoder_resolution: AtomicU64::new(pack_resolution(
-                video_width as u16,
-                video_height as u16,
-            )),
-            remote_vp9_resolution: AtomicU64::new(pack_resolution(
-                video_width as u16,
-                video_height as u16,
-            )),
+            encoder_resolution: AtomicU64::new(resolution.pack()),
+            remote_vp9_resolution: AtomicU64::new(resolution.pack()),
             vp9_keyframe_cache: Mutex::new(
                 VP9_BLACK_KEYFRAMES
                     .iter()
-                    .map(|kf| ((kf.width, kf.height), kf.data.to_vec()))
+                    .map(|kf| (Resolution::new(kf.width, kf.height), kf.data.to_vec()))
                     .collect(),
             ),
         }
@@ -279,27 +273,15 @@ pub async fn start_tun_bridge(
     tun: AsyncDevice,
     log_dir: Option<&std::path::Path>,
     prefix: &str,
-    video_width: u32,
-    video_height: u32,
+    resolution: Resolution,
 ) -> Result<TunBridge> {
     let tun = Arc::new(tun);
     let (inbound_tx, mut inbound_rx) = mpsc::channel(INBOUND_QUEUE_MAX_PACKETS);
 
-    let webm_mux = log_dir.and_then(|dir| {
-        WebmMuxer::open(
-            &dir.join(format!("{}.webm", prefix)),
-            video_width,
-            video_height,
-        )
-        .ok()
-    });
+    let webm_mux = log_dir
+        .and_then(|dir| WebmMuxer::open(&dir.join(format!("{}.webm", prefix)), resolution).ok());
 
-    let state = Arc::new(TunnelState::new(
-        inbound_tx,
-        webm_mux,
-        video_width,
-        video_height,
-    ));
+    let state = Arc::new(TunnelState::new(inbound_tx, webm_mux, resolution));
 
     set_tunnel_state(Arc::clone(&state));
 
@@ -373,7 +355,7 @@ pub async fn start_tun_bridge(
 pub fn next_tunnel_frame(
     carrier_len: usize,
     is_key_frame: bool,
-    sender_res: (u16, u16),
+    sender_res: Resolution,
 ) -> Option<Vec<u8>> {
     let state = tunnel_state()?;
     if carrier_len == 0 {
@@ -492,8 +474,8 @@ pub fn pop_cached_frame_that_fits(
     None
 }
 
-/// Returns `Some((is_key_frame, sender_width, sender_height))` from the last data frame parsed.
-pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
+/// Returns `Some((is_key_frame, sender_resolution))` from the last data frame parsed.
+pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, Resolution)> {
     let state = tunnel_state()?;
     // Only decapsulated packets from an authenticated peer are injected into
     // the TUN device. The sender already withholds tunnel data until the Noise
@@ -502,7 +484,7 @@ pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
     // handshake from injecting IP packets during the pre-auth window. Resolution
     // tracking below still runs so a keyframe replacement can be selected.
     let authenticated = state.authenticated.load(Ordering::Relaxed);
-    let mut last_data: Option<(bool, u16, u16)> = None;
+    let mut last_data: Option<(bool, Resolution)> = None;
     let mut offset = 0usize;
 
     loop {
@@ -513,8 +495,7 @@ pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
             None | Some(TunnelFrame::Padding) => break,
             Some(TunnelFrame::Whole {
                 is_key_frame,
-                sender_width,
-                sender_height,
+                sender,
                 packet,
             }) => {
                 let packet_len = packet.len();
@@ -524,13 +505,12 @@ pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
                         .fetch_add(1, Ordering::Relaxed);
                     let _ = state.inbound_packets.try_send(packet.to_vec());
                 }
-                last_data = Some((is_key_frame, sender_width, sender_height));
+                last_data = Some((is_key_frame, sender));
                 offset += WHOLE_HEADER_LEN + packet_len;
             }
             Some(TunnelFrame::Fragment {
                 is_key_frame,
-                sender_width,
-                sender_height,
+                sender,
                 packet_id,
                 fragment_index,
                 fragment_count,
@@ -539,7 +519,7 @@ pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
                 let data_len = data.len();
                 let (reassembled, expired) = {
                     let Ok(mut reassembly) = state.reassembly.try_lock() else {
-                        last_data = Some((is_key_frame, sender_width, sender_height));
+                        last_data = Some((is_key_frame, sender));
                         offset += FRAGMENT_HEADER_LEN + data_len;
                         continue;
                     };
@@ -558,7 +538,7 @@ pub fn handle_inbound_tunnel_frame(carrier: &[u8]) -> Option<(bool, u16, u16)> {
                         .fetch_add(1, Ordering::Relaxed);
                     let _ = state.inbound_packets.try_send(packet);
                 }
-                last_data = Some((is_key_frame, sender_width, sender_height));
+                last_data = Some((is_key_frame, sender));
                 offset += FRAGMENT_HEADER_LEN + data_len;
             }
         }
@@ -571,14 +551,12 @@ pub enum TunnelFrame<'a> {
     Padding,
     Whole {
         is_key_frame: bool,
-        sender_width: u16,
-        sender_height: u16,
+        sender: Resolution,
         packet: &'a [u8],
     },
     Fragment {
         is_key_frame: bool,
-        sender_width: u16,
-        sender_height: u16,
+        sender: Resolution,
         packet_id: u32,
         fragment_index: u16,
         fragment_count: u16,
@@ -593,15 +571,15 @@ pub fn frame_flags(is_key_frame: bool) -> u8 {
 pub fn encode_whole_frame(
     packet: &[u8],
     is_key_frame: bool,
-    (sender_w, sender_h): (u16, u16),
+    sender: Resolution,
 ) -> Option<Vec<u8>> {
     let len = u16::try_from(packet.len()).ok()?;
     let mut frame = Vec::with_capacity(WHOLE_HEADER_LEN + packet.len());
     frame.put_u8(FRAME_KIND_WHOLE);
     frame.put_u8(frame_flags(is_key_frame));
     frame.put_u16(len);
-    frame.put_u16(sender_w);
-    frame.put_u16(sender_h);
+    frame.put_u16(sender.width);
+    frame.put_u16(sender.height);
     frame.put_slice(packet);
     Some(frame)
 }
@@ -611,7 +589,7 @@ pub fn encode_fragment_frame(
     carrier_len: usize,
     packet_id: u32,
     is_key_frame: bool,
-    (sender_w, sender_h): (u16, u16),
+    sender: Resolution,
 ) -> Result<Vec<Vec<u8>>> {
     let fragment_payload_len = carrier_len.saturating_sub(FRAGMENT_HEADER_LEN);
     if fragment_payload_len == 0 {
@@ -635,8 +613,8 @@ pub fn encode_fragment_frame(
         frame.put_u16(fragment_index);
         frame.put_u16(fragment_count);
         frame.put_u16(fragment_len);
-        frame.put_u16(sender_w);
-        frame.put_u16(sender_h);
+        frame.put_u16(sender.width);
+        frame.put_u16(sender.height);
         frame.put_slice(chunk);
         frames.push(frame);
     }
@@ -664,8 +642,7 @@ pub fn parse_tunnel_frame(frame: &[u8]) -> Option<TunnelFrame<'_>> {
             }
             Some(TunnelFrame::Whole {
                 is_key_frame: flags & FRAME_FLAG_KEYFRAME != 0,
-                sender_width,
-                sender_height,
+                sender: Resolution::new(sender_width, sender_height),
                 packet: &buf[..len],
             })
         }
@@ -689,8 +666,7 @@ pub fn parse_tunnel_frame(frame: &[u8]) -> Option<TunnelFrame<'_>> {
             }
             Some(TunnelFrame::Fragment {
                 is_key_frame: flags & FRAME_FLAG_KEYFRAME != 0,
-                sender_width,
-                sender_height,
+                sender: Resolution::new(sender_width, sender_height),
                 packet_id,
                 fragment_index,
                 fragment_count,
@@ -854,22 +830,19 @@ pub unsafe extern "C" fn hook_after_vp9_encode(
         {
             webm.write_video_frame(&orig, is_key_frame);
         }
-        if is_key_frame && let Some((w, h)) = vp9_keyframe_dimensions(&orig) {
-            let prev = unpack_resolution(
-                state
-                    .encoder_resolution
-                    .swap(pack_resolution(w, h), Ordering::Relaxed),
-            );
-            if prev != (w, h) {
-                info!("encoder resolution changed: {w}×{h}");
+        if is_key_frame && let Some(res) = vp9_keyframe_dimensions(&orig) {
+            let prev =
+                Resolution::unpack(state.encoder_resolution.swap(res.pack(), Ordering::Relaxed));
+            if prev != res {
+                info!("encoder resolution changed: {res}");
             }
             if let Ok(mut cache) = state.vp9_keyframe_cache.lock() {
-                cache.insert((w, h), orig);
+                cache.insert(res, orig);
             }
         }
 
         buf.fill(FRAME_KIND_PADDING);
-        let sender_res = unpack_resolution(state.encoder_resolution.load(Ordering::Relaxed));
+        let sender_res = Resolution::unpack(state.encoder_resolution.load(Ordering::Relaxed));
         let is_data = if let Some(frame) = next_tunnel_frame(len, is_key_frame, sender_res)
             && frame.len() <= len
         {
@@ -927,16 +900,16 @@ pub unsafe extern "C" fn hook_before_vp9_reference_find(
     let mut carrier_is_key_frame = None;
     {
         let frame = unsafe { std::slice::from_raw_parts(payload, len) };
-        if let Some((kf, w, h)) = handle_inbound_tunnel_frame(frame) {
+        if let Some((kf, sender)) = handle_inbound_tunnel_frame(frame) {
             carrier_is_key_frame = Some(kf);
             state.tunnel_frames_received.fetch_add(1, Ordering::Relaxed);
             state
                 .tunnel_frame_bytes_received
                 .fetch_add(len as u64, Ordering::Relaxed);
-            if w > 0 && h > 0 {
+            if sender.width > 0 && sender.height > 0 {
                 state
                     .remote_vp9_resolution
-                    .store(pack_resolution(w, h), Ordering::Relaxed);
+                    .store(sender.pack(), Ordering::Relaxed);
             }
         }
     } // immutable borrow of payload ends here
@@ -947,21 +920,24 @@ pub unsafe extern "C" fn hook_before_vp9_reference_find(
     // Select replacement VP9 frame: correct-resolution black keyframe or show-existing-frame.
     let keyframe_buf: Vec<u8>;
     let replacement: &[u8] = if replacement_is_key_frame {
-        let (w, h) = unpack_resolution(state.remote_vp9_resolution.load(Ordering::Relaxed));
+        let remote = Resolution::unpack(state.remote_vp9_resolution.load(Ordering::Relaxed));
         keyframe_buf = state
             .vp9_keyframe_cache
             .lock()
             .ok()
             .and_then(|cache| {
                 cache
-                    .get(&(w, h))
-                    .or_else(|| cache.get(&(VIDEO_WIDTH as u16, VIDEO_HEIGHT as u16)))
+                    .get(&remote)
+                    .or_else(|| cache.get(&DEFAULT_RESOLUTION))
                     .cloned()
             })
             .unwrap_or_else(|| {
                 VP9_BLACK_KEYFRAMES
                     .iter()
-                    .find(|kf| kf.width == VIDEO_WIDTH as u16 && kf.height == VIDEO_HEIGHT as u16)
+                    .find(|kf| {
+                        kf.width == DEFAULT_RESOLUTION.width
+                            && kf.height == DEFAULT_RESOLUTION.height
+                    })
                     .map(|kf| kf.data.to_vec())
                     .unwrap_or_default()
             });
@@ -1068,17 +1044,9 @@ pub fn keep_opus_hooks_linked() {
     let _ = &KEEP_OPUS_HOOKS;
 }
 
-pub fn pack_resolution(w: u16, h: u16) -> u64 {
-    (w as u64) << 16 | h as u64
-}
-
-pub fn unpack_resolution(v: u64) -> (u16, u16) {
-    ((v >> 16) as u16, v as u16)
-}
-
 /// Parses width and height from a VP9 keyframe bitstream (profile 0–3).
 /// Returns `None` if `data` is not a valid VP9 keyframe.
-pub fn vp9_keyframe_dimensions(data: &[u8]) -> Option<(u16, u16)> {
+pub fn vp9_keyframe_dimensions(data: &[u8]) -> Option<Resolution> {
     let b0 = *data.first()?;
     // byte 0: frame_marker(2) | profile_low(1) | profile_high(1) |
     //         show_existing_frame(1) | frame_type(1) | show_frame(1) | error_resilient(1)
@@ -1106,7 +1074,7 @@ pub fn vp9_keyframe_dimensions(data: &[u8]) -> Option<(u16, u16)> {
     // frame_width_minus_1 (16 bits), frame_height_minus_1 (16 bits)
     let w = read_stream_bits(data, pos, 16)? as u16 + 1;
     let h = read_stream_bits(data, pos + 16, 16)? as u16 + 1;
-    Some((w, h))
+    Some(Resolution::new(w, h))
 }
 
 /// Reads `n` bits (up to 24) from the VP9 bitstream at bit offset `pos`, MSB-first.
@@ -1133,7 +1101,7 @@ pub struct WebmMuxer {
 }
 
 impl WebmMuxer {
-    fn open(path: &std::path::Path, video_width: u32, video_height: u32) -> Result<Self> {
+    fn open(path: &std::path::Path, resolution: Resolution) -> Result<Self> {
         let file = std::fs::File::create(path)
             .with_context(|| format!("create webm dump {}", path.display()))?;
         let writer = Writer::new(file);
@@ -1141,7 +1109,7 @@ impl WebmMuxer {
         let builder = builder.set_mode(SegmentMode::File)?;
 
         let (builder, video_track) =
-            builder.add_video_track(video_width, video_height, VideoCodecId::VP9, None)?;
+            builder.add_video_track(resolution.w32(), resolution.h32(), VideoCodecId::VP9, None)?;
         let (builder, audio_track) = builder.add_audio_track(48000, 1, AudioCodecId::Opus, None)?;
 
         let opus_head = [
@@ -1211,21 +1179,17 @@ mod tests {
     #[test]
     fn parses_whole_frame_with_padding() {
         let payload = b"hello";
-        let mut frame =
-            encode_whole_frame(payload, true, (VIDEO_WIDTH as u16, VIDEO_HEIGHT as u16))
-                .expect("whole frame");
+        let mut frame = encode_whole_frame(payload, true, DEFAULT_RESOLUTION).expect("whole frame");
         frame.resize(64, 0);
 
         match parse_tunnel_frame(&frame).expect("parse frame") {
             TunnelFrame::Whole {
                 is_key_frame,
-                sender_width,
-                sender_height,
+                sender,
                 packet,
             } => {
                 assert!(is_key_frame);
-                assert_eq!(sender_width, VIDEO_WIDTH as u16);
-                assert_eq!(sender_height, VIDEO_HEIGHT as u16);
+                assert_eq!(sender, DEFAULT_RESOLUTION);
                 assert_eq!(packet, payload);
             }
             _ => panic!("expected whole frame"),
@@ -1235,8 +1199,8 @@ mod tests {
     #[test]
     fn fragments_and_reassembles_with_padding() {
         let payload = (0..512).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-        let frames =
-            encode_fragment_frame(&payload, 80, 7, false, (480, 270)).expect("fragment packet");
+        let frames = encode_fragment_frame(&payload, 80, 7, false, Resolution::new(480, 270))
+            .expect("fragment packet");
         assert!(frames.len() > 1);
 
         let mut reassembly = ReassemblyState::default();
@@ -1246,16 +1210,14 @@ mod tests {
             match parse_tunnel_frame(&frame).expect("parse fragment") {
                 TunnelFrame::Fragment {
                     is_key_frame,
-                    sender_width,
-                    sender_height,
+                    sender,
                     packet_id,
                     fragment_index,
                     fragment_count,
                     data,
                 } => {
                     assert!(!is_key_frame);
-                    assert_eq!(sender_width, 480);
-                    assert_eq!(sender_height, 270);
+                    assert_eq!(sender, Resolution::new(480, 270));
                     (result, _) =
                         reassembly.insert_fragment(packet_id, fragment_index, fragment_count, data);
                 }
@@ -1280,7 +1242,7 @@ mod tests {
         for kf in VP9_BLACK_KEYFRAMES {
             assert_eq!(
                 vp9_keyframe_dimensions(kf.data),
-                Some((kf.width, kf.height)),
+                Some(Resolution::new(kf.width, kf.height)),
                 "{}x{}",
                 kf.width,
                 kf.height
@@ -1292,7 +1254,7 @@ mod tests {
     fn multi_frame_pack_and_parse() {
         let p1 = b"first-packet";
         let p2 = b"second-packet";
-        let res = (640u16, 360u16);
+        let res = Resolution::new(640, 360);
         let frame1 = encode_whole_frame(p1, false, res).unwrap();
         let frame2 = encode_whole_frame(p2, true, res).unwrap();
 

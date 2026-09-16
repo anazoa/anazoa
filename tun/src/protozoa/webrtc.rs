@@ -185,7 +185,11 @@ pub enum Role {
 }
 
 impl WebrtcCall {
-    pub fn new(turn: &TurnServer, role: Role, video_width: u32, video_height: u32) -> Result<Self> {
+    pub fn new(
+        turn: &TurnServer,
+        role: Role,
+        resolution: super::resolution::Resolution,
+    ) -> Result<Self> {
         let (tx, events) = mpsc::unbounded_channel();
         let factory = create_peer_connection_factory();
         let config = RtcConfiguration {
@@ -217,8 +221,8 @@ impl WebrtcCall {
             factory.create_audio_track("anazoa-audio".to_string(), audio_source.clone());
         let video_source = new_video_track_source(
             &VideoResolution {
-                width: video_width,
-                height: video_height,
+                width: resolution.w32(),
+                height: resolution.h32(),
             },
             false,
         );

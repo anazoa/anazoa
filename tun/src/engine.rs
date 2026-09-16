@@ -19,18 +19,19 @@ use tracing::{debug, info, warn};
 use anazoa_auth::TurnServer;
 use anazoa_auth::oneme::{IncomingCall, SessionClient};
 use anazoa_auth::signaling::SignalingClient;
-use anazoa_config::{FingerprintConfig, ServiceEndpoints};
+use anazoa_config::ServiceEndpoints;
 
 use crate::daemon::DaemonCmd;
 use crate::protozoa::media::{
     AUDIO_CHANNELS, AUDIO_FRAME_SAMPLES, AUDIO_SAMPLE_RATE, RaylibMedia, VIDEO_FPS,
     send_i420_video_frame,
 };
+use crate::protozoa::resolution::Resolution;
 use crate::protozoa::tunnel::{
     NoiseRole, OUTBOUND_QUEUE_MAX_PACKETS, clear_noise_keys, finalize_webm, init_noise_keys,
-    noise_auth_failed, prepare_noise_for_call, start_tun_bridge, tunnel_state, unpack_resolution,
+    noise_auth_failed, prepare_noise_for_call, start_tun_bridge, tunnel_state,
 };
-use crate::protozoa::vp9::{VP9_BLACK_KEYFRAMES, parse_resolution};
+use crate::protozoa::vp9::VP9_BLACK_KEYFRAMES;
 use crate::protozoa::webrtc::{
     LocalEvent, Role, WebrtcCall, add_ice_candidate, attach_existing_remote_tracks, create_answer,
     create_offer, ensure_local_senders, ice_state_name, log_local_senders, pc_state_name,
@@ -76,8 +77,8 @@ pub fn init_noise_from_config(cfg: &Config) -> Result<()> {
 
 /// Resolves `media-video-resolution` to a (width, height) pair, or a
 /// descriptive error listing the valid presets.
-pub fn video_resolution(cfg: &Config) -> Result<(u32, u32)> {
-    parse_resolution(&cfg.media_video_resolution).ok_or_else(|| {
+pub fn video_resolution(cfg: &Config) -> Result<Resolution> {
+    Resolution::parse_preset(&cfg.media_video_resolution).ok_or_else(|| {
         let valid = VP9_BLACK_KEYFRAMES
             .iter()
             .map(|kf| format!("{}x{}", kf.width, kf.height))
@@ -121,8 +122,8 @@ pub async fn run_with_tun(
     status: &watch::Sender<EngineState>,
 ) -> Result<()> {
     status.send_replace(EngineState::Connecting);
-    let (video_width, video_height) = video_resolution(cfg)?;
-    let _tun_bridge = start_tun_bridge(tun, log_dir, log_prefix, video_width, video_height).await?;
+    let resolution = video_resolution(cfg)?;
+    let _tun_bridge = start_tun_bridge(tun, log_dir, log_prefix, resolution).await?;
     let mut media = match media_path {
         Some(p) => {
             info!(
@@ -135,9 +136,7 @@ pub async fn run_with_tun(
             // it finished — a Disconnect during media load stalled for
             // the whole STOP_TIMEOUT.
             let path = p.to_string();
-            let spawn = tokio::task::spawn_blocking(move || {
-                RaylibMedia::spawn(&path, video_width, video_height)
-            });
+            let spawn = tokio::task::spawn_blocking(move || RaylibMedia::spawn(&path, resolution));
             let m = tokio::select! {
                 _ = shutdown_signal() => {
                     info!("shutdown requested during media load");
@@ -158,16 +157,7 @@ pub async fn run_with_tun(
     let result = if shutdown_requested() {
         Ok(())
     } else {
-        run_daemon(
-            cfg,
-            &mut media,
-            &mut cmd_rx,
-            video_width,
-            video_height,
-            auto_call,
-            status,
-        )
-        .await
+        run_daemon(cfg, &mut media, &mut cmd_rx, resolution, auto_call, status).await
     };
     status.send_replace(EngineState::Stopped);
     finalize_webm();
@@ -176,20 +166,30 @@ pub async fn run_with_tun(
 
 // ── call execution ────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+/// Everything a call needs that is invariant across the whole daemon session:
+/// the config and its derived endpoints/fingerprint/resolution, the shared
+/// media source, the command channel, and the status publisher. Bundled so
+/// the call runners don't each thread a dozen positional arguments through
+/// `run_incoming_call`/`run_outgoing_call` → `run_call` → `drive_call`.
+struct CallEnv<'a> {
+    cfg: &'a Config,
+    endpoints: &'a ServiceEndpoints,
+    resolution: Resolution,
+    media: &'a mut Option<RaylibMedia>,
+    cmd_rx: &'a mut mpsc::Receiver<DaemonCmd>,
+    status: &'a watch::Sender<EngineState>,
+}
+
 async fn run_call(
     signaling: &mut SignalingClient,
     turn: TurnServer,
     role: Role,
-    media: &mut Option<RaylibMedia>,
     shutdown_rx: watch::Receiver<bool>,
-    cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
     peer_id: i64,
     started_at: Instant,
-    video_width: u32,
-    video_height: u32,
+    env: &mut CallEnv<'_>,
 ) -> Result<()> {
-    let mut call = WebrtcCall::new(&turn, role, video_width, video_height)?;
+    let mut call = WebrtcCall::new(&turn, role, env.resolution)?;
 
     match role {
         Role::Caller => {
@@ -215,7 +215,8 @@ async fn run_call(
                 peer_id,
                 started_at,
             };
-            let Some(waited) = setup_step(wait_for_sdp(signaling), cmd_rx, &in_call).await else {
+            let Some(waited) = setup_step(wait_for_sdp(signaling), env.cmd_rx, &in_call).await
+            else {
                 info!("call abandoned while waiting for remote SDP offer");
                 return Ok(());
             };
@@ -241,33 +242,17 @@ async fn run_call(
         }
     }
 
-    drive_call(
-        signaling,
-        call,
-        role,
-        media,
-        shutdown_rx,
-        cmd_rx,
-        peer_id,
-        started_at,
-        video_width,
-        video_height,
-    )
-    .await
+    drive_call(signaling, call, role, shutdown_rx, peer_id, started_at, env).await
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn drive_call(
     signaling: &mut SignalingClient,
     mut call: WebrtcCall,
     role: Role,
-    media: &mut Option<RaylibMedia>,
     mut shutdown_rx: watch::Receiver<bool>,
-    cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
     peer_id: i64,
     started_at: Instant,
-    video_width: u32,
-    video_height: u32,
+    env: &mut CallEnv<'_>,
 ) -> Result<()> {
     let mut audio_tick = interval(Duration::from_millis(20));
     audio_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -312,7 +297,7 @@ async fn drive_call(
             }
 
             _ = audio_tick.tick() => {
-                let audio_frame = if let Some(media) = media.as_mut() {
+                let audio_frame = if let Some(media) = env.media.as_mut() {
                     media.next_audio_frame().unwrap_or_else(|err| {
                         debug!("raylib audio read failed, sending silence: {err:#}");
                         silence.clone()
@@ -338,20 +323,20 @@ async fn drive_call(
                 if !authenticated {
                     continue;
                 }
-                let result = if let Some(media) = media.as_mut() {
+                let result = if let Some(media) = env.media.as_mut() {
                     let frame_count = media.frame_count;
                     if frame_count % 150 == 0 {
                         debug!("capturing video frame {}", frame_count);
                     }
                     match media.next_video_frame() {
-                        Ok(frame) => send_i420_video_frame(&call.media.video_source, Some(&frame), video_width, video_height),
+                        Ok(frame) => send_i420_video_frame(&call.media.video_source, Some(&frame), env.resolution),
                         Err(err) => {
                             debug!("raylib video frame failed, sending black: {err:#}");
-                            send_i420_video_frame(&call.media.video_source, None, video_width, video_height)
+                            send_i420_video_frame(&call.media.video_source, None, env.resolution)
                         }
                     }
                 } else {
-                    send_i420_video_frame(&call.media.video_source, None, video_width, video_height)
+                    send_i420_video_frame(&call.media.video_source, None, env.resolution)
                 };
                 if let Err(err) = result {
                     debug!("video frame failed: {err:#}");
@@ -383,7 +368,7 @@ async fn drive_call(
                     .reset(tokio::time::Instant::now() + Duration::from_secs(60 * 60 * 24 * 365));
             }
 
-            cmd = cmd_rx.recv() => {
+            cmd = env.cmd_rx.recv() => {
                 if handle_call_cmd(cmd, peer_id, started_at) {
                     break;
                 }
@@ -459,9 +444,8 @@ fn tunnel_stats_json() -> Value {
     let Some(state) = tunnel_state() else {
         return json!(null);
     };
-    let (local_w, local_h) = unpack_resolution(state.encoder_resolution.load(Ordering::Relaxed));
-    let (remote_w, remote_h) =
-        unpack_resolution(state.remote_vp9_resolution.load(Ordering::Relaxed));
+    let local = Resolution::unpack(state.encoder_resolution.load(Ordering::Relaxed));
+    let remote = Resolution::unpack(state.remote_vp9_resolution.load(Ordering::Relaxed));
     let queue_depth = OUTBOUND_QUEUE_MAX_PACKETS - state.outbound_semaphore.available_permits();
 
     let packets_per_frame = {
@@ -504,8 +488,8 @@ fn tunnel_stats_json() -> Value {
         "packets_reassembled": state.tunnel_packets_reassembled.load(Ordering::Relaxed),
         "fragments_dropped": state.tunnel_fragments_dropped.load(Ordering::Relaxed),
         "outbound_queue": queue_depth,
-        "local_resolution": format!("{local_w}x{local_h}"),
-        "remote_resolution": format!("{remote_w}x{remote_h}"),
+        "local_resolution": local.to_string(),
+        "remote_resolution": remote.to_string(),
         "utilization": utilization,
         "packets_per_frame": packets_per_frame,
     })
@@ -680,41 +664,71 @@ async fn idle_loop(
 
 // ── call runners ─────────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_arguments)]
+/// Runs an established call to completion and tears it down: publishes
+/// `InCall`, drives the call, then hangs up the signaling and stops the
+/// keepalive. Shared tail of both call runners — they differ only in the
+/// role-specific setup (and, for incoming, that the keepalive is spawned
+/// before signaling connects), so the keepalive is spawned by each and
+/// handed in here already running.
+async fn finish_call(
+    signaling: &mut SignalingClient,
+    turn: TurnServer,
+    role: Role,
+    peer_id: i64,
+    keepalive_stop_tx: watch::Sender<bool>,
+    keepalive: JoinHandle<()>,
+    env: &mut CallEnv<'_>,
+) {
+    let (hangup_tx, hangup_rx) = watch::channel(false);
+    let started_at = Instant::now();
+    env.status.send_replace(EngineState::InCall {
+        peer_id,
+        started_at,
+    });
+
+    let call_result = run_call(signaling, turn, role, hangup_rx, peer_id, started_at, env).await;
+
+    let _ = hangup_tx.send(true);
+    teardown_call(signaling, keepalive_stop_tx, keepalive).await;
+
+    match call_result {
+        Ok(()) => info!("call ended"),
+        Err(err) => warn!("call ended with error: {err:#}"),
+    }
+}
+
 async fn run_incoming_call(
     oneme: Arc<Mutex<SessionClient>>,
     incoming: IncomingCall,
-    endpoints: &ServiceEndpoints,
-    signaling_user_id: &str,
-    oneme_keepalive_secs: u64,
-    fingerprint: &FingerprintConfig,
-    media: &mut Option<RaylibMedia>,
-    cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
-    video_width: u32,
-    video_height: u32,
-    status: &watch::Sender<EngineState>,
+    env: &mut CallEnv<'_>,
 ) {
     info!("incoming call from peer {}", incoming.caller_id);
-    status.send_replace(EngineState::Answering {
+    env.status.send_replace(EngineState::Answering {
         peer_id: incoming.caller_id,
     });
     prepare_noise_for_call(NoiseRole::Responder);
 
     let turn = incoming.turn.clone();
 
+    // Spawned before the signaling connect (unlike the outgoing path): the
+    // calltaker's OneMe session must be kept alive while that connect runs.
     let (keepalive_stop_tx, keepalive_stop_rx) = watch::channel(false);
     let keepalive = tokio::spawn(call_keepalive_loop(
         Arc::clone(&oneme),
-        Duration::from_secs(oneme_keepalive_secs.max(1)),
+        Duration::from_secs(env.cfg.oneme_keepalive_secs.max(1)),
         keepalive_stop_rx,
     ));
 
-    let connect =
-        SignalingClient::from_incoming(&incoming, signaling_user_id, endpoints, fingerprint);
+    let connect = SignalingClient::from_incoming(
+        &incoming,
+        &env.cfg.signaling_user_id,
+        env.endpoints,
+        &env.cfg.auth.fingerprint,
+    );
     let answering = EngineState::Answering {
         peer_id: incoming.caller_id,
     };
-    let mut signaling = match setup_step(connect, cmd_rx, &answering).await {
+    let mut signaling = match setup_step(connect, env.cmd_rx, &answering).await {
         Some(Ok(s)) => s,
         Some(Err(err)) => {
             warn!("signaling connect: {err:#}");
@@ -728,55 +742,30 @@ async fn run_incoming_call(
         }
     };
 
-    let (hangup_tx, hangup_rx) = watch::channel(false);
-    let started_at = Instant::now();
-    status.send_replace(EngineState::InCall {
-        peer_id: incoming.caller_id,
-        started_at,
-    });
-
-    let call_result = run_call(
+    finish_call(
         &mut signaling,
         turn,
         Role::Calltaker,
-        media,
-        hangup_rx,
-        cmd_rx,
         incoming.caller_id,
-        started_at,
-        video_width,
-        video_height,
+        keepalive_stop_tx,
+        keepalive,
+        env,
     )
     .await;
-
-    let _ = hangup_tx.send(true);
-    teardown_call(&mut signaling, keepalive_stop_tx, keepalive).await;
-
-    match call_result {
-        Ok(()) => info!("call ended"),
-        Err(err) => warn!("call ended with error: {err:#}"),
-    }
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn run_outgoing_call(
     oneme: Arc<Mutex<SessionClient>>,
     peer_id: i64,
     call_resp: tokio::sync::oneshot::Sender<Result<Value>>,
-    cfg: &Config,
-    endpoints: &ServiceEndpoints,
-    media: &mut Option<RaylibMedia>,
-    cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
-    video_width: u32,
-    video_height: u32,
-    status: &watch::Sender<EngineState>,
+    env: &mut CallEnv<'_>,
 ) {
     info!("placing call to {peer_id}");
-    status.send_replace(EngineState::Dialing { peer_id });
+    env.status.send_replace(EngineState::Dialing { peer_id });
     prepare_noise_for_call(NoiseRole::Initiator);
     let dialing = EngineState::Dialing { peer_id };
     let start = async { oneme.lock().await.start_outgoing_call(peer_id).await };
-    let started = match setup_step(start, cmd_rx, &dialing).await {
+    let started = match setup_step(start, env.cmd_rx, &dialing).await {
         Some(Ok(s)) => s,
         Some(Err(err)) => {
             // Logged as well as returned: with auto_call nobody reads the
@@ -800,11 +789,11 @@ async fn run_outgoing_call(
     let connect = SignalingClient::from_outgoing(
         &started,
         &calltaker_id,
-        &cfg.signaling_user_id,
-        endpoints,
-        &cfg.auth.fingerprint,
+        &env.cfg.signaling_user_id,
+        env.endpoints,
+        &env.cfg.auth.fingerprint,
     );
-    let mut signaling = match setup_step(connect, cmd_rx, &dialing).await {
+    let mut signaling = match setup_step(connect, env.cmd_rx, &dialing).await {
         Some(Ok(s)) => s,
         Some(Err(err)) => {
             warn!("signaling connect: {err:#}");
@@ -816,41 +805,25 @@ async fn run_outgoing_call(
         }
     };
 
+    // Spawned only after signaling connects (unlike the incoming path): the
+    // caller just placed the call and reaches this point promptly.
     let (keepalive_stop_tx, keepalive_stop_rx) = watch::channel(false);
     let keepalive = tokio::spawn(call_keepalive_loop(
         Arc::clone(&oneme),
-        Duration::from_secs(cfg.oneme_keepalive_secs.max(1)),
+        Duration::from_secs(env.cfg.oneme_keepalive_secs.max(1)),
         keepalive_stop_rx,
     ));
 
-    let (hangup_tx, hangup_rx) = watch::channel(false);
-    let started_at = Instant::now();
-    status.send_replace(EngineState::InCall {
-        peer_id,
-        started_at,
-    });
-
-    let call_result = run_call(
+    finish_call(
         &mut signaling,
         turn,
         Role::Caller,
-        media,
-        hangup_rx,
-        cmd_rx,
         peer_id,
-        started_at,
-        video_width,
-        video_height,
+        keepalive_stop_tx,
+        keepalive,
+        env,
     )
     .await;
-
-    let _ = hangup_tx.send(true);
-    teardown_call(&mut signaling, keepalive_stop_tx, keepalive).await;
-
-    match call_result {
-        Ok(()) => info!("call ended"),
-        Err(err) => warn!("call ended with error: {err:#}"),
-    }
 }
 
 /// Runs one call-setup step (session request, signaling connect, waiting
@@ -1064,8 +1037,7 @@ pub async fn run_daemon(
     cfg: &Config,
     media: &mut Option<RaylibMedia>,
     cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
-    video_width: u32,
-    video_height: u32,
+    resolution: Resolution,
     auto_call: bool,
     status: &watch::Sender<EngineState>,
 ) -> Result<()> {
@@ -1115,35 +1087,26 @@ pub async fn run_daemon(
         };
         match outcome {
             IdleOutcome::Incoming { call } => {
-                run_incoming_call(
-                    Arc::clone(&oneme),
-                    call,
-                    &endpoints,
-                    &cfg.signaling_user_id,
-                    cfg.oneme_keepalive_secs,
-                    &cfg.auth.fingerprint,
+                let mut env = CallEnv {
+                    cfg,
+                    endpoints: &endpoints,
+                    resolution,
                     media,
                     cmd_rx,
-                    video_width,
-                    video_height,
                     status,
-                )
-                .await;
+                };
+                run_incoming_call(Arc::clone(&oneme), call, &mut env).await;
             }
             IdleOutcome::OutgoingRequested { peer_id, resp } => {
-                run_outgoing_call(
-                    Arc::clone(&oneme),
-                    peer_id,
-                    resp,
+                let mut env = CallEnv {
                     cfg,
-                    &endpoints,
+                    endpoints: &endpoints,
+                    resolution,
                     media,
                     cmd_rx,
-                    video_width,
-                    video_height,
                     status,
-                )
-                .await;
+                };
+                run_outgoing_call(Arc::clone(&oneme), peer_id, resp, &mut env).await;
             }
             IdleOutcome::Shutdown => return Ok(()),
             IdleOutcome::SessionError => {

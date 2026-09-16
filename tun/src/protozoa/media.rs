@@ -16,6 +16,7 @@ use webrtc_sys::video_frame_buffer::ffi::{
 use webrtc_sys::video_track::ffi::{FrameMetadata, VideoTrackSource};
 
 use super::raylib::{Canvas, Color};
+use super::resolution::Resolution;
 use super::tunnel::tunnel_state;
 
 pub const AUDIO_SAMPLE_RATE: u32 = 48_000;
@@ -23,6 +24,8 @@ pub const AUDIO_CHANNELS: u32 = 1;
 pub const AUDIO_FRAME_SAMPLES: usize = 960;
 pub const VIDEO_WIDTH: u32 = 640;
 pub const VIDEO_HEIGHT: u32 = 360;
+/// Fallback resolution used when no per-call resolution is known yet.
+pub const DEFAULT_RESOLUTION: Resolution = Resolution::new(VIDEO_WIDTH as u16, VIDEO_HEIGHT as u16);
 pub const VIDEO_FPS: u64 = 30;
 
 /// Exponential rate (1/s) for inter-fragment silence duration; mean silence = 1/rate seconds.
@@ -385,7 +388,7 @@ pub struct RaylibMedia {
 }
 
 impl RaylibMedia {
-    pub fn spawn(path: &str, width: u32, height: u32) -> Result<Self> {
+    pub fn spawn(path: &str, resolution: Resolution) -> Result<Self> {
         if !path.ends_with(".opus") {
             bail!("only .opus files are supported");
         }
@@ -393,8 +396,8 @@ impl RaylibMedia {
             opus: OpusMedia::spawn(path)?,
             smoothed_rms: 0.0,
             frame_count: 0,
-            width,
-            height,
+            width: resolution.w32(),
+            height: resolution.h32(),
         })
     }
 
@@ -557,9 +560,9 @@ fn rgba_to_i420(rgba: &[Color], i420: &mut [u8], width: usize, height: usize) {
 pub fn send_i420_video_frame(
     source: &SharedPtr<VideoTrackSource>,
     data: Option<&[u8]>,
-    width: u32,
-    height: u32,
+    resolution: Resolution,
 ) -> Result<()> {
+    let (width, height) = (resolution.w32(), resolution.h32());
     let mut buffer = new_i420_buffer(
         width as i32,
         height as i32,

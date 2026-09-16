@@ -358,6 +358,36 @@ fn build_wt_client_config(tc: QuicTransportConfig, skip_tls_verify: bool) -> Cli
 
 // ── Public client ────────────────────────────────────────────────────────────
 
+/// Reads the next non-empty text frame from `wire` — honoring buffered
+/// `pending` messages first — and parses it as JSON. Shared by the pre-call
+/// handshake ([`RawSignalingClient`]) and the in-call loop
+/// ([`SignalingClient`]); the latter layers `handle_post_receive` on top of
+/// the returned value.
+async fn recv_parse_json(wire: &mut SignalingWire, pending: &mut VecDeque<Value>) -> Result<Value> {
+    if let Some(value) = pending.pop_front() {
+        return Ok(value);
+    }
+    loop {
+        let text = wire
+            .recv_text()
+            .await?
+            .ok_or_else(|| anyhow!("signaling connection closed"))?;
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        log_signaling_ws("rx", trimmed);
+        return serde_json::from_str(trimmed).with_context(|| {
+            let (short, len) = trimmed.unicode_truncate(200);
+            format!(
+                "parse signaling message: {}{}",
+                short,
+                if len < trimmed.len() { "..." } else { "" }
+            )
+        });
+    }
+}
+
 pub struct SignalingClient {
     wire: SignalingWire,
     participant_id: i64,
@@ -585,33 +615,9 @@ impl SignalingClient {
     }
 
     async fn receive_json_value(&mut self) -> Result<Value> {
-        if let Some(value) = self.pending_messages.pop_front() {
-            self.handle_post_receive(&value).await?;
-            return Ok(value);
-        }
-
-        loop {
-            let text = self
-                .wire
-                .recv_text()
-                .await?
-                .ok_or_else(|| anyhow!("signaling connection closed"))?;
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            log_signaling_ws("rx", trimmed);
-            let value: Value = serde_json::from_str(trimmed).with_context(|| {
-                let (short, len) = trimmed.unicode_truncate(200);
-                format!(
-                    "parse signaling message: {}{}",
-                    short,
-                    if len < trimmed.len() { "..." } else { "" }
-                )
-            })?;
-            self.handle_post_receive(&value).await?;
-            return Ok(value);
-        }
+        let value = recv_parse_json(&mut self.wire, &mut self.pending_messages).await?;
+        self.handle_post_receive(&value).await?;
+        Ok(value)
     }
 
     fn next_sequence(&mut self) -> i32 {
@@ -734,30 +740,7 @@ struct RawSignalingClient {
 
 impl RawSignalingClient {
     async fn receive_json_value(&mut self) -> Result<Value> {
-        if let Some(value) = self.pending_messages.pop_front() {
-            return Ok(value);
-        }
-
-        loop {
-            let text = self
-                .wire
-                .recv_text()
-                .await?
-                .ok_or_else(|| anyhow!("signaling connection closed"))?;
-            let trimmed = text.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            log_signaling_ws("rx", trimmed);
-            return serde_json::from_str(trimmed).with_context(|| {
-                let (short, len) = trimmed.unicode_truncate(200);
-                format!(
-                    "parse signaling json: {}{}",
-                    short,
-                    if len < trimmed.len() { "..." } else { "" }
-                )
-            });
-        }
+        recv_parse_json(&mut self.wire, &mut self.pending_messages).await
     }
 
     async fn receive_connection_notification(&mut self) -> Result<ConnectionNotification> {

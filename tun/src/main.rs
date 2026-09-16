@@ -55,17 +55,12 @@ async fn main() -> Result<()> {
         .layer(tun_rs::Layer::L3)
         .build_async()
         .context("create TUN device")?;
-    let (video_width, video_height) = engine::video_resolution(&cfg)?;
+    let resolution = engine::video_resolution(&cfg)?;
 
     let log_prefix = cfg.auth.debug.log_prefix.as_deref().unwrap_or(tun_name);
-    let _tun_bridge = anazoa_tun::protozoa::tunnel::start_tun_bridge(
-        tun,
-        log_dir,
-        log_prefix,
-        video_width,
-        video_height,
-    )
-    .await?;
+    let _tun_bridge =
+        anazoa_tun::protozoa::tunnel::start_tun_bridge(tun, log_dir, log_prefix, resolution)
+            .await?;
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel(8);
 
@@ -84,7 +79,7 @@ async fn main() -> Result<()> {
     let mut media = cfg
         .media
         .as_deref()
-        .map(|p| RaylibMedia::spawn(p, video_width, video_height))
+        .map(|p| RaylibMedia::spawn(p, resolution))
         .transpose()?;
 
     if let Some(listener) = jsonrpc_listener {
@@ -101,16 +96,7 @@ async fn main() -> Result<()> {
     // The CLI answers status over the JSON-RPC socket via cmd_rx; nothing
     // here reads the watch-based snapshot, so its receiver is just dropped.
     let (status_tx, _status_rx) = tokio::sync::watch::channel(engine::EngineState::Connecting);
-    engine::run_daemon(
-        &cfg,
-        &mut media,
-        &mut cmd_rx,
-        video_width,
-        video_height,
-        false,
-        &status_tx,
-    )
-    .await?;
+    engine::run_daemon(&cfg, &mut media, &mut cmd_rx, resolution, false, &status_tx).await?;
 
     anazoa_tun::protozoa::tunnel::finalize_webm();
     Ok(())
