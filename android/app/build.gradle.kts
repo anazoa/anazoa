@@ -15,8 +15,8 @@ android {
         // (used in AnazoaVpnService) needs 24.
         minSdk = 24
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.3.0"
+        versionCode = 2
+        versionName = "0.3.1"
 
         // libanazoa_tun.so under src/main/jniLibs/arm64-v8a is the only
         // artifact we currently build (aarch64-linux-android); restrict
