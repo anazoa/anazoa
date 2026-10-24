@@ -232,6 +232,7 @@ async fn run_call(
             let answer = create_answer(&call.pc).await.context("create SDP answer")?;
             let local_sdp = answer.stringify();
             log_sdp_negotiation("local answer", &local_sdp);
+            ensure_tunnel_codec(&local_sdp, "local answer")?;
             set_local_description(&call.pc, answer)
                 .await
                 .context("set local answer")?;
@@ -1208,6 +1209,7 @@ async fn handle_remote_signal(call: &mut WebrtcCall, data: Value, role: Role) ->
         set_remote_sdp(&call.pc, ty, body).await?;
         attach_existing_remote_tracks(call);
         if role == Role::Caller && matches!(ty, SdpType::Answer) {
+            ensure_tunnel_codec(body, "remote answer")?;
             log_local_senders(call, "after remote answer");
             info!("remote answer applied");
         }
@@ -1239,6 +1241,41 @@ async fn handle_remote_signal(call: &mut WebrtcCall, data: Value, role: Role) ->
     }
 
     Ok(())
+}
+
+/// The tunnel rides on the VP9 encode/reference hooks, so a call whose
+/// *negotiated* video section lacks VP9 can never carry data — it connects and
+/// then dies with an unrelated-looking Noise handshake timeout. `prefer_codec`
+/// only guards against the local libwebrtc missing VP9; this guards against the
+/// peer never offering/answering it. Checked on the answer, which both sides
+/// agree on.
+fn ensure_tunnel_codec(sdp: &str, label: &str) -> Result<()> {
+    if sdp_video_has_codec(sdp, "VP9") {
+        return Ok(());
+    }
+    bail!("{label} negotiated no VP9 video codec; tunnel cannot carry this call");
+}
+
+/// Whether the SDP's video m-section advertises an `a=rtpmap` for `codec`.
+fn sdp_video_has_codec(sdp: &str, codec: &str) -> bool {
+    let mut in_video = false;
+    for line in sdp.lines() {
+        if let Some(rest) = line.strip_prefix("m=") {
+            in_video = rest.starts_with("video");
+            continue;
+        }
+        if in_video
+            && let Some(rtpmap) = line.strip_prefix("a=rtpmap:")
+            && let Some((_, encoding)) = rtpmap.split_once(' ')
+            && encoding
+                .split('/')
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case(codec))
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn log_sdp_negotiation(label: &str, sdp: &str) {
@@ -1314,4 +1351,45 @@ fn parse_noise_key(b64: &str) -> Result<[u8; 32]> {
     bytes
         .try_into()
         .map_err(|v: Vec<u8>| anyhow!("noise key must decode to 32 bytes, got {}", v.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The video m-section from anazoa.log's negotiated answer: VP8/H264/AV1,
+    // no VP9 — the exact shape that must be rejected before the call proceeds.
+    const ANSWER_NO_VP9: &str = "v=0\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96 100 35\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtpmap:100 H264/90000\r\n\
+a=rtpmap:35 AV1/90000\r\n";
+
+    const ANSWER_WITH_VP9: &str = "v=0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 98 96\r\n\
+a=rtpmap:98 VP9/90000\r\n\
+a=rtpmap:96 VP8/90000\r\n";
+
+    #[test]
+    fn detects_vp9_only_in_video_section() {
+        assert!(sdp_video_has_codec(ANSWER_WITH_VP9, "VP9"));
+        assert!(!sdp_video_has_codec(ANSWER_NO_VP9, "VP9"));
+        // Case-insensitive, and VP8 present in both must not match VP9.
+        assert!(sdp_video_has_codec(ANSWER_WITH_VP9, "vp9"));
+    }
+
+    #[test]
+    fn audio_codec_does_not_count_as_video() {
+        // opus lives in the audio m-section; a VP9 lookup must stay scoped to video.
+        let sdp = "m=audio 9 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 VP9/90000\r\n";
+        assert!(!sdp_video_has_codec(sdp, "VP9"));
+    }
+
+    #[test]
+    fn ensure_tunnel_codec_rejects_vp9less_answer() {
+        assert!(ensure_tunnel_codec(ANSWER_NO_VP9, "local answer").is_err());
+        assert!(ensure_tunnel_codec(ANSWER_WITH_VP9, "remote answer").is_ok());
+    }
 }

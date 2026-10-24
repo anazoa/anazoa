@@ -300,8 +300,11 @@ pub fn prefer_codec(
                 .ends_with(&format!("/{wanted}"))
     });
     if selected.is_empty() {
-        warn!("codec {name} not found in libwebrtc capabilities");
-        return Ok(());
+        // The tunnel rides on these codecs' encode/reference hooks, so a build
+        // whose libwebrtc lacks the preferred codec can never carry a call.
+        // Fail loudly here rather than letting the call connect and then die
+        // later with an unrelated-looking Noise handshake timeout.
+        return Err(anyhow!("codec {name} not found in libwebrtc capabilities"));
     }
     selected.extend(rest);
     transceiver

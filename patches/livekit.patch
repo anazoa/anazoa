@@ -243,3 +243,29 @@ index 417c9b9f..a78bba6a 100755
  cp "$OUTPUT_DIR/args.gn" "$ARTIFACTS_DIR"
  
  cp "$OUTPUT_DIR/LICENSE.md" "$ARTIFACTS_DIR"
+diff --git a/webrtc-sys/libwebrtc/build_android.sh b/webrtc-sys/libwebrtc/build_android.sh
+index d8ef3131..e4b9c74d 100755
+--- a/webrtc-sys/libwebrtc/build_android.sh
++++ b/webrtc-sys/libwebrtc/build_android.sh
+@@ -80,6 +80,12 @@ git apply "$COMMAND_DIR/patches/external_audio_source.patch" -v --ignore-space-c
+ # livekit prefixed jni
+ git apply "$COMMAND_DIR/patches/jni_prefix.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+ 
++# anazoa tunnel hooks into the Opus and VP9 encode/decode paths (matches
++# build_linux.sh). Required for the tunnel to carry a call; VP9 hooks need
++# rtc_libvpx_build_vp9=true below.
++git apply "$COMMAND_DIR/patches/hooks-opus.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++git apply "$COMMAND_DIR/patches/hooks-vp9.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++
+ cd third_party/libyuv
+ git apply "$COMMAND_DIR/patches/disable_sme_for_libyuv.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+ 
+@@ -104,7 +110,7 @@ args="is_debug=$debug \
+   rtc_include_tests=false \
+   rtc_build_tools=false \
+   rtc_build_examples=false \
+-  rtc_libvpx_build_vp9=false \
++  rtc_libvpx_build_vp9=true \
+   is_component_build=false \
+   enable_stripping=true \
+   rtc_use_h264=false \
