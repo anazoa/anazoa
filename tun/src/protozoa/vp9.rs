@@ -2,7 +2,7 @@
 // Regenerate with: ./gen-ivf.sh > tun/src/protozoa/vp9.rs
 //
 // One minimal black VP9 keyframe per resolution in libwebrtc's VideoAdapter
-// down-step sequence from 1280x720.  Used by hook_before_vp9_reference_find
+// down-step sequence from 1280x720.  Used by hook_before_video_reference_find
 // to seed the decoder when the sender's encoder is at a given resolution.
 
 #![cfg_attr(rustfmt, rustfmt_skip)]

@@ -3,12 +3,19 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+val testApp = providers.gradleProperty("anazoaTestApp").orNull == "true"
+
 android {
     namespace = "org.anazoa.vpn"
     compileSdk = 34
 
     defaultConfig {
         applicationId = "org.anazoa.vpn"
+        if (testApp) {
+            applicationIdSuffix = ".test"
+            versionNameSuffix = "-test"
+            resValue("string", "app_name", "Anazoa test")
+        }
         // The Rust .so (livekit/webrtc-sys/libwebrtc/android-arm64-release,
         // and anazoa-tun's cdylib) was built with a floor of API 23, so 24
         // satisfies it; bumped from 23 because Service.STOP_FOREGROUND_REMOVE

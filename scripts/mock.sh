@@ -1,6 +1,8 @@
 #!/bin/sh
 set -eux
 
+extraargs=${@:-}
+
 export LK_CUSTOM_WEBRTC=$(pwd)/livekit/webrtc-sys/libwebrtc/linux-x64-release
 
 # export LK_DEBUG_WEBRTC=true
@@ -17,14 +19,14 @@ fi
 
 # cargo clean -p webrtc-sys --release
 cargo build --release
-sudo target/release/mock test --media test/sample.opus --keep-logs
+sudo target/release/mock test $extraargs --media test/sample.opus --keep-logs
 
 # Disconnects and reconnects the caller mid-test (via reconnect-host, see
 # mock/src/bin/reconnect_host.rs) and places a second call — reproduces
 # Android's nativeStart/nativeStop reuse of process-global statics
 # (TUNNEL_STATE, SHUTDOWN_TX, ...), which the plain run above never touches
 # since each peer there is a single-session, fresh process.
-sudo target/release/mock test --media test/sample.opus --keep-logs --reconnect
+sudo target/release/mock test $extraargs --media test/sample.opus --keep-logs --reconnect
 
 # The netem is applied to both veth interfaces symmetrically right after they
 # come up, before TURN and anazoa start — so packet loss hits everything:
@@ -37,4 +39,4 @@ sudo target/release/mock test --media test/sample.opus --keep-logs --reconnect
 #   mild, should adapt slowly:                 --netem "loss 1%"
 #   aggressive, should trigger rapid downscale: --netem "loss 5%"
 #   milder loss with RTT (affects GCC probing): --netem "loss 2% delay 30ms"
-sudo target/release/mock test --media test/sample.opus --keep-logs --netem "loss 5% delay 30ms"
+sudo target/release/mock test $extraargs --media test/sample.opus --keep-logs --netem "loss 5% delay 30ms"

@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use super::h264;
 use super::media::DEFAULT_RESOLUTION;
 use super::noise::{
     NOISE_MSG_SIZE, noise_enabled, noise_process_incoming, noise_reset_state, noise_try_inject,
@@ -160,17 +161,19 @@ pub struct TunnelState {
     /// Zero until the first speech frame is observed.
     pub remote_vad_last_speech_ms: AtomicU64,
     /// Sender's current encoder resolution, packed as `(w as u64) << 16 | h`.
-    /// Updated by `hook_after_vp9_encode` on every outbound keyframe.
+    /// Updated by `hook_after_video_encode` on every outbound keyframe.
     /// Read by `next_tunnel_frame` to embed resolution in tunnel frame headers.
     pub encoder_resolution: AtomicU64,
     /// Last sender resolution seen on inbound tunnel frames, packed as `(w as u64) << 16 | h`.
-    /// Updated by `hook_before_vp9_reference_find` when parsing inbound frames.
+    /// Updated by `hook_before_video_reference_find` when parsing inbound frames.
     /// Used to select the correct keyframe replacement for the decoder.
     pub remote_vp9_resolution: AtomicU64,
     /// Keyframe cache: one VP9 black keyframe per resolution.
     /// Pre-populated at startup with the 4 known VideoAdapter down-step resolutions.
     /// Updated on every outbound keyframe with the actual encoder output.
     pub vp9_keyframe_cache: Mutex<HashMap<Resolution, Vec<u8>>>,
+    /// Position in the receive-side H.264 replacement stream.
+    pub h264_replayer: Mutex<h264::H264Replayer>,
 
     /// Set to true once the Noise KK handshake completes successfully.
     /// Always true when Noise authentication is not configured.
@@ -229,6 +232,7 @@ impl TunnelState {
                     .map(|kf| (Resolution::new(kf.width, kf.height), kf.data.to_vec()))
                     .collect(),
             ),
+            h264_replayer: Mutex::new(h264::H264Replayer::new(resolution.width, resolution.height)),
         }
     }
 }
@@ -796,97 +800,124 @@ impl PartialPacket {
     }
 }
 
-pub type Vp9EncodeHook = unsafe extern "C" fn(*mut u8, usize, u32, bool) -> bool;
-pub type Vp9ReferenceHook = unsafe extern "C" fn(*mut u8, usize, u32, bool, *mut bool) -> usize;
+/// Codec identifiers shared with the patched C++ video hooks.
+pub const TUNNEL_CODEC_VP9: u32 = 0;
+pub const TUNNEL_CODEC_H264: u32 = 1;
+
+pub type VideoEncodeHook = unsafe extern "C" fn(*mut u8, usize, u32, bool, u32) -> bool;
+pub type VideoReferenceHook =
+    unsafe extern "C" fn(*mut u8, usize, usize, u32, bool, u32, *mut bool) -> usize;
 
 #[used]
-pub static KEEP_VP9_HOOKS: (Vp9EncodeHook, Vp9ReferenceHook) =
-    (hook_after_vp9_encode, hook_before_vp9_reference_find);
+pub static KEEP_VIDEO_HOOKS: (VideoEncodeHook, VideoReferenceHook) =
+    (hook_after_video_encode, hook_before_video_reference_find);
 
+/// Replaces an encoded frame's payload with tunnel data for its codec.
+///
 /// # Safety
 ///
-/// Called from patched libwebrtc VP9 encoder code. `payload` must point to a
-/// readable and writable buffer of exactly `len` bytes; the hook modifies it
-/// in place and always produces output of the same length.
+/// `payload` must point to `len` readable and writable bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hook_after_vp9_encode(
+pub unsafe extern "C" fn hook_after_video_encode(
     payload: *mut u8,
     len: usize,
     _rtp_timestamp: u32,
     is_key_frame: bool,
+    codec: u32,
 ) -> bool {
-    if payload.is_null() || len == 0 {
+    if payload.is_null() || len == 0 || !matches!(codec, TUNNEL_CODEC_VP9 | TUNNEL_CODEC_H264) {
         return false;
     }
+    let Some(state) = tunnel_state() else {
+        return false;
+    };
+    // SAFETY: The caller supplies a writable buffer of `len` bytes.
     let buf = unsafe { std::slice::from_raw_parts_mut(payload, len) };
+    state.hook_encode_calls.fetch_add(1, Ordering::Relaxed);
 
-    if let Some(state) = tunnel_state() {
-        state.hook_encode_calls.fetch_add(1, Ordering::Relaxed);
-
-        // Read the original frame before overwriting, for webm mux and keyframe cache.
-        let orig = buf.to_vec();
-        if let Ok(mut mux) = state.webm_mux.lock()
-            && let Some(ref mut webm) = *mux
+    // WebM logging currently supports VP9 video only.
+    if codec == TUNNEL_CODEC_VP9
+        && let Ok(mut mux) = state.webm_mux.lock()
+        && let Some(ref mut webm) = *mux
+    {
+        webm.write_video_frame(buf, is_key_frame);
+    }
+    let dims = if !is_key_frame {
+        None
+    } else if codec == TUNNEL_CODEC_H264 {
+        h264::access_unit_dimensions(buf).map(|(w, h)| Resolution::new(w, h))
+    } else {
+        vp9_keyframe_dimensions(buf)
+    };
+    if let Some(res) = dims {
+        let prev = Resolution::unpack(state.encoder_resolution.swap(res.pack(), Ordering::Relaxed));
+        if prev != res {
+            info!("encoder resolution changed: {res}");
+        }
+        if codec == TUNNEL_CODEC_VP9
+            && let Ok(mut cache) = state.vp9_keyframe_cache.lock()
         {
-            webm.write_video_frame(&orig, is_key_frame);
+            cache.insert(res, buf.to_vec());
         }
-        if is_key_frame && let Some(res) = vp9_keyframe_dimensions(&orig) {
-            let prev =
-                Resolution::unpack(state.encoder_resolution.swap(res.pack(), Ordering::Relaxed));
-            if prev != res {
-                info!("encoder resolution changed: {res}");
-            }
-            if let Ok(mut cache) = state.vp9_keyframe_cache.lock() {
-                cache.insert(res, orig);
-            }
-        }
+    }
 
+    let sender_res = Resolution::unpack(state.encoder_resolution.load(Ordering::Relaxed));
+    let is_data = if codec == TUNNEL_CODEC_H264 {
+        let capacity = h264::carrier_capacity(buf);
+        let frame = next_tunnel_frame(capacity, is_key_frame, sender_res).unwrap_or_default();
+        h264::pack_carrier(buf, &frame) > 0
+    } else {
         buf.fill(FRAME_KIND_PADDING);
-        let sender_res = Resolution::unpack(state.encoder_resolution.load(Ordering::Relaxed));
-        let is_data = if let Some(frame) = next_tunnel_frame(len, is_key_frame, sender_res)
+        if let Some(frame) = next_tunnel_frame(len, is_key_frame, sender_res)
             && frame.len() <= len
         {
             buf[..frame.len()].copy_from_slice(&frame);
-            state.tunnel_frames_sent.fetch_add(1, Ordering::Relaxed);
-            state
-                .tunnel_frame_bytes_sent
-                .fetch_add(len as u64, Ordering::Relaxed);
             true
         } else {
             false
-        };
-
-        let now_sec = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if let Ok(mut u) = state.utilization.try_lock() {
-            u.record(now_sec, is_data);
         }
+    };
+    if is_data {
+        state.tunnel_frames_sent.fetch_add(1, Ordering::Relaxed);
+        state
+            .tunnel_frame_bytes_sent
+            .fetch_add(len as u64, Ordering::Relaxed);
+    }
+    let now_sec = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if let Ok(mut u) = state.utilization.try_lock() {
+        u.record(now_sec, is_data);
     }
     true
 }
 
+/// Extracts tunnel data and supplies a valid replacement frame before reference finding.
+///
 /// # Safety
 ///
-/// Called from patched libwebrtc after VP9 RTP payloads are depacketized and
-/// decrypted, but before the VP9 reference finder sees the frame. `payload`
-/// must point to a readable and writable buffer of exactly `len` bytes; the
-/// hook overwrites it in place with a replacement frame and returns the new
-/// length. Returns 0 if no replacement was written. `output_is_key_frame`
-/// may be null.
+/// `payload` must hold `len` readable bytes in a writable buffer of `capacity`
+/// bytes. `output_is_key_frame` must be null or point to a writable bool.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn hook_before_vp9_reference_find(
+pub unsafe extern "C" fn hook_before_video_reference_find(
     payload: *mut u8,
     len: usize,
+    capacity: usize,
     _rtp_timestamp: u32,
     is_key_frame: bool,
+    codec: u32,
     output_is_key_frame: *mut bool,
 ) -> usize {
-    if !output_is_key_frame.is_null() {
-        unsafe {
-            *output_is_key_frame = is_key_frame;
+    let set_key = |value: bool| {
+        if !output_is_key_frame.is_null() {
+            // SAFETY: The caller supplies a null or writable output pointer.
+            unsafe { *output_is_key_frame = value };
         }
+    };
+    set_key(is_key_frame);
+    if len > capacity || !matches!(codec, TUNNEL_CODEC_VP9 | TUNNEL_CODEC_H264) {
+        return 0;
     }
     let Some(state) = tunnel_state() else {
         return 0;
@@ -895,6 +926,12 @@ pub unsafe extern "C" fn hook_before_vp9_reference_find(
 
     if payload.is_null() || len == 0 {
         return 0;
+    }
+
+    if codec == TUNNEL_CODEC_H264 {
+        return unsafe {
+            h264_reference_find(&state, payload, len, capacity, is_key_frame, set_key)
+        };
     }
 
     let mut carrier_is_key_frame = None;
@@ -946,11 +983,7 @@ pub unsafe extern "C" fn hook_before_vp9_reference_find(
         VP9_SHOW_EXISTING_FRAME_SLOT_0
     };
 
-    if !output_is_key_frame.is_null() {
-        unsafe {
-            *output_is_key_frame = replacement_is_key_frame;
-        }
-    }
+    set_key(replacement_is_key_frame);
 
     if replacement.is_empty() || replacement.len() > len {
         return 0;
@@ -964,8 +997,66 @@ pub unsafe extern "C" fn hook_before_vp9_reference_find(
     replacement.len()
 }
 
-pub fn keep_vp9_hooks_linked() {
-    let _ = &KEEP_VP9_HOOKS;
+/// H.264 branch of [`hook_before_video_reference_find`].
+///
+/// # Safety
+///
+/// `payload` must be valid for reads of `len` and writes of `capacity` bytes.
+unsafe fn h264_reference_find(
+    state: &TunnelState,
+    payload: *mut u8,
+    len: usize,
+    capacity: usize,
+    is_key_frame: bool,
+    set_key: impl Fn(bool),
+) -> usize {
+    let (tunnel_bytes, carrier_resolution) = {
+        let carrier = unsafe { std::slice::from_raw_parts(payload, len) };
+        (
+            h264::unpack_carrier(carrier),
+            h264::access_unit_dimensions(carrier),
+        )
+    };
+
+    let mut replayer = match state.h264_replayer.lock() {
+        Ok(r) => r,
+        Err(_) => return 0,
+    };
+
+    let mut carrier_is_key = None;
+    if let Some((kf, _resolution)) = handle_inbound_tunnel_frame(&tunnel_bytes) {
+        carrier_is_key = Some(kf);
+        state.tunnel_frames_received.fetch_add(1, Ordering::Relaxed);
+        state
+            .tunnel_frame_bytes_received
+            .fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    // Padding keyframes also carry SPS/PPS and update libwebrtc's encoded
+    // dimensions. Follow that same SPS immediately: waiting for a data-frame
+    // header can change replay size mid-GOP, which stops Android's decoder.
+    if let Some((width, height)) = carrier_resolution {
+        replayer.set_resolution(width, height);
+    }
+
+    let need_key = state.vp9_replacement_needs_keyframe.load(Ordering::Relaxed);
+    let (bitstream, replacement_is_key) =
+        replayer.next(carrier_is_key.unwrap_or(is_key_frame), need_key);
+    set_key(replacement_is_key);
+
+    if bitstream.is_empty() || bitstream.len() > capacity {
+        return 0;
+    }
+    let out = unsafe { std::slice::from_raw_parts_mut(payload, bitstream.len()) };
+    out.copy_from_slice(&bitstream);
+    state
+        .vp9_replacement_needs_keyframe
+        .store(false, Ordering::Relaxed);
+    bitstream.len()
+}
+
+pub fn keep_video_hooks_linked() {
+    let _ = &KEEP_VIDEO_HOOKS;
 }
 
 // ---------------------------------------------------------------------------
@@ -1175,6 +1266,35 @@ pub fn finalize_webm() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn h264_replay_follows_padding_keyframe_dimensions() {
+        let (inbound_tx, _inbound_rx) = mpsc::channel(8);
+        let state = TunnelState::new(inbound_tx, None, DEFAULT_RESOLUTION);
+        for (width, height) in [(320, 180), (480, 264), (640, 360), (960, 540), (1280, 720)] {
+            let stream = h264::static_stream(width, height);
+            let mut carrier = h264::keyframe_bitstream(stream);
+            assert_eq!(h264::pack_carrier(&mut carrier, &[]), 0);
+            let len = carrier.len();
+            carrier.resize(8192, 0);
+            // SAFETY: carrier owns the readable prefix and writable capacity.
+            let replay_len = unsafe {
+                h264_reference_find(
+                    &state,
+                    carrier.as_mut_ptr(),
+                    len,
+                    carrier.len(),
+                    true,
+                    |_| {},
+                )
+            };
+            assert!(replay_len > 0);
+            assert_eq!(
+                h264::access_unit_dimensions(&carrier[..replay_len]),
+                Some((width, height)),
+            );
+        }
+    }
 
     #[test]
     fn parses_whole_frame_with_padding() {

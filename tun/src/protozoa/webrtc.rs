@@ -176,6 +176,7 @@ pub struct WebrtcCall {
     pub events: mpsc::UnboundedReceiver<LocalEvent>,
     pub media: MediaHandles,
     pub local_ufrag: Option<String>,
+    pub video_codec: VideoCodec,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -184,11 +185,39 @@ pub enum Role {
     Calltaker,
 }
 
+/// Video codec selected for negotiation and tunnel framing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum VideoCodec {
+    #[default]
+    Vp9,
+    H264,
+}
+
+impl VideoCodec {
+    /// Returns the codec name used by RTP capabilities and SDP.
+    pub fn rtp_name(self) -> &'static str {
+        match self {
+            Self::Vp9 => "VP9",
+            Self::H264 => "H264",
+        }
+    }
+
+    /// Parses a configured video codec name.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "vp9" => Some(Self::Vp9),
+            "h264" | "h.264" | "avc" => Some(Self::H264),
+            _ => None,
+        }
+    }
+}
+
 impl WebrtcCall {
     pub fn new(
         turn: &TurnServer,
         role: Role,
         resolution: super::resolution::Resolution,
+        video_codec: VideoCodec,
     ) -> Result<Self> {
         let (tx, events) = mpsc::unbounded_channel();
         let factory = create_peer_connection_factory();
@@ -251,7 +280,7 @@ impl WebrtcCall {
             prefer_codec(
                 factory.rtp_sender_capabilities(MediaType::Video).codecs,
                 &video_transceiver,
-                "VP9",
+                video_codec.rtp_name(),
             )?;
         }
 
@@ -259,6 +288,7 @@ impl WebrtcCall {
             factory,
             pc,
             events,
+            video_codec,
             media: MediaHandles {
                 audio_source,
                 video_source,
@@ -306,7 +336,18 @@ pub fn prefer_codec(
         // later with an unrelated-looking Noise handshake timeout.
         return Err(anyhow!("codec {name} not found in libwebrtc capabilities"));
     }
-    selected.extend(rest);
+    // Video is a caller request, not a preference that the answerer can
+    // silently replace. Retain repair codecs, but exclude other video codecs.
+    if VideoCodec::parse(name).is_some() {
+        selected.extend(rest.into_iter().filter(|codec| {
+            matches!(
+                codec.name.to_ascii_lowercase().as_str(),
+                "rtx" | "red" | "ulpfec" | "flexfec-03"
+            )
+        }));
+    } else {
+        selected.extend(rest);
+    }
     transceiver
         .set_codec_preferences(selected)
         .map_err(|e| anyhow!("set {name} codec preferences: {e}"))
@@ -338,7 +379,7 @@ pub fn ensure_local_senders(call: &WebrtcCall, context: &str) -> Result<()> {
                         .rtp_sender_capabilities(MediaType::Video)
                         .codecs,
                     &transceiver,
-                    "VP9",
+                    call.video_codec.rtp_name(),
                 )?;
                 sender.set_track(video_to_media(call.media.video_track.clone()))
             }

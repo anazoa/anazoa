@@ -1,39 +1,72 @@
 diff --git a/video/rtp_video_stream_receiver2.cc b/video/rtp_video_stream_receiver2.cc
-index fc176dc..cf5eb22 100644
+index fc176dc..85f8b65 100644
 --- a/video/rtp_video_stream_receiver2.cc
 +++ b/video/rtp_video_stream_receiver2.cc
-@@ -91,6 +91,12 @@
+@@ -49,6 +49,8 @@
+ #include "call/rtp_packet_sink_interface.h"
+ #include "call/syncable.h"
+ #include "call/video_receive_stream.h"
++#include "common_video/h264/h264_common.h"
++#include "common_video/h264/sps_parser.h"
+ #include "logging/rtc_event_log/events/rtc_event_rtp_packet_incoming.h"
+ #include "media/base/media_constants.h"
+ #include "modules/include/module_common_types.h"
+@@ -91,6 +93,20 @@
  #include "system_wrappers/include/ntp_time.h"
  #include "video/buffered_frame_decryptor.h"
  
-+extern "C" size_t hook_before_vp9_reference_find(uint8_t* payload,
-+                                                 size_t len,
-+                                                 uint32_t rtp_timestamp,
-+                                                 bool is_key_frame,
-+                                                 bool* output_is_key_frame) __attribute__((weak));
++// `codec` argument values shared with the Rust tunnel hooks.
++enum : uint32_t { kTunnelCodecVp9 = 0, kTunnelCodecH264 = 1 };
++
++// `payload` holds `len` carrier bytes inside a buffer of `capacity` bytes; the
++// hook reads tunnel data from the first `len` bytes and writes the replacement
++// bitstream (up to `capacity`) back into `payload`, returning its length (or 0).
++extern "C" size_t hook_before_video_reference_find(uint8_t* payload,
++                                                   size_t len,
++                                                   size_t capacity,
++                                                   uint32_t rtp_timestamp,
++                                                   bool is_key_frame,
++                                                   uint32_t codec,
++                                                   bool* output_is_key_frame) __attribute__((weak));
 +
  namespace webrtc {
  
  namespace {
-@@ -101,6 +107,48 @@ constexpr int kPacketBufferMaxSize = 2048;
+@@ -101,6 +117,85 @@ constexpr int kPacketBufferMaxSize = 2048;
  
  constexpr int kMaxPacketAgeToNack = 450;
  
++// The H.264 replacement bitstream (SPS+PPS+IDR, or a P-slice) can be larger
++// than a tiny carrier delta frame, so give the hook room to grow the buffer.
++constexpr size_t kTunnelH264Headroom = 8192;
++
 +void RewriteTunnelCompleteFrame(EncodedFrame* frame) {
-+  if (frame == nullptr || hook_before_vp9_reference_find == nullptr) {
++  if (frame == nullptr || hook_before_video_reference_find == nullptr) {
 +    return;
 +  }
-+  const VideoCodecType codec_type = frame->CodecSpecific()->codecType;
-+  if (codec_type != kVideoCodecVP9 && codec_type != kVideoCodecGeneric) {
-+    return;
++  uint32_t hook_codec;
++  switch (frame->CodecSpecific()->codecType) {
++    case kVideoCodecVP9:
++    case kVideoCodecGeneric:
++      hook_codec = kTunnelCodecVp9;
++      break;
++    case kVideoCodecH264:
++      hook_codec = kTunnelCodecH264;
++      break;
++    default:
++      return;
 +  }
 +
 +  bool hook_is_key_frame =
 +      frame->FrameType() == VideoFrameType::kVideoFrameKey;
 +  std::vector<uint8_t> buf(frame->data(), frame->data() + frame->size());
-+  size_t new_size = hook_before_vp9_reference_find(
-+      buf.data(), buf.size(), frame->RtpTimestamp(),
-+      hook_is_key_frame, &hook_is_key_frame);
++  const size_t carrier_len = buf.size();
++  if (hook_codec == kTunnelCodecH264 && buf.size() < kTunnelH264Headroom) {
++    buf.resize(kTunnelH264Headroom, 0);  // zero tail carries no start codes
++  }
++  size_t new_size = hook_before_video_reference_find(
++      buf.data(), carrier_len, buf.size(), frame->RtpTimestamp(),
++      hook_is_key_frame, hook_codec, &hook_is_key_frame);
 +  if (new_size == 0 || new_size > buf.size()) {
 +    return;
 +  }
@@ -41,6 +74,27 @@ index fc176dc..cf5eb22 100644
 +  frame->SetEncodedData(EncodedImageBuffer::Create(buf.data(), buf.size()));
 +  frame->SetFrameType(hook_is_key_frame ? VideoFrameType::kVideoFrameKey
 +                                        : VideoFrameType::kVideoFrameDelta);
++  if (hook_codec == kTunnelCodecH264) {
++    // The replay stream can differ from the carrier, including its dimensions.
++    // Android configures MediaCodec from this metadata before decoding the SPS.
++    // Delta frames inherit the decoder's last size; only a replay SPS changes it.
++    frame->_encodedWidth = 0;
++    frame->_encodedHeight = 0;
++    for (const auto& nal : H264::FindNaluIndices(buf)) {
++      if (nal.payload_size <= H264::kNaluTypeSize ||
++          H264::ParseNaluType(buf[nal.payload_start_offset]) != H264::kSps) {
++        continue;
++      }
++      auto sps = SpsParser::ParseSps(std::span<const uint8_t>(buf).subspan(
++          nal.payload_start_offset + H264::kNaluTypeSize,
++          nal.payload_size - H264::kNaluTypeSize));
++      if (sps) {
++        frame->_encodedWidth = sps->width;
++        frame->_encodedHeight = sps->height;
++      }
++      break;
++    }
++  }
 +}
 +
 +class TunnelFrameCallback
@@ -64,7 +118,7 @@ index fc176dc..cf5eb22 100644
  int PacketBufferMaxSize(const FieldTrialsView& field_trials) {
    // The group here must be a positive power of 2, in which case that is used as
    // size. All other values shall result in the default value being used.
-@@ -322,7 +370,9 @@ RtpVideoStreamReceiver2::RtpVideoStreamReceiver2(
+@@ -322,7 +417,9 @@ RtpVideoStreamReceiver2::RtpVideoStreamReceiver2(
            config_.rtp.rtcp_xr.receiver_reference_time_report,
            config->rtp.remote_ssrc)),
        nack_periodic_processor_(nack_periodic_processor),
@@ -88,22 +142,26 @@ index 5e38a22..e9b9389 100644
    const KeyFrameReqMethod keyframe_request_method_;
  
 diff --git a/video/video_stream_encoder.cc b/video/video_stream_encoder.cc
-index b5f0c13..867fbe8 100644
+index b5f0c13..a3d3491 100644
 --- a/video/video_stream_encoder.cc
 +++ b/video/video_stream_encoder.cc
-@@ -96,6 +96,11 @@
+@@ -96,6 +96,15 @@
  #include "video/frame_dumping_encoder.h"
  #include "video/video_stream_encoder_observer.h"
  
-+extern "C" bool hook_after_vp9_encode(uint8_t* payload,
-+                                      size_t len,
-+                                      uint32_t rtp_timestamp,
-+                                      bool is_key_frame) __attribute__((weak));
++// `codec` argument values shared with the Rust tunnel hooks.
++enum : uint32_t { kTunnelCodecVp9 = 0, kTunnelCodecH264 = 1 };
++
++extern "C" bool hook_after_video_encode(uint8_t* payload,
++                                        size_t len,
++                                        uint32_t rtp_timestamp,
++                                        bool is_key_frame,
++                                        uint32_t codec) __attribute__((weak));
 +
  namespace webrtc {
  
  namespace {
-@@ -125,6 +130,73 @@ constexpr int kDefaultMinScreenSharebps = 1200000;
+@@ -125,6 +134,83 @@ constexpr int kDefaultMinScreenSharebps = 1200000;
  
  constexpr int kMaxFramesInPreparation = 10;
  
@@ -117,18 +175,28 @@ index b5f0c13..867fbe8 100644
 +    if (inner_ == nullptr) {
 +      return Result(Result::Error::ERROR_SEND_FAILED);
 +    }
-+    if (hook_after_vp9_encode == nullptr ||
-+        codec_specific_info == nullptr ||
-+        codec_specific_info->codecType != kVideoCodecVP9) {
++    uint32_t hook_codec;
++    if (hook_after_video_encode == nullptr || codec_specific_info == nullptr) {
 +      return inner_->OnEncodedImage(encoded_image, codec_specific_info);
++    }
++    switch (codec_specific_info->codecType) {
++      case kVideoCodecVP9:
++        hook_codec = kTunnelCodecVp9;
++        break;
++      case kVideoCodecH264:
++        hook_codec = kTunnelCodecH264;
++        break;
++      default:
++        return inner_->OnEncodedImage(encoded_image, codec_specific_info);
 +    }
 +
 +    const bool is_key_frame =
 +        encoded_image.FrameType() == VideoFrameType::kVideoFrameKey;
 +    std::vector<uint8_t> buf(encoded_image.data(),
 +                             encoded_image.data() + encoded_image.size());
-+    if (!hook_after_vp9_encode(buf.data(), buf.size(),
-+                               encoded_image.RtpTimestamp(), is_key_frame)) {
++    if (!hook_after_video_encode(buf.data(), buf.size(),
++                                 encoded_image.RtpTimestamp(), is_key_frame,
++                                 hook_codec)) {
 +      return inner_->OnEncodedImage(encoded_image, codec_specific_info);
 +    }
 +    EncodedImage image = encoded_image;
@@ -177,7 +245,7 @@ index b5f0c13..867fbe8 100644
  int GetNumSpatialLayers(const VideoCodec& codec) {
    if (codec.codecType == kVideoCodecVP9) {
      return codec.VP9().numberOfSpatialLayers;
-@@ -924,7 +996,13 @@ void VideoStreamEncoder::SetSink(EncoderSink* sink, bool rotation_applied) {
+@@ -924,7 +1010,13 @@ void VideoStreamEncoder::SetSink(EncoderSink* sink, bool rotation_applied) {
  
    encoder_queue_->PostTask([this, sink] {
      RTC_DCHECK_RUN_ON(encoder_queue_.get());

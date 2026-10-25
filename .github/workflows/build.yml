@@ -50,7 +50,7 @@ jobs:
 
             - name: Patch livekit/webrtc-sys
               run: |
-                  cp patches/hooks-opus.patch patches/hooks-vp9.patch livekit/webrtc-sys/libwebrtc/patches/
+                  cp patches/hooks-audio.patch patches/hooks-video.patch livekit/webrtc-sys/libwebrtc/patches/
                   git -C livekit apply ../patches/livekit.patch
 
             - name: Free disk space
@@ -205,7 +205,7 @@ jobs:
 
             - name: Patch livekit/webrtc-sys
               run: |
-                  cp patches/hooks-opus.patch patches/hooks-vp9.patch livekit/webrtc-sys/libwebrtc/patches/
+                  cp patches/hooks-audio.patch patches/hooks-video.patch livekit/webrtc-sys/libwebrtc/patches/
                   git -C livekit apply ../patches/livekit.patch
 
             - name: Free disk space

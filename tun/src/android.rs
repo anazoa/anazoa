@@ -36,7 +36,7 @@ use tracing::warn;
 use crate::daemon::DaemonCmd;
 use crate::engine;
 use crate::host::TunnelSession;
-use crate::protozoa::tunnel::{keep_opus_hooks_linked, keep_vp9_hooks_linked};
+use crate::protozoa::tunnel::{keep_opus_hooks_linked, keep_video_hooks_linked};
 
 static RUNNING: OnceLock<Mutex<Option<TunnelSession>>> = OnceLock::new();
 
@@ -153,7 +153,7 @@ fn start(
     // config edits between them must take effect.
     anazoa_config::init_logging(&cfg.auth.debug.level);
     anazoa_auth::signaling::set_log_signaling_ws(cfg.auth.debug.log_signaling_ws);
-    keep_vp9_hooks_linked();
+    keep_video_hooks_linked();
     keep_opus_hooks_linked();
     engine::init_noise_from_config(&cfg)?;
 

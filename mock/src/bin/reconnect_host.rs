@@ -21,7 +21,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 use anazoa_tun::engine;
 use anazoa_tun::host::TunnelSession;
-use anazoa_tun::protozoa::tunnel::{keep_opus_hooks_linked, keep_vp9_hooks_linked};
+use anazoa_tun::protozoa::tunnel::{keep_opus_hooks_linked, keep_video_hooks_linked};
 
 fn usage() -> ! {
     eprintln!("usage: reconnect-host -c config.toml [--cycles N]");
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
     if cfg.auth.debug.log_signaling_ws {
         anazoa_auth::signaling::set_log_signaling_ws(true);
     }
-    keep_vp9_hooks_linked();
+    keep_video_hooks_linked();
     keep_opus_hooks_linked();
     engine::init_noise_from_config(&cfg)?;
 

@@ -33,9 +33,9 @@ use crate::protozoa::tunnel::{
 };
 use crate::protozoa::vp9::VP9_BLACK_KEYFRAMES;
 use crate::protozoa::webrtc::{
-    LocalEvent, Role, WebrtcCall, add_ice_candidate, attach_existing_remote_tracks, create_answer,
-    create_offer, ensure_local_senders, ice_state_name, log_local_senders, pc_state_name,
-    set_local_description, set_remote_sdp,
+    LocalEvent, Role, VideoCodec, WebrtcCall, add_ice_candidate, attach_existing_remote_tracks,
+    create_answer, create_offer, ensure_local_senders, ice_state_name, log_local_senders,
+    pc_state_name, set_local_description, set_remote_sdp,
 };
 use crate::{Config, call_keepalive_loop, shutdown_requested, shutdown_signal, trigger_shutdown};
 use webrtc_sys::jsep::ffi::SdpType;
@@ -175,6 +175,7 @@ struct CallEnv<'a> {
     cfg: &'a Config,
     endpoints: &'a ServiceEndpoints,
     resolution: Resolution,
+    video_codec: VideoCodec,
     media: &'a mut Option<RaylibMedia>,
     cmd_rx: &'a mut mpsc::Receiver<DaemonCmd>,
     status: &'a watch::Sender<EngineState>,
@@ -189,7 +190,7 @@ async fn run_call(
     started_at: Instant,
     env: &mut CallEnv<'_>,
 ) -> Result<()> {
-    let mut call = WebrtcCall::new(&turn, role, env.resolution)?;
+    let mut call = WebrtcCall::new(&turn, role, env.resolution, env.video_codec)?;
 
     match role {
         Role::Caller => {
@@ -222,6 +223,10 @@ async fn run_call(
             };
             let (sdp, early_signals) = waited?;
             log_sdp_negotiation("remote offer", &sdp);
+            call.video_codec = sdp_preferred_tunnel_codec(&sdp).ok_or_else(|| {
+                anyhow!("remote offer contains no supported VP9 or H264 video codec")
+            })?;
+            info!("incoming video codec: {}", call.video_codec.rtp_name());
             set_remote_sdp(&call.pc, SdpType::Offer, &sdp).await?;
             // Replay any signals (typically trickle ICE candidates) that arrived
             // before the offer, now that the remote description exists.
@@ -232,7 +237,7 @@ async fn run_call(
             let answer = create_answer(&call.pc).await.context("create SDP answer")?;
             let local_sdp = answer.stringify();
             log_sdp_negotiation("local answer", &local_sdp);
-            ensure_tunnel_codec(&local_sdp, "local answer")?;
+            ensure_tunnel_codec(&local_sdp, "local answer", call.video_codec)?;
             set_local_description(&call.pc, answer)
                 .await
                 .context("set local answer")?;
@@ -1043,6 +1048,13 @@ pub async fn run_daemon(
     status: &watch::Sender<EngineState>,
 ) -> Result<()> {
     let endpoints = cfg.auth.endpoints.clone();
+    let video_codec = VideoCodec::parse(&cfg.media_video_codec).ok_or_else(|| {
+        anyhow!(
+            "invalid media-video-codec {:?}: must be vp9 or h264",
+            cfg.media_video_codec
+        )
+    })?;
+    info!("outgoing video codec: {}", video_codec.rtp_name());
 
     // Establish the OneMe session once and keep it alive across calls,
     // matching Android behavior (single WebSocket for the full app session).
@@ -1092,6 +1104,7 @@ pub async fn run_daemon(
                     cfg,
                     endpoints: &endpoints,
                     resolution,
+                    video_codec,
                     media,
                     cmd_rx,
                     status,
@@ -1103,6 +1116,7 @@ pub async fn run_daemon(
                     cfg,
                     endpoints: &endpoints,
                     resolution,
+                    video_codec,
                     media,
                     cmd_rx,
                     status,
@@ -1209,7 +1223,7 @@ async fn handle_remote_signal(call: &mut WebrtcCall, data: Value, role: Role) ->
         set_remote_sdp(&call.pc, ty, body).await?;
         attach_existing_remote_tracks(call);
         if role == Role::Caller && matches!(ty, SdpType::Answer) {
-            ensure_tunnel_codec(body, "remote answer")?;
+            ensure_tunnel_codec(body, "remote answer", call.video_codec)?;
             log_local_senders(call, "after remote answer");
             info!("remote answer applied");
         }
@@ -1243,17 +1257,46 @@ async fn handle_remote_signal(call: &mut WebrtcCall, data: Value, role: Role) ->
     Ok(())
 }
 
-/// The tunnel rides on the VP9 encode/reference hooks, so a call whose
-/// *negotiated* video section lacks VP9 can never carry data — it connects and
-/// then dies with an unrelated-looking Noise handshake timeout. `prefer_codec`
-/// only guards against the local libwebrtc missing VP9; this guards against the
-/// peer never offering/answering it. Checked on the answer, which both sides
-/// agree on.
-fn ensure_tunnel_codec(sdp: &str, label: &str) -> Result<()> {
-    if sdp_video_has_codec(sdp, "VP9") {
+/// Selects the caller's first supported codec in an active video m-section.
+fn sdp_preferred_tunnel_codec(sdp: &str) -> Option<VideoCodec> {
+    for section in sdp.split("\nm=") {
+        let section = section.strip_prefix("m=").unwrap_or(section);
+        let mut lines = section.lines();
+        let mut media = lines.next()?.split_whitespace();
+        if media.next() != Some("video") {
+            continue;
+        }
+        let port = media.next()?;
+        if port.split('/').next() == Some("0") {
+            continue;
+        }
+        media.next()?; // transport protocol
+        for payload in media {
+            for line in lines.clone() {
+                let Some(mapping) = line.strip_prefix("a=rtpmap:") else {
+                    continue;
+                };
+                let mut fields = mapping.split_whitespace();
+                if fields.next() == Some(payload)
+                    && let Some(codec) = fields
+                        .next()
+                        .and_then(|encoding| VideoCodec::parse(encoding.split('/').next()?))
+                {
+                    return Some(codec);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Rejects answers that omit the codec requested for this call.
+fn ensure_tunnel_codec(sdp: &str, label: &str, codec: VideoCodec) -> Result<()> {
+    let codec = codec.rtp_name();
+    if sdp_video_has_codec(sdp, codec) {
         return Ok(());
     }
-    bail!("{label} negotiated no VP9 video codec; tunnel cannot carry this call");
+    bail!("{label} negotiated no {codec} video codec; tunnel cannot carry this call");
 }
 
 /// Whether the SDP's video m-section advertises an `a=rtpmap` for `codec`.
@@ -1389,7 +1432,45 @@ a=rtpmap:96 VP8/90000\r\n";
 
     #[test]
     fn ensure_tunnel_codec_rejects_vp9less_answer() {
-        assert!(ensure_tunnel_codec(ANSWER_NO_VP9, "local answer").is_err());
-        assert!(ensure_tunnel_codec(ANSWER_WITH_VP9, "remote answer").is_ok());
+        assert!(ensure_tunnel_codec(ANSWER_NO_VP9, "local answer", VideoCodec::Vp9).is_err());
+        assert!(ensure_tunnel_codec(ANSWER_WITH_VP9, "remote answer", VideoCodec::Vp9).is_ok());
+    }
+
+    #[test]
+    fn ensure_tunnel_codec_checks_selected_codec() {
+        assert!(ensure_tunnel_codec(ANSWER_NO_VP9, "local answer", VideoCodec::H264).is_ok());
+        assert!(ensure_tunnel_codec(ANSWER_WITH_VP9, "remote answer", VideoCodec::H264).is_err());
+    }
+
+    #[test]
+    fn incoming_codec_comes_from_the_offer() {
+        assert_eq!(
+            sdp_preferred_tunnel_codec(ANSWER_WITH_VP9),
+            Some(VideoCodec::Vp9)
+        );
+        assert_eq!(
+            sdp_preferred_tunnel_codec(ANSWER_NO_VP9),
+            Some(VideoCodec::H264)
+        );
+    }
+
+    #[test]
+    fn incoming_codec_follows_payload_order_not_rtpmap_order() {
+        let offer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 100 98\r\n\
+a=rtpmap:98 VP9/90000\r\na=rtpmap:100 H264/90000\r\n";
+        assert_eq!(sdp_preferred_tunnel_codec(offer), Some(VideoCodec::H264));
+        assert_eq!(
+            sdp_preferred_tunnel_codec(&offer.replace("100 98", "98 100")),
+            Some(VideoCodec::Vp9)
+        );
+    }
+
+    #[test]
+    fn incoming_codec_ignores_audio_rejected_video_and_unoffered_payloads() {
+        let offer = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 100\r\n\
+a=rtpmap:100 H264/90000\r\nm=video 0 UDP/TLS/RTP/SAVPF 100\r\n\
+a=rtpmap:100 H264/90000\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+a=rtpmap:96 VP8/90000\r\na=rtpmap:98 VP9/90000\r\n";
+        assert_eq!(sdp_preferred_tunnel_codec(offer), None);
     }
 }

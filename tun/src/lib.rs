@@ -30,6 +30,10 @@ pub struct Config {
     pub media: Option<String>,
     #[serde(rename = "media-video-resolution")]
     pub media_video_resolution: String,
+    /// Codec requested for outgoing calls: `vp9` (default) or `h264`.
+    /// Incoming calls select either codec from the caller's offer.
+    #[serde(rename = "media-video-codec", default = "default_video_codec")]
+    pub media_video_codec: String,
     #[serde(rename = "ctl-socket", default = "default_socket_path")]
     pub ctl_socket: String,
     #[serde(rename = "tun-name")]
@@ -57,6 +61,10 @@ fn default_oneme_keepalive_secs() -> u64 {
 
 fn default_socket_path() -> String {
     "/run/anazoa.sock".to_string()
+}
+
+fn default_video_codec() -> String {
+    "vp9".to_string()
 }
 
 pub async fn wait_or_shutdown(duration: Duration) -> bool {

@@ -6,6 +6,7 @@ set -eu
 #   scripts/build-android.sh              # rebuild Rust .so + APK
 #   scripts/build-android.sh --skip-rust  # only rebuild the APK (Kotlin/res changed, Rust didn't)
 #   scripts/build-android.sh --release    # signed release APK (see android/README.md)
+#   scripts/build-android.sh --test-app   # install alongside the normal app
 #
 # Used both for local dev and by .github/workflows/build.yml's `android` job
 # — CI sets ANDROID_NDK_HOME/ANDROID_SDK_ROOT itself (from nttld/setup-ndk
@@ -17,12 +18,14 @@ ANDROID_DIR="$REPO_ROOT/android"
 
 skip_rust=0
 build_type=debug
+test_app=0
 for arg in "$@"; do
     case "$arg" in
         --skip-rust) skip_rust=1 ;;
         --release) build_type=release ;;
+        --test-app) test_app=1 ;;
         *)
-            echo "Usage: $0 [--skip-rust] [--release]" >&2
+            echo "Usage: $0 [--skip-rust] [--release] [--test-app]" >&2
             exit 1
             ;;
     esac
@@ -90,6 +93,10 @@ if [ "$build_type" = release ]; then
 else
     gradle_task=:app:assembleDebug
 fi
-(cd "$ANDROID_DIR" && ./gradlew "$gradle_task" --no-daemon --quiet)
+if [ "$test_app" = 1 ]; then
+    (cd "$ANDROID_DIR" && ./gradlew "$gradle_task" -PanazoaTestApp=true --no-daemon --quiet)
+else
+    (cd "$ANDROID_DIR" && ./gradlew "$gradle_task" --no-daemon --quiet)
+fi
 
 echo "APK: $ANDROID_DIR/app/build/outputs/apk/$build_type/app-$build_type.apk"

@@ -212,8 +212,8 @@ index 417c9b9f..a78bba6a 100755
  git apply "$COMMAND_DIR/patches/external_audio_source.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
  git apply "$COMMAND_DIR/patches/fix_pipewire_utils_compile.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
  
-+git apply "$COMMAND_DIR/patches/hooks-opus.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
-+git apply "$COMMAND_DIR/patches/hooks-vp9.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++git apply "$COMMAND_DIR/patches/hooks-audio.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++git apply "$COMMAND_DIR/patches/hooks-video.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 +
  # Disable CREL (compact relocations). Chromium's build enables experimental
  # CREL via -Wa,--crel which causes segfaults on aarch64-linux (and is known
@@ -251,11 +251,11 @@ index d8ef3131..e4b9c74d 100755
  # livekit prefixed jni
  git apply "$COMMAND_DIR/patches/jni_prefix.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
  
-+# anazoa tunnel hooks into the Opus and VP9 encode/decode paths (matches
++# anazoa tunnel hooks into the Opus and video encode/decode paths (matches
 +# build_linux.sh). Required for the tunnel to carry a call; VP9 hooks need
 +# rtc_libvpx_build_vp9=true below.
-+git apply "$COMMAND_DIR/patches/hooks-opus.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
-+git apply "$COMMAND_DIR/patches/hooks-vp9.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++git apply "$COMMAND_DIR/patches/hooks-audio.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++git apply "$COMMAND_DIR/patches/hooks-video.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 +
  cd third_party/libyuv
  git apply "$COMMAND_DIR/patches/disable_sme_for_libyuv.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn

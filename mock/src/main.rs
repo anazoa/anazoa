@@ -107,6 +107,10 @@ struct TestCli {
     /// Optional tc-netem expression applied symmetrically to both veth interfaces,
     /// e.g. "loss 3%" or "loss 5% delay 20ms".
     netem: Option<String>,
+    /// Codec requested by the caller: vp9 (default) or h264.
+    video_codec: String,
+    /// Calltaker's outgoing preference, independent of the incoming call.
+    calltaker_video_codec: String,
     /// After the first call ends, fully disconnect and reconnect the caller
     /// daemon (via `ctl shutdown` + `reconnect-host --cycles 2`, all within
     /// the same process) and place a second call. Reproduces what Android's
@@ -441,6 +445,7 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         &calltaker_sock,
         &calltaker_privkey,
         &caller_pubkey,
+        &cli.calltaker_video_codec,
         cli.privdrop.as_deref(),
     )?;
     write_tun_config(
@@ -454,6 +459,7 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
         &caller_sock,
         &caller_privkey,
         &calltaker_pubkey,
+        &cli.video_codec,
         None,
     )?;
 
@@ -1393,6 +1399,7 @@ fn write_tun_config(
     daemon_socket: &Path,
     noise_privkey: &str,
     noise_peer_pubkey: &str,
+    video_codec: &str,
     privdrop: Option<&str>,
 ) -> Result<()> {
     let media_line = media_path
@@ -1426,6 +1433,7 @@ device-id = "f211d3fd4bc2d9cf""#;
 signaling-user-id = "{signaling_user_id}"
 remote-peer-id = {peer_id}
 media-video-resolution = "{DEFAULT_VIDEO_RESOLUTION}"
+media-video-codec = "{video_codec}"
 oneme-keepalive-secs = {MOCK_ONEME_KEEPALIVE_SECS}
 {media_line}{privdrop_line}ctl-socket = "{daemon_socket}"
 tun-name = "{tun_name}"
@@ -1937,6 +1945,8 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
     let mut keep_logs = false;
     let mut media_path = None;
     let mut netem = None;
+    let mut video_codec = "vp9".to_string();
+    let mut calltaker_video_codec = "vp9".to_string();
     let mut reconnect = false;
     let mut drop_session = None;
     let mut setup_delay = None;
@@ -1968,6 +1978,17 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
             "--keep-logs" => keep_logs = true,
             "--media" => media_path = Some(PathBuf::from(next_arg(&mut args, "--media")?)),
             "--netem" => netem = Some(next_arg(&mut args, "--netem")?),
+            "--video-codec" | "--calltaker-video-codec" => {
+                let codec = next_arg(&mut args, &arg)?;
+                if !matches!(codec.as_str(), "vp9" | "h264") {
+                    return Err(format!("{arg} must be vp9 or h264, got {codec:?}"));
+                }
+                if arg == "--video-codec" {
+                    video_codec = codec;
+                } else {
+                    calltaker_video_codec = codec;
+                }
+            }
             "--reconnect" => reconnect = true,
             "--privdrop" => privdrop = Some(next_arg(&mut args, "--privdrop")?),
             "--no-privdrop" => privdrop = None,
@@ -2015,6 +2036,8 @@ fn parse_test_args(mut args: impl Iterator<Item = String>) -> Result<TestCli, St
         keep_logs,
         media_path,
         netem,
+        video_codec,
+        calltaker_video_codec,
         reconnect,
         drop_session,
         setup_delay,
@@ -2116,6 +2139,9 @@ Options:
   --ready-timeout SECONDS    Tunnel readiness timeout (default: 15)
   --keep-logs                Preserve temp logs on success
   --media FILE               WebM/MP4 media file to stream from anazoa peers
+  --video-codec CODEC        Caller requests vp9 (default) or h264
+  --calltaker-video-codec CODEC
+                             Calltaker's outgoing preference: vp9 (default) or h264
   --netem EXPR               tc-netem expression applied to both veth interfaces (e.g. \"loss 3%\")
   --reconnect                After the first call, fully disconnect and reconnect the caller
                              daemon (same process) and place a second call

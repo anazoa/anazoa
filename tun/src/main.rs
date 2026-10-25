@@ -6,7 +6,7 @@ use anazoa_config::load_config;
 use anazoa_tun::daemon;
 use anazoa_tun::engine;
 use anazoa_tun::protozoa::media::RaylibMedia;
-use anazoa_tun::protozoa::tunnel::{keep_opus_hooks_linked, keep_vp9_hooks_linked};
+use anazoa_tun::protozoa::tunnel::{keep_opus_hooks_linked, keep_video_hooks_linked};
 
 fn usage() -> ! {
     eprintln!("usage: anazoa-tun [-c config.toml]");
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
     if cfg.auth.debug.log_signaling_ws {
         anazoa_auth::signaling::set_log_signaling_ws(true);
     }
-    keep_vp9_hooks_linked();
+    keep_video_hooks_linked();
     keep_opus_hooks_linked();
     engine::init_noise_from_config(&cfg)?;
 
