@@ -15,7 +15,6 @@ use tokio_rustls::{TlsConnector, client::TlsStream};
 use tracing::debug;
 use unicode_truncate::UnicodeTruncateStr;
 use uuid::Uuid;
-use webpki_roots::TLS_SERVER_ROOTS;
 
 use crate::calls::StartedConversationInfo;
 use crate::{FingerprintConfig, ServiceEndpoints, TurnServer, ensure_rustls_provider};
@@ -748,10 +747,8 @@ fn build_tls_config(skip_tls_verify: bool) -> rustls::ClientConfig {
         return config;
     }
 
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(TLS_SERVER_ROOTS.iter().cloned());
     rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
+        .with_root_certificates(crate::root_store())
         .with_no_client_auth()
 }
 

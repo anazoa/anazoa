@@ -15,7 +15,6 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::timeout;
 use tracing::debug;
 use unicode_truncate::UnicodeTruncateStr;
-use webpki_roots::TLS_SERVER_ROOTS;
 use wtransport::config::QuicTransportConfig;
 use wtransport::tls::WEBTRANSPORT_ALPN;
 use wtransport::{ClientConfig, Endpoint};
@@ -340,9 +339,9 @@ fn build_wt_client_config(tc: QuicTransportConfig, skip_tls_verify: bool) -> Cli
     // up empty and every real server cert fails as UnknownIssuer. Bundling
     // Mozilla's root list via webpki-roots sidesteps the OS store entirely,
     // matching the same fix oneme.rs already uses for its own TLS config.
+    // See `crate::root_store` for the extra Russian root on top.
     let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots.extend(TLS_SERVER_ROOTS.iter().cloned());
+    let roots = crate::root_store();
     let mut tls = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
         .expect("valid TLS 1.3 client config")

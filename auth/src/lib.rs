@@ -18,6 +18,24 @@ pub struct TurnServer {
     pub credential: String,
 }
 
+/// Russian Trusted Root CA (Минцифры), extracted from the Max APK's
+/// `res/raw/rootca_ssl_rsa2022.cer`. Max trusts it alongside the system
+/// roots, and some okcdn.ru endpoints (notably the `wte` WebTransport
+/// signaling) present chains that only validate against it — it is not in
+/// Mozilla's list, so without it those connections fail as UnknownIssuer.
+const RUSSIAN_TRUSTED_ROOT_CA: &[u8] = include_bytes!("../certs/russian_trusted_root_ca.der");
+
+/// Root store matching Max's trust set: Mozilla's roots (webpki-roots, since
+/// Android has no OS store rustls can read) plus the bundled Russian root.
+pub(crate) fn root_store() -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+        .add(rustls::pki_types::CertificateDer::from(RUSSIAN_TRUSTED_ROOT_CA))
+        .expect("bundled Russian Trusted Root CA parses");
+    roots
+}
+
 #[derive(Debug)]
 pub(crate) struct SkipTlsVerifier;
 
@@ -71,4 +89,13 @@ pub fn ensure_rustls_provider() {
     let _ = RUSTLS_PROVIDER.get_or_init(|| {
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn root_store_includes_russian_trusted_root() {
+        let roots = super::root_store();
+        assert_eq!(roots.len(), webpki_roots::TLS_SERVER_ROOTS.len() + 1);
+    }
 }
