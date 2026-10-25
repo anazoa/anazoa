@@ -1,10 +1,11 @@
 #!/bin/sh
 set -eu
 
-# Rebuilds libanazoa_tun.so for aarch64-android and the debug APK.
+# Rebuilds libanazoa_tun.so for aarch64-android and an APK.
 # Usage:
 #   scripts/build-android.sh              # rebuild Rust .so + APK
 #   scripts/build-android.sh --skip-rust  # only rebuild the APK (Kotlin/res changed, Rust didn't)
+#   scripts/build-android.sh --release    # signed release APK (see android/README.md)
 #
 # Used both for local dev and by .github/workflows/build.yml's `android` job
 # — CI sets ANDROID_NDK_HOME/ANDROID_SDK_ROOT itself (from nttld/setup-ndk
@@ -15,8 +16,27 @@ REPO_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 ANDROID_DIR="$REPO_ROOT/android"
 
 skip_rust=0
-if [ "${1:-}" = "--skip-rust" ]; then
-    skip_rust=1
+build_type=debug
+for arg in "$@"; do
+    case "$arg" in
+        --skip-rust) skip_rust=1 ;;
+        --release) build_type=release ;;
+        *)
+            echo "Usage: $0 [--skip-rust] [--release]" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$build_type" = release ]; then
+    : "${ANDROID_KEYSTORE_PATH:?Set ANDROID_KEYSTORE_PATH for release signing}"
+    : "${ANDROID_KEYSTORE_PASSWORD:?Set ANDROID_KEYSTORE_PASSWORD for release signing}"
+    : "${ANDROID_KEY_ALIAS:?Set ANDROID_KEY_ALIAS for release signing}"
+    : "${ANDROID_KEY_PASSWORD:?Set ANDROID_KEY_PASSWORD for release signing}"
+    if [ ! -f "$ANDROID_KEYSTORE_PATH" ]; then
+        echo "Error: release signing keystore does not exist: $ANDROID_KEYSTORE_PATH" >&2
+        exit 1
+    fi
 fi
 
 if [ "$skip_rust" = 0 ]; then
@@ -65,6 +85,11 @@ if [ "$skip_rust" = 0 ]; then
 fi
 
 export ANDROID_SDK_ROOT="${ANDROID_SDK_ROOT:-$REPO_ROOT/.scratch/android-sdk}"
-(cd "$ANDROID_DIR" && ./gradlew :app:assembleDebug --no-daemon --quiet)
+if [ "$build_type" = release ]; then
+    gradle_task=:app:assembleRelease
+else
+    gradle_task=:app:assembleDebug
+fi
+(cd "$ANDROID_DIR" && ./gradlew "$gradle_task" --no-daemon --quiet)
 
-echo "APK: $ANDROID_DIR/app/build/outputs/apk/debug/app-debug.apk"
+echo "APK: $ANDROID_DIR/app/build/outputs/apk/$build_type/app-$build_type.apk"

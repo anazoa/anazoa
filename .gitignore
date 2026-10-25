@@ -11,3 +11,7 @@ __pycache__
 # Compiled native libs: rebuilt from source by scripts/build-android.sh/CI,
 # not tracked (unlike android/app/libs/libwebrtc.jar, which is committed).
 /android/app/src/main/jniLibs/
+# Private Android signing material must never be committed.
+*.keystore
+*.jks
+*.p12

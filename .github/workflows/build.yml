@@ -168,11 +168,29 @@ jobs:
 
     android:
         runs-on: ubuntu-latest
+        env:
+            APK_BUILD_TYPE: ${{ startsWith(github.ref, 'refs/tags/') && 'release' || 'debug' }}
 
         steps:
             - uses: actions/checkout@v7
               with:
                   submodules: recursive
+
+            - name: Restore Android release signing key
+              if: startsWith(github.ref, 'refs/tags/')
+              env:
+                  ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+                  ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+                  ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+                  ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+              run: |
+                  : "${ANDROID_KEYSTORE_BASE64:?Configure ANDROID_KEYSTORE_BASE64 in repository secrets}"
+                  : "${ANDROID_KEYSTORE_PASSWORD:?Configure ANDROID_KEYSTORE_PASSWORD in repository secrets}"
+                  : "${ANDROID_KEY_ALIAS:?Configure ANDROID_KEY_ALIAS in repository secrets}"
+                  : "${ANDROID_KEY_PASSWORD:?Configure ANDROID_KEY_PASSWORD in repository secrets}"
+                  umask 077
+                  printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/anazoa-release.keystore"
+                  echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/anazoa-release.keystore" >> "$GITHUB_ENV"
 
             - name: Compute livekit submodule SHA
               id: lk-sha
@@ -272,12 +290,31 @@ jobs:
               env:
                   ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
                   LK_CUSTOM_WEBRTC: ${{ github.workspace }}/livekit/webrtc-sys/libwebrtc/android-arm64-release
-              run: bash scripts/build-android.sh
+                  ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+                  ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+                  ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+              run: |
+                  if [ "$APK_BUILD_TYPE" = release ]; then
+                      bash scripts/build-android.sh --release
+                  else
+                      bash scripts/build-android.sh
+                  fi
+
+            - name: Verify Android release APK signature
+              if: startsWith(github.ref, 'refs/tags/')
+              run: |
+                  "$ANDROID_SDK_ROOT/build-tools/34.0.0/apksigner" verify --verbose --print-certs \
+                      android/app/build/outputs/apk/release/app-release.apk
+
+            - name: Remove Android release signing key
+              if: always() && startsWith(github.ref, 'refs/tags/')
+              run: rm -f "$RUNNER_TEMP/anazoa-release.keystore"
 
             - uses: actions/upload-artifact@v7
               with:
                   name: anazoa-android
-                  path: android/app/build/outputs/apk/debug/app-debug.apk
+                  path: android/app/build/outputs/apk/${{ env.APK_BUILD_TYPE }}/app-${{ env.APK_BUILD_TYPE }}.apk
+                  if-no-files-found: error
 
     release:
         needs: build
@@ -338,7 +375,7 @@ jobs:
                   path: /tmp/artifact
 
             - name: Stage APK release asset
-              run: cp /tmp/artifact/app-debug.apk "anazoa-${GITHUB_REF_NAME#v}.apk"
+              run: cp /tmp/artifact/app-release.apk "anazoa-${GITHUB_REF_NAME#v}.apk"
 
             - uses: softprops/action-gh-release@v3
               with:
