@@ -158,6 +158,76 @@ jobs:
             - name: Build anazoa-auth and anazoa-ctl
               run: cargo build --release --bin anazoa-auth --bin anazoa-ctl --target ${{ matrix.static_target }}
 
+            # End-to-end tunnel tests (mock/src/main.rs): two anazoa-tun peers
+            # in their own network namespaces, talking through the mock
+            # signaling server and a local coturn. The hosted runner is a full
+            # VM with passwordless sudo, so netns, veth, TUN and tc-netem all
+            # work as root; aarch64 is cross-compiled and can't run here.
+            - name: Build mock harness
+              if: matrix.arch == 'x86_64'
+              env:
+                  LK_CUSTOM_WEBRTC: ${{ github.workspace }}/livekit/webrtc-sys/libwebrtc/linux-${{ matrix.lk_arch }}-release
+                  CC: ${{ env.LLVM_ROOT }}/bin/clang
+                  CXX: ${{ env.LLVM_ROOT }}/bin/clang++
+              # mock runs anazoa-tun, anazoa-ctl and reconnect-host from its
+              # own directory, so they're all built for the same target.
+              run: cargo build --release --bin mock --bin reconnect-host --bin anazoa-ctl --target ${{ matrix.dynamic_target }}
+
+            # A few dozen small packages. ffmpeg used to be here too and
+            # pulled in ~290 more (codecs, X11, mesa) for no runtime use.
+            - name: Install mock test dependencies
+              if: matrix.arch == 'x86_64'
+              timeout-minutes: 10
+              run: |
+                  sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+                    coturn iperf3 tcpdump iputils-ping
+                  sudo modprobe sch_netem || {
+                    sudo DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
+                      "linux-modules-extra-$(uname -r)"
+                    sudo modprobe sch_netem
+                  }
+
+            # The calltaker drops to nobody:nogroup and must still be able to
+            # read the media, which it can't under the runner's home directory.
+            # mock/fixtures/media.opus comes from scripts/gen-mock-media.sh.
+            - name: Stage mock test media
+              if: matrix.arch == 'x86_64'
+              run: install -m 644 mock/fixtures/media.opus /tmp/mock-media.opus
+
+            - name: Mock test
+              if: matrix.arch == 'x86_64'
+              timeout-minutes: 5
+              run: sudo target/${{ matrix.dynamic_target }}/release/mock test --media /tmp/mock-media.opus --keep-logs
+
+            - name: Mock test (reconnect)
+              if: matrix.arch == 'x86_64'
+              timeout-minutes: 5
+              run: sudo target/${{ matrix.dynamic_target }}/release/mock test --media /tmp/mock-media.opus --keep-logs --reconnect
+
+            - name: Mock test (packet loss)
+              if: matrix.arch == 'x86_64'
+              timeout-minutes: 5
+              run: sudo target/${{ matrix.dynamic_target }}/release/mock test --media /tmp/mock-media.opus --keep-logs --netem "loss 5% delay 30ms"
+
+            - name: Mock test (H.264)
+              if: matrix.arch == 'x86_64'
+              timeout-minutes: 5
+              run: sudo target/${{ matrix.dynamic_target }}/release/mock test --media /tmp/mock-media.opus --keep-logs --video-codec h264
+
+            - name: Collect mock test logs
+              if: failure() && matrix.arch == 'x86_64'
+              run: |
+                  sudo tar -czf mock-logs.tar.gz -C /tmp $(cd /tmp && ls -d mock-*/ 2>/dev/null) || true
+                  sudo chown "$(id -u):$(id -g)" mock-logs.tar.gz || true
+
+            - name: Upload mock test logs
+              if: failure() && matrix.arch == 'x86_64'
+              uses: actions/upload-artifact@v7
+              with:
+                  name: mock-logs
+                  path: mock-logs.tar.gz
+                  if-no-files-found: ignore
+
             - uses: actions/upload-artifact@v7
               with:
                   name: anazoa-${{ matrix.arch }}

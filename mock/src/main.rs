@@ -283,9 +283,6 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
     ensure_command_exists("iperf3")?;
     ensure_command_exists("turnserver")?;
     ensure_command_exists("tcpdump")?;
-    if cli.media_path.is_some() {
-        ensure_command_exists("ffmpeg")?;
-    }
 
     let current_exe = env::current_exe().context("resolve mock path")?;
     let tun_exe = sibling_binary(&current_exe, "anazoa-tun")?;
