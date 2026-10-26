@@ -44,6 +44,23 @@ fn slot() -> &'static Mutex<Option<TunnelSession>> {
     RUNNING.get_or_init(|| Mutex::new(None))
 }
 
+/// Why the last session failed (it couldn't start, or its engine exited
+/// with an error), until the next `nativeStart`. `nativeStatus` reports it
+/// as `exit_error`, so the app can show the reason instead of a bare
+/// "Disconnected" once the dead session has been reaped.
+static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+fn set_last_failure(failure: Option<String>) {
+    *LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner()) = failure;
+}
+
+fn last_failure() -> Option<String> {
+    LAST_FAILURE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Poison-tolerant: a panic while holding the slot (now survivable, see
 /// `catch_jni`) must not turn every later JNI call into another panic.
 fn lock_slot() -> MutexGuard<'static, Option<TunnelSession>> {
@@ -76,7 +93,9 @@ fn catch_jni<T>(env: &mut JNIEnv, fallback: T, body: impl FnOnce(&mut JNIEnv) ->
 /// `TunnelSession::is_finished`'s doc comment for why).
 fn reap_finished(guard: &mut MutexGuard<'_, Option<TunnelSession>>) {
     if guard.as_ref().is_some_and(TunnelSession::is_finished) {
-        guard.take();
+        if let Some(err) = guard.take().and_then(|session| session.exit_error()) {
+            set_last_failure(Some(err));
+        }
     }
 }
 
@@ -99,9 +118,13 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeStart<'local>(
     app_context: JObject<'local>,
 ) -> jboolean {
     catch_jni(&mut env, JNI_FALSE, |env| {
+        set_last_failure(None);
         match start(env, &config_path, tun_fd as RawFd, &app_context) {
             Ok(()) => JNI_TRUE,
-            Err(err) => throw_and(env, err, JNI_FALSE),
+            Err(err) => {
+                set_last_failure(Some(format!("{err:#}")));
+                throw_and(env, err, JNI_FALSE)
+            }
         }
     })
 }
@@ -305,7 +328,13 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeStatus<'local>(
             Some(serde_json::json!({"state": "connecting"}))
         }
     }
-    .unwrap_or_else(|| serde_json::json!({"state": "error", "error": "tunnel not running"}));
+    .unwrap_or_else(|| {
+        let mut value = serde_json::json!({"state": "error", "error": "tunnel not running"});
+        if let Some(failure) = last_failure() {
+            value["exit_error"] = failure.into();
+        }
+        value
+    });
     match env.new_string(value.to_string()) {
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),

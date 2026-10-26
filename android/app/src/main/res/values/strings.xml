@@ -4,6 +4,7 @@
     <string name="status_connecting">Connecting…</string>
     <string name="status_connected">Connected</string>
     <string name="status_failed">Failed to connect</string>
+    <string name="status_failed_reason">Failed: %1$s</string>
     <string name="error_no_config">Import or write a config first</string>
     <string name="label_config">Engine Configuration</string>
     <string name="action_load_config">Load from file…</string>
@@ -23,5 +24,6 @@
     <string name="action_load_media">Load media file…</string>
     <string name="media_status_none">none</string>
     <string name="media_status_loaded">%1$s loaded</string>
+    <string name="media_status_copying">copying…</string>
     <string name="error_load_media">Could not read that file</string>
 </resources>

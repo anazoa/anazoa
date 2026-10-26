@@ -316,19 +316,41 @@ pub fn transceiver_init(direction: RtpTransceiverDirection) -> RtpTransceiverIni
     }
 }
 
+fn codec_matches(codec: &RtpCodecCapability, name: &str) -> bool {
+    codec.name.eq_ignore_ascii_case(name)
+        || codec
+            .mime_type
+            .to_ascii_lowercase()
+            .ends_with(&format!("/{}", name.to_ascii_lowercase()))
+}
+
+/// Fails if this libwebrtc build can't send `codec`. Checked once at engine
+/// startup: `prefer_codec` would catch it too, but only inside a call that
+/// has already rung the remote peer, and Android's auto-call then redialed
+/// into the same error forever. The Android build has no software H264
+/// (`rtc_use_h264=false`), so H264 there depends on a hardware MediaCodec
+/// encoder, which the emulator and some phones don't have.
+pub fn ensure_send_codec(codec: VideoCodec) -> Result<()> {
+    let factory = create_peer_connection_factory();
+    let codecs = factory.rtp_sender_capabilities(MediaType::Video).codecs;
+    if codecs.iter().any(|c| codec_matches(c, codec.rtp_name())) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "media-video-codec {} is not supported here: no {} encoder in libwebrtc",
+        codec.rtp_name().to_ascii_lowercase(),
+        codec.rtp_name()
+    ))
+}
+
 pub fn prefer_codec(
     codecs: Vec<RtpCodecCapability>,
     transceiver: &SharedPtr<RtpTransceiver>,
     name: &str,
 ) -> Result<()> {
-    let wanted = name.to_ascii_lowercase();
-    let (mut selected, rest): (Vec<_>, Vec<_>) = codecs.into_iter().partition(|codec| {
-        codec.name.eq_ignore_ascii_case(name)
-            || codec
-                .mime_type
-                .to_ascii_lowercase()
-                .ends_with(&format!("/{wanted}"))
-    });
+    let (mut selected, rest): (Vec<_>, Vec<_>) = codecs
+        .into_iter()
+        .partition(|codec| codec_matches(codec, name));
     if selected.is_empty() {
         // The tunnel rides on these codecs' encode/reference hooks, so a build
         // whose libwebrtc lacks the preferred codec can never carry a call.

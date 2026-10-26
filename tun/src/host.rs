@@ -13,8 +13,8 @@
 //! inlines the equivalent steps directly.
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -56,6 +56,9 @@ pub struct TunnelSession {
     /// detects and aborts the process over ("Cannot drop a runtime in a
     /// context where blocking is not allowed").
     finished: Arc<AtomicBool>,
+    /// Why the engine task exited, if it returned an error. Set before
+    /// `finished`, so a reaper that saw `is_finished` also sees this.
+    exit_error: Arc<Mutex<Option<String>>>,
 }
 
 impl TunnelSession {
@@ -104,6 +107,8 @@ impl TunnelSession {
 
         let finished = Arc::new(AtomicBool::new(false));
         let task_finished = Arc::clone(&finished);
+        let exit_error = Arc::new(Mutex::new(None));
+        let task_exit_error = Arc::clone(&exit_error);
         let (status_tx, status_rx) = watch::channel(EngineState::Connecting);
         let engine = runtime.spawn(async move {
             let log_dir = log_dir.as_deref().map(Path::new);
@@ -121,6 +126,8 @@ impl TunnelSession {
             .await
             {
                 warn!("tunnel engine exited: {err:#}");
+                *task_exit_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("{err:#}"));
             }
 
             // Otherwise a dead-but-unreaped session leaves send_cmd() sending
@@ -136,6 +143,7 @@ impl TunnelSession {
             engine,
             status_rx,
             finished,
+            exit_error,
         })
     }
 
@@ -171,6 +179,14 @@ impl TunnelSession {
         }
         self.runtime
             .shutdown_timeout(STOP_TIMEOUT.saturating_sub(started.elapsed()));
+    }
+
+    /// The error the engine exited with, if it has exited with one.
+    pub fn exit_error(&self) -> Option<String> {
+        self.exit_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Current engine status as the same JSON `DaemonCmd::Status` would

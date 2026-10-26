@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material3's default status bar color is the primary tint, which
+         read as a stray lavender strip above the dark UI. Match the window
+         background instead, with icons dark on light and light on dark. -->
+    <style name="Theme.Anazoa" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">?android:attr/colorBackground</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

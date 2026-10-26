@@ -22,6 +22,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import com.google.android.material.bottomnavigation.BottomNavigationView
 import java.io.File
+import java.util.concurrent.Executors
 
 class MainActivity : AppCompatActivity() {
 
@@ -38,6 +39,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var cidrInput: EditText
     private lateinit var configInput: EditText
     private lateinit var mediaStatusText: TextView
+    private lateinit var loadMediaButton: Button
 
     // Log tab
     private lateinit var logScroll: ScrollView
@@ -57,7 +59,7 @@ class MainActivity : AppCompatActivity() {
     // alongside the new one.
     private val statusTick = object : Runnable {
         override fun run() {
-            val state = AnazoaVpnService.engineState(runCatching { TunnelNative.nativeStatus() }.getOrNull())
+            val state = AnazoaVpnService.currentState()
             if (state == null) {
                 setConnected(false)
             } else {
@@ -88,6 +90,17 @@ class MainActivity : AppCompatActivity() {
         private const val LOG_POLL_MS = 2000L
         private const val LOG_PREVIEW_LINES = 3
         private const val STATE_TAB = "tab"
+
+        private val mediaCopier = Executors.newSingleThreadExecutor { r -> Thread(r, "anazoa-media-copy") }
+
+        // Process-wide, not per instance: a rotation mid-copy recreates the
+        // activity, and the new one must still show the copy as running.
+        @Volatile
+        private var mediaCopyInProgress = false
+
+        // The resumed instance, for the copy's completion to report to.
+        // Main thread only; cleared in onPause, so it never outlives one.
+        private var resumed: MainActivity? = null
     }
 
     private val vpnPermission =
@@ -115,23 +128,37 @@ class MainActivity : AppCompatActivity() {
 
     // Copies the picked file's bytes to a fixed app-private path rather than
     // keeping the content:// URI: the engine opens the file by path, and a
-    // picker grant doesn't outlive the process anyway.
+    // picker grant doesn't outlive the process anyway. Off the main thread,
+    // since a recording is easily 100 MB, and into a temp file renamed into
+    // place, so a Connect during the copy uses the previous file whole
+    // rather than a truncated one.
     private val loadMediaFile =
         registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-            if (uri == null) return@registerForActivityResult
-            val copied = runCatching {
-                contentResolver.openInputStream(uri)?.use { input ->
-                    File(filesDir, AnazoaVpnService.MEDIA_FILE_NAME).outputStream().use { output ->
-                        input.copyTo(output)
+            if (uri == null || mediaCopyInProgress) return@registerForActivityResult
+            mediaCopyInProgress = true
+            updateMediaStatus()
+            val resolver = applicationContext.contentResolver
+            val dir = filesDir
+            mediaCopier.execute {
+                val tmp = File(dir, "${AnazoaVpnService.MEDIA_FILE_NAME}.tmp")
+                val copied = runCatching {
+                    checkNotNull(resolver.openInputStream(uri)).use { input ->
+                        tmp.outputStream().use { output -> input.copyTo(output) }
                     }
+                    check(tmp.renameTo(File(dir, AnazoaVpnService.MEDIA_FILE_NAME)))
+                }.isSuccess
+                if (!copied) tmp.delete()
+                handler.post {
+                    mediaCopyInProgress = false
+                    resumed?.onMediaCopied(copied)
                 }
-            }.getOrNull()
-            if (copied == null) {
-                Toast.makeText(this, getString(R.string.error_load_media), Toast.LENGTH_LONG).show()
-            } else {
-                updateMediaStatus()
             }
         }
+
+    private fun onMediaCopied(copied: Boolean) {
+        updateMediaStatus()
+        if (!copied) Toast.makeText(this, getString(R.string.error_load_media), Toast.LENGTH_LONG).show()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -170,7 +197,8 @@ class MainActivity : AppCompatActivity() {
             loadConfigFile.launch("*/*")
         }
 
-        findViewById<Button>(R.id.load_media_button).setOnClickListener {
+        loadMediaButton = findViewById(R.id.load_media_button)
+        loadMediaButton.setOnClickListener {
             loadMediaFile.launch("*/*")
         }
 
@@ -198,14 +226,17 @@ class MainActivity : AppCompatActivity() {
         // The service may still be running from a previous activity
         // instance (e.g. after rotation, or the app was reopened); probe it
         // rather than assuming we're disconnected.
-        val state = AnazoaVpnService.engineState(runCatching { TunnelNative.nativeStatus() }.getOrNull())
+        val state = AnazoaVpnService.currentState()
         setConnected(state != null)
         if (state != null) setStatus(describeState(state))
         startLogPolling()
+        resumed = this
+        updateMediaStatus()
     }
 
     override fun onPause() {
         super.onPause()
+        resumed = null
         stopPolling()
         handler.removeCallbacks(logTick)
         if (currentTab == R.id.nav_settings) savePrefs()
@@ -251,6 +282,7 @@ class MainActivity : AppCompatActivity() {
             // keeps that signaling connection itself off the TUN device.
             putExtra(AnazoaVpnService.EXTRA_ROUTES, "0.0.0.0/0")
         }
+        AnazoaVpnService.startPending = true
         ContextCompat.startForegroundService(this, intent)
         setConnected(true)
     }
@@ -271,7 +303,10 @@ class MainActivity : AppCompatActivity() {
             startPolling()
         } else {
             stopPolling()
-            setStatus(getString(R.string.status_idle))
+            // A session that died on its own says why; a Disconnect, or a
+            // fresh start, has no failure to show.
+            val failure = AnazoaVpnService.lastFailure()
+            setStatus(failure?.let { getString(R.string.status_failed_reason, it) } ?: getString(R.string.status_idle))
         }
     }
 
@@ -322,7 +357,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateMediaStatus() {
         val mediaFile = File(filesDir, AnazoaVpnService.MEDIA_FILE_NAME)
-        mediaStatusText.text = if (mediaFile.exists()) {
+        loadMediaButton.isEnabled = !mediaCopyInProgress
+        mediaStatusText.text = if (mediaCopyInProgress) {
+            getString(R.string.media_status_copying)
+        } else if (mediaFile.exists()) {
             getString(R.string.media_status_loaded, mediaFile.length().let { "%.1f MB".format(it / 1_000_000.0) })
         } else {
             getString(R.string.media_status_none)

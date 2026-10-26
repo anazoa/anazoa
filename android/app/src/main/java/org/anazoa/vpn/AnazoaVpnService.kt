@@ -42,11 +42,17 @@ class AnazoaVpnService : VpnService() {
          * android.rs's "no session" sentinel, also returned once a session
          * has died and been reaped). Shared with MainActivity so both sides
          * agree on what "running" means.
+         *
+         * An `in_call` whose `tunnel_up` is false (ICE not connected yet or
+         * lost mid-call, or the Noise handshake not done) comes back as
+         * "connecting": the call exists, but the tunnel carries nothing.
          */
         fun engineState(status: String?): String? {
             if (status.isNullOrBlank()) return null
             return try {
-                JSONObject(status).optString("state").takeIf { it.isNotEmpty() && it != "error" }
+                val json = JSONObject(status)
+                val state = json.optString("state").takeIf { it.isNotEmpty() && it != "error" }
+                if (state == "in_call" && !json.optBoolean("tunnel_up", true)) "connecting" else state
             } catch (e: JSONException) {
                 null
             }
@@ -54,6 +60,34 @@ class AnazoaVpnService : VpnService() {
 
         fun engineRunning(): Boolean =
             engineState(runCatching { TunnelNative.nativeStatus() }.getOrNull()) != null
+
+        /**
+         * True from MainActivity sending CONNECT until the native thread is
+         * done with it (nativeStart returned, or the attempt was dropped).
+         * In that window nativeStatus still says "not running", and an
+         * onResume landing there (it runs right after the VPN consent
+         * dialog) showed Disconnected while the engine came up and dialed.
+         */
+        @Volatile
+        var startPending = false
+
+        /**
+         * The engine's state, "connecting" while a CONNECT is still pending,
+         * or null if nothing is running or starting.
+         */
+        fun currentState(): String? {
+            // Read before the status: start clears the flag only after
+            // nativeStart has returned, so this order can't miss both.
+            val pending = startPending
+            return engineState(runCatching { TunnelNative.nativeStatus() }.getOrNull())
+                ?: if (pending) "connecting" else null
+        }
+
+        /** Why the last session failed, until the next Connect (android.rs's `exit_error`). */
+        fun lastFailure(): String? =
+            runCatching { JSONObject(TunnelNative.nativeStatus()).optString("exit_error") }
+                .getOrNull()
+                ?.takeIf { it.isNotEmpty() }
 
         /**
          * The one thread that calls nativeStart/nativeStop. Neither belongs
@@ -97,6 +131,7 @@ class AnazoaVpnService : VpnService() {
                 val config = intent.getStringExtra(EXTRA_CONFIG)
                 if (config.isNullOrBlank()) {
                     Log.w(TAG, "CONNECT with no config, ignoring")
+                    startPending = false
                     stopSelf()
                     return START_NOT_STICKY
                 }
@@ -164,54 +199,63 @@ class AnazoaVpnService : VpnService() {
         }
 
         native.execute {
-            // Ask the engine rather than a local flag: nativeStatus() reaps
-            // a session whose engine already exited, so a dead session
-            // doesn't block reconnecting (see statusPoll). Checked here, on
-            // the native thread, so it runs *after* any Stop queued ahead of
-            // us — a quick Disconnect→Connect must not see the old session.
-            if (engineRunning()) {
-                Log.w(TAG, "startTunnel called while already running, ignoring")
-                return@execute
+            try {
+                startNative(builder, configFile)
+            } finally {
+                startPending = false
             }
+        }
+    }
 
-            val pfd = try {
-                builder.establish()
-            } catch (e: Exception) {
-                Log.e(TAG, "VpnService.Builder.establish() threw", e)
-                null
-            }
-            if (pfd == null) {
-                Log.e(TAG, "VpnService.Builder.establish() returned null")
-                handler.post { fail(getString(R.string.status_failed)) }
-                return@execute
-            }
+    // Runs on the `native` thread.
+    private fun startNative(builder: Builder, configFile: File) {
+        // Ask the engine rather than a local flag: nativeStatus() reaps
+        // a session whose engine already exited, so a dead session
+        // doesn't block reconnecting (see statusPoll). Checked here, on
+        // the native thread, so it runs *after* any Stop queued ahead of
+        // us — a quick Disconnect→Connect must not see the old session.
+        if (engineRunning()) {
+            Log.w(TAG, "startTunnel called while already running, ignoring")
+            return
+        }
 
-            // Ownership of the fd transfers to the Rust side (tun_rs::AsyncDevice
-            // closes it on drop, triggered from nativeStop). detachFd() so this
-            // ParcelFileDescriptor doesn't also try to close it — a double-close
-            // on a possibly-already-reused fd is exactly the kind of native bug
-            // that's miserable to track down.
-            val fd = pfd.detachFd()
+        val pfd = try {
+            builder.establish()
+        } catch (e: Exception) {
+            Log.e(TAG, "VpnService.Builder.establish() threw", e)
+            null
+        }
+        if (pfd == null) {
+            Log.e(TAG, "VpnService.Builder.establish() returned null")
+            handler.post { fail(getString(R.string.status_failed)) }
+            return
+        }
 
-            // nativeStart reports failure (e.g. a config that doesn't parse) by
-            // throwing across the JNI boundary (see android.rs's throw_and), not
-            // by some Kotlin-side error type — an uncaught exception here would
-            // crash the whole app instead of just failing to connect, which is
-            // exactly what happened before this try/catch existed.
-            val started = try {
-                TunnelNative.nativeStart(configFile.absolutePath, fd, applicationContext)
-            } catch (e: Exception) {
-                Log.e(TAG, "nativeStart threw", e)
-                false
-            }
-            handler.post {
-                if (!started) {
-                    Log.e(TAG, "nativeStart failed")
-                    fail("${getString(R.string.status_failed)}: ${lastNativeError()}")
-                } else {
-                    handler.removeCallbacks(statusPoll)
-                    handler.postDelayed(statusPoll, STATUS_POLL_MS)
-                }
+        // Ownership of the fd transfers to the Rust side (tun_rs::AsyncDevice
+        // closes it on drop, triggered from nativeStop). detachFd() so this
+        // ParcelFileDescriptor doesn't also try to close it — a double-close
+        // on a possibly-already-reused fd is exactly the kind of native bug
+        // that's miserable to track down.
+        val fd = pfd.detachFd()
+
+        // nativeStart reports failure (e.g. a config that doesn't parse) by
+        // throwing across the JNI boundary (see android.rs's throw_and), not
+        // by some Kotlin-side error type — an uncaught exception here would
+        // crash the whole app instead of just failing to connect, which is
+        // exactly what happened before this try/catch existed.
+        val started = try {
+            TunnelNative.nativeStart(configFile.absolutePath, fd, applicationContext)
+        } catch (e: Exception) {
+            Log.e(TAG, "nativeStart threw", e)
+            false
+        }
+        handler.post {
+            if (!started) {
+                Log.e(TAG, "nativeStart failed")
+                fail("${getString(R.string.status_failed)}: ${lastNativeError()}")
+            } else {
+                handler.removeCallbacks(statusPoll)
+                handler.postDelayed(statusPoll, STATUS_POLL_MS)
             }
         }
     }
@@ -254,7 +298,7 @@ class AnazoaVpnService : VpnService() {
     }
 
     private fun lastNativeError(): String =
-        runCatching { TunnelNative.nativeRecentLog() }
+        lastFailure() ?: runCatching { TunnelNative.nativeRecentLog() }
             .getOrNull()
             ?.lines()
             ?.lastOrNull { it.isNotBlank() }

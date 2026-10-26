@@ -6,7 +6,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -34,12 +34,12 @@ use crate::protozoa::tunnel::{
 use crate::protozoa::vp9::VP9_BLACK_KEYFRAMES;
 use crate::protozoa::webrtc::{
     LocalEvent, Role, VideoCodec, WebrtcCall, add_ice_candidate, attach_existing_remote_tracks,
-    create_answer, create_offer, ensure_local_senders, ice_state_name, log_local_senders,
-    pc_state_name, set_local_description, set_remote_sdp,
+    create_answer, create_offer, ensure_local_senders, ensure_send_codec, ice_state_name,
+    log_local_senders, pc_state_name, set_local_description, set_remote_sdp,
 };
 use crate::{Config, call_keepalive_loop, shutdown_requested, shutdown_signal, trigger_shutdown};
 use webrtc_sys::jsep::ffi::SdpType;
-use webrtc_sys::peer_connection::ffi::PeerConnectionState;
+use webrtc_sys::peer_connection::ffi::{IceConnectionState, PeerConnectionState};
 
 const SIGNAL_TIMEOUT: Duration = Duration::from_secs(60);
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
@@ -431,6 +431,7 @@ pub fn status_json(state: &EngineState) -> Value {
             "state": "in_call",
             "peer_id": peer_id,
             "uptime_secs": started_at.elapsed().as_secs(),
+            "tunnel_up": tunnel_up(),
             "tunnel": tunnel_stats_json(),
         }),
         EngineState::Stopped => json!({"state": "stopped"}),
@@ -444,6 +445,19 @@ fn utilization_window_json(data: u64, total: u64, secs: u64) -> Value {
         0.0
     };
     json!({ "data_frames": data, "total_frames": total, "ratio": ratio, "window_secs": secs })
+}
+
+/// Whether the current call's ICE transport is connected. Cleared when a
+/// call starts and ends; set from the call's ICE events.
+static ICE_CONNECTED: AtomicBool = AtomicBool::new(false);
+
+/// True once an `InCall` actually carries traffic: ICE connected and the
+/// Noise handshake done. `InCall` is published as soon as signaling
+/// connects, and stays through an ICE outage, so on its own it read as
+/// "Connected" while the tunnel was still coming up or already down.
+fn tunnel_up() -> bool {
+    ICE_CONNECTED.load(Ordering::Relaxed)
+        && tunnel_state().is_none_or(|s| s.authenticated.load(Ordering::Relaxed))
 }
 
 fn tunnel_stats_json() -> Value {
@@ -687,6 +701,7 @@ async fn finish_call(
 ) {
     let (hangup_tx, hangup_rx) = watch::channel(false);
     let started_at = Instant::now();
+    ICE_CONNECTED.store(false, Ordering::Relaxed);
     env.status.send_replace(EngineState::InCall {
         peer_id,
         started_at,
@@ -695,6 +710,7 @@ async fn finish_call(
     let call_result = run_call(signaling, turn, role, hangup_rx, peer_id, started_at, env).await;
 
     let _ = hangup_tx.send(true);
+    ICE_CONNECTED.store(false, Ordering::Relaxed);
     teardown_call(signaling, keepalive_stop_tx, keepalive).await;
 
     match call_result {
@@ -1055,6 +1071,10 @@ pub async fn run_daemon(
         )
     })?;
     info!("outgoing video codec: {}", video_codec.rtp_name());
+    // Before the session and the first dial, so a build that can't send the
+    // configured codec fails once with the reason instead of ringing the
+    // peer and redialing into the same error.
+    ensure_send_codec(video_codec)?;
 
     // Establish the OneMe session once and keep it alive across calls,
     // matching Android behavior (single WebSocket for the full app session).
@@ -1186,7 +1206,17 @@ async fn handle_local_event(
             }
             signaling.send_signal(body).await?;
         }
-        LocalEvent::IceState(state) => info!("ICE state = {}", ice_state_name(state)),
+        LocalEvent::IceState(state) => {
+            info!("ICE state = {}", ice_state_name(state));
+            ICE_CONNECTED.store(
+                matches!(
+                    state,
+                    IceConnectionState::IceConnectionConnected
+                        | IceConnectionState::IceConnectionCompleted
+                ),
+                Ordering::Relaxed,
+            );
+        }
         LocalEvent::ConnectionState(state) => {
             info!("connection state = {}", pc_state_name(state));
             if matches!(
