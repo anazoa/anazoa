@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:gravity="center_horizontal"
+    android:padding="24dp">
+
+    <TextView
+        android:id="@+id/status_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:gravity="center"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:text="@string/status_idle" />
+
+    <Space
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <!-- Spelled out as AppCompatButton: under a Material theme a plain
+         <Button> inflates to MaterialButton, which replaces the round
+         background drawable with its own. -->
+    <androidx.appcompat.widget.AppCompatButton
+        android:id="@+id/connect_button"
+        android:layout_width="180dp"
+        android:layout_height="180dp"
+        android:background="@drawable/round_button_bg"
+        android:textColor="@android:color/white"
+        android:textSize="18sp"
+        android:textStyle="bold"
+        android:elevation="4dp"
+        android:text="@string/action_connect" />
+
+    <Space
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        android:layout_weight="1" />
+
+    <!-- Last few log lines; tapping it opens the Log tab. -->
+    <TextView
+        android:id="@+id/log_preview_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#1a1a1a"
+        android:padding="8dp"
+        android:minLines="3"
+        android:fontFamily="monospace"
+        android:textSize="10sp"
+        android:textColor="#e0e0e0" />
+
+</LinearLayout>

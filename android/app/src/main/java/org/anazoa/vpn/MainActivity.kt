@@ -8,22 +8,46 @@ import android.net.VpnService
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.text.Selection
+import android.view.View
 import android.widget.Button
+import android.widget.EditText
+import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
+import com.google.android.material.bottomnavigation.BottomNavigationView
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
     private lateinit var prefs: SharedPreferences
+    private lateinit var bottomNav: BottomNavigationView
+    private lateinit var tabs: Map<Int, View>
+
+    // Main tab
     private lateinit var statusText: TextView
     private lateinit var connectButton: Button
+    private lateinit var logPreviewText: TextView
+
+    // Settings tab
+    private lateinit var cidrInput: EditText
+    private lateinit var configInput: EditText
+    private lateinit var mediaStatusText: TextView
+
+    // Log tab
+    private lateinit var logScroll: ScrollView
+    private lateinit var logText: TextView
 
     private val handler = Handler(Looper.getMainLooper())
     private var connected = false
+    private var currentTab = R.id.nav_main
+
+    private val cidrRegex = Regex("""^(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})$""")
 
     // A single Runnable instance, so stopPolling() can remove exactly the
     // tick that is queued. The previous per-startPolling() object plus a
@@ -43,8 +67,27 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Same single-instance rule as statusTick. Runs on every tab except
+    // Settings, which shows no log.
+    private val logTick = object : Runnable {
+        override fun run() {
+            updateLog()
+            handler.postDelayed(this, LOG_POLL_MS)
+        }
+    }
+
+    // Back from Settings or Log returns to Main instead of closing the app.
+    private val backToMain = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            bottomNav.selectedItemId = R.id.nav_main
+        }
+    }
+
     companion object {
         private const val STATUS_POLL_MS = 2000L
+        private const val LOG_POLL_MS = 2000L
+        private const val LOG_PREVIEW_LINES = 3
+        private const val STATE_TAB = "tab"
     }
 
     private val vpnPermission =
@@ -56,25 +99,98 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+    private val loadConfigFile =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            if (uri == null) return@registerForActivityResult
+            val text = runCatching {
+                contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+            }.getOrNull()
+            if (text.isNullOrEmpty()) {
+                Toast.makeText(this, getString(R.string.error_load_config), Toast.LENGTH_LONG).show()
+            } else {
+                configInput.setText(text)
+                Toast.makeText(this, getString(R.string.toast_config_imported), Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    // Copies the picked file's bytes to a fixed app-private path rather than
+    // keeping the content:// URI: the engine opens the file by path, and a
+    // picker grant doesn't outlive the process anyway.
+    private val loadMediaFile =
+        registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+            if (uri == null) return@registerForActivityResult
+            val copied = runCatching {
+                contentResolver.openInputStream(uri)?.use { input ->
+                    File(filesDir, AnazoaVpnService.MEDIA_FILE_NAME).outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+            }.getOrNull()
+            if (copied == null) {
+                Toast.makeText(this, getString(R.string.error_load_media), Toast.LENGTH_LONG).show()
+            } else {
+                updateMediaStatus()
+            }
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
         prefs = getSharedPreferences("anazoa_vpn", MODE_PRIVATE)
 
+        tabs = mapOf(
+            R.id.nav_main to findViewById(R.id.tab_main),
+            R.id.nav_settings to findViewById(R.id.tab_settings),
+            R.id.nav_log to findViewById(R.id.tab_log),
+        )
+
         statusText = findViewById(R.id.status_text)
         connectButton = findViewById(R.id.connect_button)
+        logPreviewText = findViewById(R.id.log_preview_text)
+        cidrInput = findViewById(R.id.cidr_input)
+        configInput = findViewById(R.id.config_input)
+        mediaStatusText = findViewById(R.id.media_status_text)
+        logScroll = findViewById(R.id.tab_log)
+        logText = findViewById(R.id.log_text)
 
         connectButton.setOnClickListener {
             if (connected) disconnect() else connect()
         }
 
-        findViewById<Button>(R.id.config_button).setOnClickListener {
-            startActivity(Intent(this, ConfigActivity::class.java))
+        logPreviewText.setOnClickListener {
+            bottomNav.selectedItemId = R.id.nav_log
         }
 
-        findViewById<Button>(R.id.log_button).setOnClickListener {
-            startActivity(Intent(this, LogActivity::class.java))
+        val address = prefs.getString("local_address", null) ?: getString(R.string.default_cidr).substringBefore("/")
+        val prefixLength = prefs.getString("prefix_length", null) ?: getString(R.string.default_cidr).substringAfter("/")
+        cidrInput.setText("$address/$prefixLength")
+        configInput.setText(prefs.getString("config", ""))
+
+        findViewById<Button>(R.id.import_config_button).setOnClickListener {
+            loadConfigFile.launch("*/*")
         }
+
+        findViewById<Button>(R.id.load_media_button).setOnClickListener {
+            loadMediaFile.launch("*/*")
+        }
+
+        updateMediaStatus()
+
+        onBackPressedDispatcher.addCallback(this, backToMain)
+
+        bottomNav = findViewById(R.id.bottom_nav)
+        bottomNav.setOnItemSelectedListener { item ->
+            showTab(item.itemId)
+            true
+        }
+        // Setting selectedItemId runs the listener above, which the
+        // BottomNavigationView's own state restore does not.
+        bottomNav.selectedItemId = savedInstanceState?.getInt(STATE_TAB) ?: R.id.nav_main
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putInt(STATE_TAB, currentTab)
     }
 
     override fun onResume() {
@@ -85,11 +201,24 @@ class MainActivity : AppCompatActivity() {
         val state = AnazoaVpnService.engineState(runCatching { TunnelNative.nativeStatus() }.getOrNull())
         setConnected(state != null)
         if (state != null) setStatus(describeState(state))
+        startLogPolling()
     }
 
     override fun onPause() {
         super.onPause()
         stopPolling()
+        handler.removeCallbacks(logTick)
+        if (currentTab == R.id.nav_settings) savePrefs()
+    }
+
+    private fun showTab(id: Int) {
+        if (currentTab == R.id.nav_settings && id != R.id.nav_settings) savePrefs()
+        currentTab = id
+        for ((tabId, view) in tabs) {
+            view.visibility = if (tabId == id) View.VISIBLE else View.GONE
+        }
+        backToMain.isEnabled = id != R.id.nav_main
+        startLogPolling()
     }
 
     private fun connect() {
@@ -157,8 +286,63 @@ class MainActivity : AppCompatActivity() {
         handler.removeCallbacks(statusTick)
     }
 
+    private fun startLogPolling() {
+        handler.removeCallbacks(logTick)
+        if (currentTab != R.id.nav_settings) handler.post(logTick)
+    }
+
     private fun setStatus(text: String) {
         statusText.text = text
+    }
+
+    private fun updateLog() {
+        val log = runCatching { TunnelNative.nativeRecentLog() }.getOrDefault("")
+        if (currentTab == R.id.nav_main) {
+            logPreviewText.text = log.trimEnd().lines().takeLast(LOG_PREVIEW_LINES).joinToString("\n")
+            return
+        }
+
+        // Replacing the text wipes any in-progress selection (the old
+        // Spannable buffer is discarded outright), which is why a copy
+        // gesture kept getting cut off mid-selection. Skip this tick
+        // entirely while text is selected; refresh resumes once it's
+        // cleared (e.g. right after the copy).
+        if (Selection.getSelectionStart(logText.text) != Selection.getSelectionEnd(logText.text)) return
+
+        // Only stick to the bottom if the view was already there. Otherwise
+        // every update — even while the user has scrolled up to read
+        // history — yanks the scroll position back to the end, which is
+        // what read as "scrolls back and forth on itself".
+        val wasAtBottom = !logScroll.canScrollVertically(1)
+        logText.text = log
+        if (wasAtBottom) {
+            logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+        }
+    }
+
+    private fun updateMediaStatus() {
+        val mediaFile = File(filesDir, AnazoaVpnService.MEDIA_FILE_NAME)
+        mediaStatusText.text = if (mediaFile.exists()) {
+            getString(R.string.media_status_loaded, mediaFile.length().let { "%.1f MB".format(it / 1_000_000.0) })
+        } else {
+            getString(R.string.media_status_none)
+        }
+    }
+
+    private fun savePrefs() {
+        val editor = prefs.edit().putString("config", configInput.text.toString())
+
+        val match = cidrRegex.matchEntire(cidrInput.text.toString().trim())
+        if (match != null) {
+            editor.putString("local_address", match.groupValues[1])
+            editor.putString("prefix_length", match.groupValues[2])
+        } else if (cidrInput.text.isNotBlank()) {
+            // Keep whatever was previously saved rather than writing a value
+            // connect() can't parse.
+            Toast.makeText(this, getString(R.string.error_invalid_cidr), Toast.LENGTH_LONG).show()
+        }
+
+        editor.apply()
     }
 
     // Only `in_call` means the tunnel is actually carrying traffic. The

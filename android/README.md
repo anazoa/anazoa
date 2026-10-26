@@ -90,8 +90,8 @@ adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 
 `--test-app` builds `org.anazoa.vpn.test`, labelled **Anazoa test**, with separate
 settings. It can coexist with the release app even when their signing keys
-differ. Import a config and load an `.opus` file with **Load media file…**
-before connecting. Authentication uses the Opus carrier before video starts;
+differ. On the **Settings** tab, import a config and load an `.opus` file with
+**Load media file…** before connecting. Authentication uses the Opus carrier before video starts;
 silence without a media file may provide too little carrier capacity and time
 out before a video encoder is created. Android may ask to approve the test
 app's VPN connection. Only one VPN can be active at a time.

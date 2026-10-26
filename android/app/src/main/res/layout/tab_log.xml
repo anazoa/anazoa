@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Only one scrolling ancestor here (unlike the old nested-ScrollView
      layout on the main screen, which fought itself over scroll position
-     whenever the log text updated). -->
+     whenever the log text updated). No android:id on the root: the
+     <include> in activity_main.xml replaces it with @id/tab_log. -->
 <org.anazoa.vpn.NoAutoScrollScrollView xmlns:android="http://schemas.android.com/apk/res/android"
-    android:id="@+id/log_scroll"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
     android:background="#1a1a1a">

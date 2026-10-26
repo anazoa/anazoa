@@ -16,8 +16,9 @@
     <string name="error_invalid_cidr">Invalid address/prefix, keeping previous value</string>
     <string name="action_connect">Connect</string>
     <string name="action_disconnect">Disconnect</string>
-    <string name="action_config">Config</string>
-    <string name="action_log">Log</string>
+    <string name="tab_main">Main</string>
+    <string name="tab_settings">Settings</string>
+    <string name="tab_log">Log</string>
     <string name="label_media">Audio .opus</string>
     <string name="action_load_media">Load media file…</string>
     <string name="media_status_none">none</string>
