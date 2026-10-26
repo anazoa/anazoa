@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use cxx::{SharedPtr, UniquePtr};
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -548,6 +549,41 @@ pub async fn add_ice_candidate(
     rx.await
         .context("add_ice_candidate callback dropped")?
         .map_err(|e| anyhow!(e))
+}
+
+/// The video sender's encoder figures from a `getStats()` report: the
+/// target bitrate WebRTC gives the encoder (from bandwidth estimation),
+/// the frame rate it actually encodes, and what WebRTC says is limiting
+/// quality ("bandwidth", "cpu" or "none"). Null fields if this libwebrtc
+/// doesn't report them; None until the encoder has produced a frame.
+pub async fn video_send_stats(pc: &SharedPtr<PeerConnection>) -> Result<Option<Value>> {
+    let (tx, rx) = oneshot::channel::<String>();
+    pc.get_stats(Box::new(PeerContext(Box::new(tx))), stats_delivered);
+    let report: Value = serde_json::from_str(&rx.await.context("get_stats callback dropped")?)
+        .context("parse stats report")?;
+    let Some(rtp) = report.as_array().and_then(|stats| {
+        stats
+            .iter()
+            .find(|s| s["type"] == "outbound-rtp" && s["kind"] == "video")
+            .filter(|s| s["framesEncoded"].as_u64().is_some_and(|n| n > 0))
+    }) else {
+        return Ok(None);
+    };
+    Ok(Some(json!({
+        "target_bitrate": rtp["targetBitrate"],
+        "fps": rtp["framesPerSecond"],
+        "frames_encoded": rtp["framesEncoded"],
+        "quality_limitation": rtp["qualityLimitationReason"],
+        "encoder": rtp["encoderImplementation"],
+    })))
+}
+
+#[allow(clippy::boxed_local)]
+fn stats_delivered(ctx: Box<PeerContext>, json: String) {
+    let PeerContext(inner) = *ctx;
+    if let Ok(tx) = inner.downcast::<oneshot::Sender<String>>() {
+        let _ = tx.send(json);
+    }
 }
 
 #[allow(clippy::boxed_local)]

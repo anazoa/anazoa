@@ -35,7 +35,7 @@ use crate::protozoa::vp9::VP9_BLACK_KEYFRAMES;
 use crate::protozoa::webrtc::{
     LocalEvent, Role, VideoCodec, WebrtcCall, add_ice_candidate, attach_existing_remote_tracks,
     create_answer, create_offer, ensure_local_senders, ensure_send_codec, ice_state_name,
-    log_local_senders, pc_state_name, set_local_description, set_remote_sdp,
+    log_local_senders, pc_state_name, set_local_description, set_remote_sdp, video_send_stats,
 };
 use crate::{Config, call_keepalive_loop, shutdown_requested, shutdown_signal, trigger_shutdown};
 use webrtc_sys::jsep::ffi::SdpType;
@@ -357,6 +357,7 @@ async fn drive_call(
                 if let Err(err) = signaling.send_custom_data().await {
                     debug!("custom-data send failed: {err:#}");
                 }
+                refresh_video_send_stats(&call).await;
                 log_tunnel_stats();
             }
 
@@ -432,6 +433,7 @@ pub fn status_json(state: &EngineState) -> Value {
             "peer_id": peer_id,
             "uptime_secs": started_at.elapsed().as_secs(),
             "tunnel_up": tunnel_up(),
+            "video_send": VIDEO_SEND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             "tunnel": tunnel_stats_json(),
         }),
         EngineState::Stopped => json!({"state": "stopped"}),
@@ -455,6 +457,61 @@ static ICE_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// Noise handshake done. `InCall` is published as soon as signaling
 /// connects, and stays through an ICE outage, so on its own it read as
 /// "Connected" while the tunnel was still coming up or already down.
+/// The current call's video sender stats (see `video_send_stats`), refreshed
+/// on the call's 5 s tick and cleared when a call starts and ends.
+static VIDEO_SEND_STATS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+fn set_video_send_stats(stats: Option<Value>) {
+    *VIDEO_SEND_STATS.lock().unwrap_or_else(|e| e.into_inner()) = stats;
+}
+
+/// Refreshes `VIDEO_SEND_STATS`, logging when WebRTC's reason for limiting
+/// video quality changes, or the encoded frame rate falls below (or
+/// recovers to) two thirds of the capture rate. Tunnel capacity follows the
+/// encoder's output, so these tell a slow network from a starved host.
+/// WebRTC's own "cpu" reason isn't enough for the latter: on a starved
+/// host it reported "none" while encoding 11-16 of the 30 frames.
+async fn refresh_video_send_stats(call: &WebrtcCall) {
+    let stats = match tokio::time::timeout(Duration::from_secs(1), video_send_stats(&call.pc)).await
+    {
+        Ok(Ok(Some(stats))) => stats,
+        Ok(Ok(None)) => return,
+        Ok(Err(err)) => {
+            debug!("video sender stats: {err:#}");
+            return;
+        }
+        Err(_) => {
+            debug!("video sender stats timed out");
+            return;
+        }
+    };
+    let starved = |stats: &Value| {
+        stats["fps"]
+            .as_f64()
+            .is_some_and(|fps| fps * 3.0 < VIDEO_FPS as f64 * 2.0)
+    };
+    let mut slot = VIDEO_SEND_STATS.lock().unwrap_or_else(|e| e.into_inner());
+    let changed = slot.as_ref().is_none_or(|prev| {
+        prev["quality_limitation"] != stats["quality_limitation"]
+            || starved(prev) != starved(&stats)
+    });
+    if changed {
+        let line = format!(
+            "video quality limitation: {} (target {} bps, {} of {VIDEO_FPS} fps, encoder {})",
+            stats["quality_limitation"].as_str().unwrap_or("unknown"),
+            stats["target_bitrate"],
+            stats["fps"],
+            stats["encoder"].as_str().unwrap_or("unknown")
+        );
+        if starved(&stats) {
+            warn!("{line}; frames are missing before the encoder, is the host CPU-bound?");
+        } else {
+            info!("{line}");
+        }
+    }
+    *slot = Some(stats);
+}
+
 fn tunnel_up() -> bool {
     ICE_CONNECTED.load(Ordering::Relaxed)
         && tunnel_state().is_none_or(|s| s.authenticated.load(Ordering::Relaxed))
@@ -702,6 +759,7 @@ async fn finish_call(
     let (hangup_tx, hangup_rx) = watch::channel(false);
     let started_at = Instant::now();
     ICE_CONNECTED.store(false, Ordering::Relaxed);
+    set_video_send_stats(None);
     env.status.send_replace(EngineState::InCall {
         peer_id,
         started_at,
@@ -711,6 +769,7 @@ async fn finish_call(
 
     let _ = hangup_tx.send(true);
     ICE_CONNECTED.store(false, Ordering::Relaxed);
+    set_video_send_stats(None);
     teardown_call(signaling, keepalive_stop_tx, keepalive).await;
 
     match call_result {
