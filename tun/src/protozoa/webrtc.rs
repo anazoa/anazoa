@@ -553,7 +553,8 @@ pub async fn add_ice_candidate(
 
 /// The video sender's encoder figures from a `getStats()` report: the
 /// target bitrate WebRTC gives the encoder (from bandwidth estimation),
-/// the frame rate it actually encodes, and what WebRTC says is limiting
+/// the frame rate our source delivers (`source_fps`, before any dropping)
+/// and the rate actually encoded (`fps`), and what WebRTC says is limiting
 /// quality ("bandwidth", "cpu" or "none"). Null fields if this libwebrtc
 /// doesn't report them; None until the encoder has produced a frame.
 pub async fn video_send_stats(pc: &SharedPtr<PeerConnection>) -> Result<Option<Value>> {
@@ -561,16 +562,20 @@ pub async fn video_send_stats(pc: &SharedPtr<PeerConnection>) -> Result<Option<V
     pc.get_stats(Box::new(PeerContext(Box::new(tx))), stats_delivered);
     let report: Value = serde_json::from_str(&rx.await.context("get_stats callback dropped")?)
         .context("parse stats report")?;
-    let Some(rtp) = report.as_array().and_then(|stats| {
-        stats
-            .iter()
-            .find(|s| s["type"] == "outbound-rtp" && s["kind"] == "video")
-            .filter(|s| s["framesEncoded"].as_u64().is_some_and(|n| n > 0))
-    }) else {
+    let stats = report.as_array().map(Vec::as_slice).unwrap_or_default();
+    let Some(rtp) = stats
+        .iter()
+        .find(|s| s["type"] == "outbound-rtp" && s["kind"] == "video")
+        .filter(|s| s["framesEncoded"].as_u64().is_some_and(|n| n > 0))
+    else {
         return Ok(None);
     };
+    let source = stats
+        .iter()
+        .find(|s| s["type"] == "media-source" && s["kind"] == "video");
     Ok(Some(json!({
         "target_bitrate": rtp["targetBitrate"],
+        "source_fps": source.map_or(&Value::Null, |s| &s["framesPerSecond"]),
         "fps": rtp["framesPerSecond"],
         "frames_encoded": rtp["framesEncoded"],
         "quality_limitation": rtp["qualityLimitationReason"],

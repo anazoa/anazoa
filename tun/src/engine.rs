@@ -466,11 +466,14 @@ fn set_video_send_stats(stats: Option<Value>) {
 }
 
 /// Refreshes `VIDEO_SEND_STATS`, logging when WebRTC's reason for limiting
-/// video quality changes, or the encoded frame rate falls below (or
-/// recovers to) two thirds of the capture rate. Tunnel capacity follows the
+/// video quality changes, or the frame rate our source delivers falls below
+/// (or recovers to) two thirds of VIDEO_FPS. Tunnel capacity follows the
 /// encoder's output, so these tell a slow network from a starved host.
 /// WebRTC's own "cpu" reason isn't enough for the latter: on a starved
-/// host it reported "none" while encoding 11-16 of the 30 frames.
+/// host it reported "none" while encoding 11-16 of the 30 frames. The
+/// encoded rate alone isn't either: when the bitrate collapses the encoder
+/// drops frames too (8 of 30 on an idle host as ICE was failing), so only
+/// the source rate counts as starvation.
 async fn refresh_video_send_stats(call: &WebrtcCall) {
     let stats = match tokio::time::timeout(Duration::from_secs(1), video_send_stats(&call.pc)).await
     {
@@ -486,7 +489,7 @@ async fn refresh_video_send_stats(call: &WebrtcCall) {
         }
     };
     let starved = |stats: &Value| {
-        stats["fps"]
+        stats["source_fps"]
             .as_f64()
             .is_some_and(|fps| fps * 3.0 < VIDEO_FPS as f64 * 2.0)
     };
@@ -497,14 +500,15 @@ async fn refresh_video_send_stats(call: &WebrtcCall) {
     });
     if changed {
         let line = format!(
-            "video quality limitation: {} (target {} bps, {} of {VIDEO_FPS} fps, encoder {})",
+            "video quality limitation: {} (target {} bps, {} of {} fps encoded, encoder {})",
             stats["quality_limitation"].as_str().unwrap_or("unknown"),
             stats["target_bitrate"],
             stats["fps"],
+            stats["source_fps"],
             stats["encoder"].as_str().unwrap_or("unknown")
         );
         if starved(&stats) {
-            warn!("{line}; frames are missing before the encoder, is the host CPU-bound?");
+            warn!("{line}; the source delivers under {VIDEO_FPS} fps, is the host CPU-bound?");
         } else {
             info!("{line}");
         }
