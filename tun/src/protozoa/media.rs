@@ -3,11 +3,12 @@ use cxx::SharedPtr;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
+use raylib::prelude::{Color, Image, Rectangle};
 use std::fs::File;
 use std::io::BufReader;
+use std::os::raw::c_int;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use raylib::prelude::{Color, Image, Rectangle};
 use tracing::{debug, info};
 
 use webrtc_sys::video_frame::ffi::{VideoRotation, new_video_frame_builder};
@@ -385,6 +386,41 @@ pub struct RaylibMedia {
     pub frame_count: u64,
     pub width: u32,
     pub height: u32,
+    canvas: Canvas,
+}
+
+/// The frame buffers, kept across frames. Allocating a fresh 3.7 MB RGBA
+/// image, a 3.7 MB copy of it (`get_image_data`) and the I420 output every
+/// frame cost ~1,100 page faults per frame, and the per-pixel float
+/// conversion another 3.7 ms: 5.9 ms per 720p frame, a third of a 1-vCPU
+/// host at 30 fps, while raylib's drawing itself took 0.15 ms.
+struct Canvas {
+    image: Image,
+    i420: Vec<u8>,
+}
+
+// SAFETY: `Image` is only `!Send` because it holds a raw pointer to its
+// pixel buffer, which it owns exclusively (allocated by GenImageColor, freed
+// by UnloadImage on drop). raylib's CPU image functions don't use any global
+// or window state, and the canvas is only ever used through `&mut self`.
+unsafe impl Send for Canvas {}
+
+unsafe extern "C" {
+    /// libyuv's RGBA (its "ABGR", named in little-endian word order) to
+    /// full-range BT.601 I420, the colors the old per-pixel conversion used.
+    /// Linked from the libyuv inside libwebrtc.
+    fn ABGRToJ420(
+        src_abgr: *const u8,
+        src_stride_abgr: c_int,
+        dst_yj: *mut u8,
+        dst_stride_yj: c_int,
+        dst_uj: *mut u8,
+        dst_stride_uj: c_int,
+        dst_vj: *mut u8,
+        dst_stride_vj: c_int,
+        width: c_int,
+        height: c_int,
+    ) -> c_int;
 }
 
 impl RaylibMedia {
@@ -398,6 +434,16 @@ impl RaylibMedia {
             frame_count: 0,
             width: resolution.w32(),
             height: resolution.h32(),
+            canvas: Canvas {
+                // Every frame starts by painting the whole image with the
+                // background, so its initial color never shows.
+                image: Image::gen_image_color(
+                    resolution.w32() as i32,
+                    resolution.h32() as i32,
+                    Color::BLACK,
+                ),
+                i420: vec![0; (resolution.w32() * resolution.h32() * 3 / 2) as usize],
+            },
         })
     }
 
@@ -414,23 +460,16 @@ impl RaylibMedia {
         Ok(samples)
     }
 
-    pub fn next_video_frame(&mut self) -> Result<Vec<u8>> {
+    pub fn next_video_frame(&mut self) -> Result<&[u8]> {
         self.frame_count += 1;
         let w = self.width as f32;
         let h = self.height as f32;
         let cx = self.width as i32 / 2;
         let cy = self.height as i32 / 2;
-
-        let mut canvas = Image::gen_image_color(
-            self.width as i32,
-            self.height as i32,
-            Color {
-                r: 10,
-                g: 10,
-                b: 20,
-                a: 255,
-            },
-        );
+        let Canvas {
+            image: canvas,
+            i420,
+        } = &mut self.canvas;
 
         let bg_pulse = (self.frame_count as f32 * 0.05).sin() * 0.5 + 0.5;
         let bg_color = Color {
@@ -517,45 +556,30 @@ impl RaylibMedia {
             },
         );
 
-        let pixels = canvas.get_image_data();
-        let frame_bytes = (self.width * self.height * 3 / 2) as usize;
-        let mut i420 = vec![0u8; frame_bytes];
-        rgba_to_i420(
-            &pixels,
-            &mut i420,
-            self.width as usize,
-            self.height as usize,
-        );
-
-        Ok(i420)
-    }
-}
-
-fn rgba_to_i420(rgba: &[Color], i420: &mut [u8], width: usize, height: usize) {
-    let y_start = 0;
-    let u_start = width * height;
-    let v_start = u_start + (width * height) / 4;
-
-    for y in 0..height {
-        for x in 0..width {
-            let color = rgba[y * width + x];
-            let r = color.r as f32;
-            let g = color.g as f32;
-            let b = color.b as f32;
-
-            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
-            let luma_u8 = luma.clamp(0.0, 255.0) as u8;
-            i420[y_start + y * width + x] = luma_u8;
-
-            if y % 2 == 0 && x % 2 == 0 {
-                let u: f32 = -0.169 * r - 0.331 * g + 0.500 * b + 128.0;
-                let v: f32 = 0.500 * r - 0.419 * g - 0.081 * b + 128.0;
-
-                let uv_idx = (y / 2) * (width / 2) + (x / 2);
-                i420[u_start + uv_idx] = u.clamp(0.0, 255.0) as u8;
-                i420[v_start + uv_idx] = v.clamp(0.0, 255.0) as u8;
-            }
+        let (width, height) = (self.width as usize, self.height as usize);
+        let (y, chroma) = i420.split_at_mut(width * height);
+        let (u, v) = chroma.split_at_mut(width * height / 4);
+        // SAFETY: the image is width x height R8G8B8A8 (gen_image_color's
+        // format, which drawing never changes) and the planes are sized for
+        // that resolution, with the strides given here.
+        let ret = unsafe {
+            ABGRToJ420(
+                canvas.data() as *const u8,
+                (width * 4) as c_int,
+                y.as_mut_ptr(),
+                width as c_int,
+                u.as_mut_ptr(),
+                (width / 2) as c_int,
+                v.as_mut_ptr(),
+                (width / 2) as c_int,
+                width as c_int,
+                height as c_int,
+            )
+        };
+        if ret != 0 {
+            bail!("ABGRToJ420 failed: {ret}");
         }
+        Ok(i420.as_slice())
     }
 }
 

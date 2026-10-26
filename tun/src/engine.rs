@@ -335,7 +335,7 @@ async fn drive_call(
                         debug!("capturing video frame {}", frame_count);
                     }
                     match media.next_video_frame() {
-                        Ok(frame) => send_i420_video_frame(&call.media.video_source, Some(&frame), env.resolution),
+                        Ok(frame) => send_i420_video_frame(&call.media.video_source, Some(frame), env.resolution),
                         Err(err) => {
                             debug!("raylib video frame failed, sending black: {err:#}");
                             send_i420_video_frame(&call.media.video_source, None, env.resolution)
