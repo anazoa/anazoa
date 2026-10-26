@@ -1,11 +1,11 @@
 diff --git a/webrtc-sys/Cargo.toml b/webrtc-sys/Cargo.toml
-index 0dc40648..1e5c4d51 100644
+index c44d7919..3a767b32 100644
 --- a/webrtc-sys/Cargo.toml
 +++ b/webrtc-sys/Cargo.toml
-@@ -1,28 +1,28 @@
+@@ -1,11 +1,11 @@
  [package]
  name = "webrtc-sys"
- version = "0.3.43"
+ version = "0.3.51"
 -edition.workspace = true
 +edition = "2021"
  homepage = "https://livekit.io"
@@ -17,6 +17,7 @@ index 0dc40648..1e5c4d51 100644
  
  [features]
  default = []
+@@ -17,13 +17,13 @@ mode = "powerset"
  
  [dependencies]
  cxx = "1.0"
@@ -33,13 +34,8 @@ index 0dc40648..1e5c4d51 100644
  pkg-config = "0.3.22"
  
  [target.'cfg(target_os = "linux")'.build-dependencies]
- pkg-config = "0.3.22"
- 
- [dev-dependencies]
--env_logger = { workspace = true }
-+env_logger = "0.11"
 diff --git a/webrtc-sys/build.rs b/webrtc-sys/build.rs
-index 6451740b..beba6d7c 100644
+index 37912530..8580dcfb 100644
 --- a/webrtc-sys/build.rs
 +++ b/webrtc-sys/build.rs
 @@ -23,7 +23,8 @@ fn main() {
@@ -86,7 +82,7 @@ index 6451740b..beba6d7c 100644
                  }
              }
  
-@@ -372,7 +374,13 @@ fn main() {
+@@ -376,7 +378,13 @@ fn main() {
                  .flag("-std=c++20");
          }
          "android" => {
@@ -101,7 +97,7 @@ index 6451740b..beba6d7c 100644
  
              println!("cargo:rustc-link-lib=EGL");
              println!("cargo:rustc-link-lib=OpenSLES");
-@@ -396,6 +404,10 @@ fn main() {
+@@ -400,6 +408,10 @@ fn main() {
      builder.define("LIVEKIT_TEST", None);
      builder.warnings(false).compile("webrtcsys-cxx");
  
@@ -113,13 +109,13 @@ index 6451740b..beba6d7c 100644
          println!("cargo:rerun-if-changed={}", entry.unwrap().display());
      }
 diff --git a/webrtc-sys/build/Cargo.toml b/webrtc-sys/build/Cargo.toml
-index 4e985b52..d3abf22b 100644
+index 824ea986..6927e316 100644
 --- a/webrtc-sys/build/Cargo.toml
 +++ b/webrtc-sys/build/Cargo.toml
 @@ -1,10 +1,10 @@
  [package]
  name = "webrtc-sys-build"
- version = "0.3.19"
+ version = "0.3.21"
 -edition.workspace = true
 -license.workspace = true
 +edition = "2021"
@@ -137,7 +133,7 @@ index 4e985b52..d3abf22b 100644
 -anyhow = { workspace = true }
 +anyhow = "1.0"
 diff --git a/webrtc-sys/build/src/lib.rs b/webrtc-sys/build/src/lib.rs
-index 586b6675..4aeb3a18 100644
+index 4dc7d89a..91200482 100644
 --- a/webrtc-sys/build/src/lib.rs
 +++ b/webrtc-sys/build/src/lib.rs
 @@ -118,12 +118,13 @@ pub fn webrtc_dir() -> path::PathBuf {
@@ -189,7 +185,7 @@ index 586b6675..4aeb3a18 100644
      Ok(())
  }
 diff --git a/webrtc-sys/libwebrtc/.gclient b/webrtc-sys/libwebrtc/.gclient
-index 490388b9..f5f0033b 100644
+index 490388b9..81769ca7 100644
 --- a/webrtc-sys/libwebrtc/.gclient
 +++ b/webrtc-sys/libwebrtc/.gclient
 @@ -1,9 +1,10 @@
@@ -197,20 +193,46 @@ index 490388b9..f5f0033b 100644
    {
      "name": 'src',
 -    "url": 'https://github.com/webrtc-sdk/webrtc.git@m150_release',
-+    "url": 'https://github.com/webrtc-sdk/webrtc.git@030ad13afd0ab7d16c70662e0e793ea1b892c158',
++    "url": 'https://github.com/webrtc-sdk/webrtc.git@a545de45259b47dfac5f3635863e47cb601f1bb2',
      "custom_deps": {},
      "deps_file": "DEPS",
      "managed": False,
    },
  ]
 +target_os = ['android', 'linux']
+diff --git a/webrtc-sys/libwebrtc/build_android.sh b/webrtc-sys/libwebrtc/build_android.sh
+index 6d4323f4..a0c2dce8 100755
+--- a/webrtc-sys/libwebrtc/build_android.sh
++++ b/webrtc-sys/libwebrtc/build_android.sh
+@@ -82,6 +82,12 @@ apply_patch "$COMMAND_DIR/patches/external_audio_source.patch"
+ # livekit prefixed jni
+ apply_patch "$COMMAND_DIR/patches/jni_prefix.patch"
+ 
++# anazoa tunnel hooks into the Opus and video encode/decode paths (matches
++# build_linux.sh). Required for the tunnel to carry a call; VP9 hooks need
++# rtc_libvpx_build_vp9=true below.
++git apply "$COMMAND_DIR/patches/hooks-audio.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++git apply "$COMMAND_DIR/patches/hooks-video.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
++
+ cd third_party/libyuv
+ apply_patch "$COMMAND_DIR/patches/disable_sme_for_libyuv.patch"
+ 
+@@ -106,7 +112,7 @@ args="is_debug=$debug \
+   rtc_include_tests=false \
+   rtc_build_tools=false \
+   rtc_build_examples=false \
+-  rtc_libvpx_build_vp9=false \
++  rtc_libvpx_build_vp9=true \
+   is_component_build=false \
+   enable_stripping=true \
+   rtc_use_h264=false \
 diff --git a/webrtc-sys/libwebrtc/build_linux.sh b/webrtc-sys/libwebrtc/build_linux.sh
-index 417c9b9f..a78bba6a 100755
+index fdfa1302..fa5bf0dd 100755
 --- a/webrtc-sys/libwebrtc/build_linux.sh
 +++ b/webrtc-sys/libwebrtc/build_linux.sh
-@@ -79,6 +79,9 @@ git apply "$COMMAND_DIR/patches/fix_desktop_capture_compile.patch" -v --ignore-s
- git apply "$COMMAND_DIR/patches/external_audio_source.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
- git apply "$COMMAND_DIR/patches/fix_pipewire_utils_compile.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
+@@ -81,6 +81,9 @@ apply_patch "$COMMAND_DIR/patches/fix_desktop_capture_compile.patch"
+ apply_patch "$COMMAND_DIR/patches/external_audio_source.patch"
+ apply_patch "$COMMAND_DIR/patches/fix_pipewire_utils_compile.patch"
  
 +git apply "$COMMAND_DIR/patches/hooks-audio.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
 +git apply "$COMMAND_DIR/patches/hooks-video.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
@@ -218,7 +240,7 @@ index 417c9b9f..a78bba6a 100755
  # Disable CREL (compact relocations). Chromium's build enables experimental
  # CREL via -Wa,--crel which causes segfaults on aarch64-linux (and is known
  # broken on arm32 and s390x too).
-@@ -136,12 +139,12 @@ args="is_debug=$debug  \
+@@ -138,12 +141,12 @@ args="is_debug=$debug  \
    enable_stripping=true \
    ffmpeg_branding=\"Chrome\" \
    rtc_use_h264=true \
@@ -234,7 +256,7 @@ index 417c9b9f..a78bba6a 100755
  
  # generate ninja files
  gn gen "$OUTPUT_DIR" --root="src" --args="${args}"
-@@ -209,7 +212,7 @@ vpython3 "./src/tools_webrtc/libs/generate_licenses.py" \
+@@ -228,7 +231,7 @@ vpython3 "./src/tools_webrtc/libs/generate_licenses.py" \
    --target :default "$OUTPUT_DIR" "$OUTPUT_DIR" || echo "Warning: License generation failed (non-critical)"
  
  cp "$OUTPUT_DIR/obj/webrtc.ninja" "$ARTIFACTS_DIR"
@@ -243,29 +265,3 @@ index 417c9b9f..a78bba6a 100755
  cp "$OUTPUT_DIR/args.gn" "$ARTIFACTS_DIR"
  
  cp "$OUTPUT_DIR/LICENSE.md" "$ARTIFACTS_DIR"
-diff --git a/webrtc-sys/libwebrtc/build_android.sh b/webrtc-sys/libwebrtc/build_android.sh
-index d8ef3131..e4b9c74d 100755
---- a/webrtc-sys/libwebrtc/build_android.sh
-+++ b/webrtc-sys/libwebrtc/build_android.sh
-@@ -80,6 +80,12 @@ git apply "$COMMAND_DIR/patches/external_audio_source.patch" -v --ignore-space-c
- # livekit prefixed jni
- git apply "$COMMAND_DIR/patches/jni_prefix.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
- 
-+# anazoa tunnel hooks into the Opus and video encode/decode paths (matches
-+# build_linux.sh). Required for the tunnel to carry a call; VP9 hooks need
-+# rtc_libvpx_build_vp9=true below.
-+git apply "$COMMAND_DIR/patches/hooks-audio.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
-+git apply "$COMMAND_DIR/patches/hooks-video.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
-+
- cd third_party/libyuv
- git apply "$COMMAND_DIR/patches/disable_sme_for_libyuv.patch" -v --ignore-space-change --ignore-whitespace --whitespace=nowarn
- 
-@@ -104,7 +110,7 @@ args="is_debug=$debug \
-   rtc_include_tests=false \
-   rtc_build_tools=false \
-   rtc_build_examples=false \
--  rtc_libvpx_build_vp9=false \
-+  rtc_libvpx_build_vp9=true \
-   is_component_build=false \
-   enable_stripping=true \
-   rtc_use_h264=false \
