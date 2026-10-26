@@ -19,12 +19,13 @@
 //!  * SPS (7) / PPS (8) NALs pass through untouched — the depacketizer parses
 //!    them and they carry the real picture size.
 //!  * Every slice NAL (1 non-IDR, 5 IDR) keeps its header byte and length; its
-//!    body becomes `[SLICE_PREFIX][u16 chunk_len][whitened tunnel bytes]`,
-//!    emulation-prevention encoded, `0xFF`-padded to the original length.
+//!    body becomes `[SLICE_PREFIX] COBS([u16 chunk_len][tunnel bytes])`,
+//!    `0xFF`-padded to the original length.  COBS output has no zero bytes,
+//!    so no start code or emulation-prevention sequence can appear in it.
 //!    `SLICE_PREFIX` decodes as `first_mb_in_slice=0, slice_type=5,
 //!    pic_parameter_set_id=0` so `PpsParser::ParseSliceHeader` succeeds and the
 //!    frame is delimited correctly.
-//!  * SEI (6) NALs carry `[u16 chunk_len][whitened tunnel bytes]` with no
+//!  * SEI (6) NALs carry `COBS([u16 chunk_len][tunnel bytes])` with no
 //!    prefix (the depacketizer does not parse SEI bodies).
 //!
 //! ## Receive side — [`unpack_carrier`] + [`H264Replayer`]
@@ -52,8 +53,7 @@ const SLICE_PREFIX: [u8; 1] = [0x9A];
 const CHUNK_LEN_BYTES: usize = 2;
 
 /// Byte used to pad a rewritten NAL body back up to its original length after
-/// emulation-prevention encoding.  `0xFF` never participates in a start-code or
-/// emulation-prevention sequence.
+/// COBS encoding.  Nonzero, so it never participates in a start code.
 const PAD_BYTE: u8 = 0xFF;
 
 // H.264 NAL unit types we care about.
@@ -125,6 +125,7 @@ fn scan_nals(buf: &[u8]) -> Vec<NalSpan> {
 // ---------------------------------------------------------------------------
 
 /// Insert emulation-prevention bytes: `00 00 {00,01,02,03}` → `00 00 03 {..}`.
+#[cfg(test)]
 fn epb_encode(src: &[u8], out: &mut Vec<u8>) {
     let mut zeros = 0usize;
     for &b in src {
@@ -137,7 +138,7 @@ fn epb_encode(src: &[u8], out: &mut Vec<u8>) {
     }
 }
 
-/// Remove emulation-prevention bytes inserted by [`epb_encode`].
+/// Remove emulation-prevention bytes, as found in real encoder SPS NALs.
 fn epb_decode(src: &[u8], out: &mut Vec<u8>) {
     let mut zeros = 0usize;
     let mut i = 0usize;
@@ -171,37 +172,54 @@ fn epb_encoded_len(src: &[u8]) -> usize {
 }
 
 // ---------------------------------------------------------------------------
-// Whitening — a fixed keystream so tunnel bytes rarely collide with 00 00 0x
-// and EPB expansion stays negligible.  Not a security boundary (SRTP already
-// encrypts the wire); purely to keep the sender's own NAL scan well-formed.
+// COBS — consistent overhead byte stuffing.  Removes every zero byte, so tunnel
+// bytes can never form a start code, at a worst case of 1 byte per 254.
 // ---------------------------------------------------------------------------
 
-/// Deterministic xorshift32 keystream, fixed seed.  Both peers iterate NALs in
-/// the same order and advance this by the same number of bytes per NAL, so the
-/// stream stays in lock-step without any framing.
-#[derive(Clone)]
-struct Keystream {
-    state: u32,
-}
-
-impl Keystream {
-    fn new() -> Self {
-        Self { state: 0x9E37_79B9 }
-    }
-    #[inline]
-    fn next_byte(&mut self) -> u8 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 17;
-        x ^= x << 5;
-        self.state = x;
-        (x & 0xFF) as u8
-    }
-    fn apply(&mut self, buf: &mut [u8]) {
-        for b in buf.iter_mut() {
-            *b ^= self.next_byte();
+/// Encode `src` with no zero bytes: each block is a code byte `n` followed by
+/// `n - 1` nonzero bytes and an implied zero, except `n == 0xFF` (no zero).
+fn cobs_encode(src: &[u8], out: &mut Vec<u8>) {
+    let mut code_pos = out.len();
+    out.push(0);
+    let mut code = 1u8;
+    for &b in src {
+        if b != 0 {
+            out.push(b);
+            code += 1;
+        }
+        if b == 0 || code == 0xFF {
+            out[code_pos] = code;
+            code_pos = out.len();
+            out.push(0);
+            code = 1;
         }
     }
+    out[code_pos] = code;
+}
+
+/// Largest COBS output for `n` input bytes (no zeros to absorb a code byte).
+fn cobs_max_len(n: usize) -> usize {
+    n + 1 + n / 254
+}
+
+/// Decode the first `want` bytes of a [`cobs_encode`] output, ignoring
+/// whatever follows (padding).  `None` if `src` is malformed or too short.
+fn cobs_decode_prefix(src: &[u8], want: usize) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(want + 1);
+    let mut i = 0usize;
+    while out.len() < want {
+        let code = *src.get(i)? as usize;
+        if code == 0 {
+            return None;
+        }
+        out.extend_from_slice(src.get(i + 1..i + code)?);
+        i += code;
+        if code != 0xFF {
+            out.push(0);
+        }
+    }
+    out.truncate(want);
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -230,15 +248,14 @@ fn plan_rewrites(buf: &[u8], nals: &[NalSpan]) -> Vec<RewritePlan> {
             _ => continue,
         };
         let body = n.body();
-        let body_len = body.len();
-        // Escaping can add one byte per two input bytes. Reserve that worst
-        // case, plus a nonzero terminator so a following 3-byte start code
-        // cannot absorb the end of this NAL. The length field is only u16.
-        let escaped_budget = body_len.saturating_sub(1);
-        let raw_budget = escaped_budget - escaped_budget.div_ceil(3);
-        let capacity = raw_budget
-            .saturating_sub(prefix_len + CHUNK_LEN_BYTES)
-            .min(u16::MAX as usize);
+        // Largest raw length whose worst-case COBS encoding fits after the
+        // prefix.  The length field is only u16.
+        let region = body.len().saturating_sub(prefix_len);
+        let mut raw = (region * 254 / 255).saturating_sub(1);
+        while cobs_max_len(raw + 1) <= region {
+            raw += 1;
+        }
+        let capacity = raw.saturating_sub(CHUNK_LEN_BYTES).min(u16::MAX as usize);
         if capacity == 0 {
             continue;
         }
@@ -269,24 +286,21 @@ pub fn carrier_capacity(encoder_output: &[u8]) -> usize {
 pub fn pack_carrier(buf: &mut [u8], tunnel: &[u8]) -> usize {
     let nals = scan_nals(buf);
     let plans = plan_rewrites(buf, &nals);
-    let mut ks = Keystream::new();
     let mut written = 0usize;
+    let mut raw = Vec::new();
 
     for plan in &plans {
         let body_len = plan.body.len();
         let take = (tunnel.len() - written).min(plan.capacity);
 
-        // [prefix][len u16 LE][chunk]; whiten everything after the prefix so the
-        // keystream advances by exactly CHUNK_LEN_BYTES + take on both peers.
-        let mut raw = Vec::with_capacity(plan.prefix_len + CHUNK_LEN_BYTES + take);
-        raw.extend_from_slice(&SLICE_PREFIX[..plan.prefix_len]);
+        // [prefix] COBS([len u16 LE][chunk]) [padding]
+        raw.clear();
         raw.extend_from_slice(&(take as u16).to_le_bytes());
         raw.extend_from_slice(&tunnel[written..written + take]);
-        ks.apply(&mut raw[plan.prefix_len..]);
-
         let mut enc = Vec::with_capacity(body_len);
-        epb_encode(&raw, &mut enc);
-        debug_assert!(enc.len() < body_len);
+        enc.extend_from_slice(&SLICE_PREFIX[..plan.prefix_len]);
+        cobs_encode(&raw, &mut enc);
+        debug_assert!(enc.len() <= body_len);
         enc.resize(body_len, PAD_BYTE);
         buf[plan.body.clone()].copy_from_slice(&enc);
         written += take;
@@ -299,28 +313,22 @@ pub fn pack_carrier(buf: &mut [u8], tunnel: &[u8]) -> usize {
 /// peer's [`pack_carrier`].
 pub fn unpack_carrier(buf: &[u8]) -> Vec<u8> {
     let nals = scan_nals(buf);
-    let mut ks = Keystream::new();
     let mut out = Vec::new();
 
     for plan in plan_rewrites(buf, &nals) {
-        let prefix_len = plan.prefix_len;
-        let body = &buf[plan.body];
-        let mut dec = Vec::with_capacity(body.len());
-        epb_decode(body, &mut dec);
-        if dec.len() < prefix_len + CHUNK_LEN_BYTES {
-            continue;
-        }
-        // Whitened region starts after the prefix.  De-whiten the u16 length
-        // first, then exactly that many chunk bytes; the keystream advances by
-        // CHUNK_LEN_BYTES + len, matching the sender.
-        let mut region = dec[prefix_len..].to_vec();
-        ks.apply(&mut region[..CHUNK_LEN_BYTES]);
-        let len = u16::from_le_bytes([region[0], region[1]]) as usize;
-        if len > region.len() - CHUNK_LEN_BYTES {
+        let region = &buf[plan.body][plan.prefix_len..];
+        // Decode the u16 length first, then exactly that many chunk bytes.
+        let Some(head) = cobs_decode_prefix(region, CHUNK_LEN_BYTES) else {
+            return Vec::new();
+        };
+        let len = u16::from_le_bytes([head[0], head[1]]) as usize;
+        if len > plan.capacity {
             return Vec::new();
         }
-        ks.apply(&mut region[CHUNK_LEN_BYTES..CHUNK_LEN_BYTES + len]);
-        out.extend_from_slice(&region[CHUNK_LEN_BYTES..CHUNK_LEN_BYTES + len]);
+        let Some(chunk) = cobs_decode_prefix(region, CHUNK_LEN_BYTES + len) else {
+            return Vec::new();
+        };
+        out.extend_from_slice(&chunk[CHUNK_LEN_BYTES..]);
     }
     out
 }
@@ -591,7 +599,7 @@ mod tests {
     }
 
     #[test]
-    fn carrier_small_nals_keep_both_keystreams_aligned() {
+    fn carrier_small_nals_round_trip() {
         for header in [0x41, 0x06] {
             for small_len in 0..64 {
                 let mut frame = Vec::new();
@@ -620,34 +628,88 @@ mod tests {
         assert_eq!(unpack_carrier(&frame), payload);
     }
 
+    /// Body bytes after the NAL header, between start codes.
+    fn nal_bodies(frame: &[u8]) -> Vec<&[u8]> {
+        scan_nals(frame).iter().map(|n| &frame[n.body()]).collect()
+    }
+
     #[test]
-    fn advertised_capacity_fits_maximal_epb_expansion_and_a_terminator() {
+    fn advertised_capacity_is_exact_for_worst_case_cobs() {
         for body_len in 0..2048 {
             let mut frame = Vec::new();
             append_test_nal(&mut frame, &START_CODE, 0x41, body_len);
-            let first_capacity = carrier_capacity(&frame);
-            append_test_nal(&mut frame, &[0, 0, 1], 0x41, 1024);
-            let mut payload = vec![0x5a; carrier_capacity(&frame)];
-            // Cancel whitening so the first NAL's entire payload is zero:
-            // escaping must handle its worst case, including a trailing zero.
-            let mut ks = Keystream::new();
-            ks.apply(&mut [0; CHUNK_LEN_BYTES]);
-            payload[..first_capacity].fill(0);
-            ks.apply(&mut payload[..first_capacity]);
-            let original_len = frame.len();
-            assert_eq!(
-                pack_carrier(&mut frame, &payload),
-                payload.len(),
-                "body {body_len}"
-            );
-            assert_eq!(frame.len(), original_len);
-            let nals = scan_nals(&frame);
-            assert_eq!(nals.len(), 2);
-            if first_capacity > 0 {
-                assert_eq!(frame[nals[0].end - 1], PAD_BYTE);
+            let capacity = carrier_capacity(&frame);
+            let region = body_len.saturating_sub(SLICE_PREFIX.len());
+            // Tight: one more byte might not fit.
+            if capacity > 0 {
+                assert!(cobs_max_len(CHUNK_LEN_BYTES + capacity) <= region);
+                assert!(cobs_max_len(CHUNK_LEN_BYTES + capacity + 1) > region);
             }
-            assert_eq!(unpack_carrier(&frame), payload, "body {body_len}");
+            append_test_nal(&mut frame, &[0, 0, 1], 0x41, 1024);
+            // No zeros anywhere is the worst case; all zeros is the other extreme.
+            for fill in [0x5a, 0x00] {
+                let mut f = frame.clone();
+                let payload = vec![fill; carrier_capacity(&f)];
+                assert_eq!(pack_carrier(&mut f, &payload), payload.len());
+                assert_eq!(f.len(), frame.len());
+                let bodies = nal_bodies(&f);
+                assert_eq!(bodies.len(), 2);
+                if capacity > 0 {
+                    assert!(!bodies[0].contains(&0), "body {body_len}");
+                }
+                assert_eq!(unpack_carrier(&f), payload, "body {body_len}");
+            }
         }
+    }
+
+    #[test]
+    fn carrier_rejects_malformed_cobs() {
+        let mut frame = Vec::new();
+        append_test_nal(&mut frame, &START_CODE, 0x41, 64);
+        let payload = vec![7; 20];
+        assert_eq!(pack_carrier(&mut frame, &payload), payload.len());
+        let mut zero_code = frame.clone();
+        zero_code[START_CODE.len() + 2] = 0;
+        assert!(unpack_carrier(&zero_code).is_empty());
+        let mut overrun = frame.clone();
+        overrun[START_CODE.len() + 2] = 0xFE;
+        assert!(unpack_carrier(&overrun).is_empty());
+    }
+
+    #[test]
+    fn cobs_round_trips() {
+        let long: Vec<u8> = (0..600).map(|i| (i % 255 + 1) as u8).collect();
+        let mut mixed = long.clone();
+        mixed[253] = 0;
+        mixed[254] = 0;
+        let cases: &[(&[u8], &[u8])] = &[
+            (&[], &[1]),
+            (&[0], &[1, 1]),
+            (&[0x11, 0x22, 0, 0x33], &[3, 0x11, 0x22, 2, 0x33]),
+            (
+                &[0x11, 0x22, 0, 0x33, 0x44, 0x55, 0, 0x66],
+                &[3, 0x11, 0x22, 4, 0x33, 0x44, 0x55, 2, 0x66],
+            ),
+            (&long, &[]),
+            (&long[..254], &[]),
+            (&mixed, &[]),
+            (&[0; 300], &[]),
+        ];
+        for &(src, want) in cases {
+            let mut enc = Vec::new();
+            cobs_encode(src, &mut enc);
+            if !want.is_empty() {
+                assert_eq!(enc, want);
+            }
+            assert!(!enc.contains(&0), "{src:?}");
+            assert!(enc.len() <= cobs_max_len(src.len()));
+            // Trailing padding is ignored.
+            enc.extend_from_slice(&[PAD_BYTE; 300]);
+            assert_eq!(cobs_decode_prefix(&enc, src.len()).as_deref(), Some(src));
+        }
+        let mut enc = Vec::new();
+        cobs_encode(&long, &mut enc);
+        assert_eq!(enc.len(), cobs_max_len(long.len()));
     }
 
     fn test_sps(
