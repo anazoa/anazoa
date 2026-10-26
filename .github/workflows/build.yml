@@ -1,6 +1,13 @@
 name: Build
 
+# Pushes to main keep libwebrtc cached in main's scope, which tag runs can
+# also read (caches are scoped to the run's ref, with the default branch as
+# fallback). Push main before tagging after a livekit or patches/ change, or
+# both runs miss the cache and build libwebrtc in parallel.
 on:
+    push:
+        branches: [main]
+        tags: ["v*"]
     workflow_dispatch:
 
 env:
