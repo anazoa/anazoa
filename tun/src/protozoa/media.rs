@@ -7,6 +7,7 @@ use std::fs::File;
 use std::io::BufReader;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use raylib::prelude::{Color, Image, Rectangle};
 use tracing::{debug, info};
 
 use webrtc_sys::video_frame::ffi::{VideoRotation, new_video_frame_builder};
@@ -15,7 +16,6 @@ use webrtc_sys::video_frame_buffer::ffi::{
 };
 use webrtc_sys::video_track::ffi::{FrameMetadata, VideoTrackSource};
 
-use super::raylib::{Canvas, Color};
 use super::resolution::Resolution;
 use super::tunnel::tunnel_state;
 
@@ -421,7 +421,7 @@ impl RaylibMedia {
         let cx = self.width as i32 / 2;
         let cy = self.height as i32 / 2;
 
-        let mut canvas = Canvas::new(
+        let mut canvas = Image::gen_image_color(
             self.width as i32,
             self.height as i32,
             Color {
@@ -439,13 +439,15 @@ impl RaylibMedia {
             b: (40.0 + bg_pulse * 40.0) as u8,
             a: 255,
         };
-        canvas.rect(0, 0, self.width as i32, self.height as i32, bg_color);
+        canvas.draw_rectangle(0, 0, self.width as i32, self.height as i32, bg_color);
 
-        canvas.rect_outline(
-            20,
-            20,
-            (self.width - 40) as i32,
-            (self.height - 40) as i32,
+        canvas.draw_rectangle_lines(
+            Rectangle {
+                x: 20.0,
+                y: 20.0,
+                width: (self.width - 40) as f32,
+                height: (self.height - 40) as f32,
+            },
             2,
             Color {
                 r: 100,
@@ -465,8 +467,8 @@ impl RaylibMedia {
             a: 255,
         };
 
-        canvas.circle(cx, cy, pulse_radius as i32, circle_color);
-        canvas.circle_outline(
+        canvas.draw_circle(cx, cy, pulse_radius as i32, circle_color);
+        canvas.draw_circle_lines(
             cx,
             cy,
             (pulse_radius + 5.0) as i32,
@@ -485,7 +487,7 @@ impl RaylibMedia {
         for i in 0..10i32 {
             let bar_h = (self.smoothed_rms * h * 200.0 / 360.0 * (1.0 + (i as f32 * 0.2).sin()))
                 .max(5.0) as i32;
-            canvas.rect(
+            canvas.draw_rectangle(
                 bar_x0 + i * bar_spacing,
                 wave_y - bar_h,
                 bar_width,
@@ -503,7 +505,7 @@ impl RaylibMedia {
         let orbit_x = cx + (orbit_angle.cos() * w * 200.0 / 640.0) as i32;
         let orbit_y = cy + (orbit_angle.sin() * h * 80.0 / 360.0) as i32;
         let orbit_r = (h * 25.0 / 360.0).max(5.0) as i32;
-        canvas.circle(
+        canvas.draw_circle(
             orbit_x,
             orbit_y,
             orbit_r,
@@ -515,7 +517,7 @@ impl RaylibMedia {
             },
         );
 
-        let pixels = canvas.rgba_pixels();
+        let pixels = canvas.get_image_data();
         let frame_bytes = (self.width * self.height * 3 / 2) as usize;
         let mut i420 = vec![0u8; frame_bytes];
         rgba_to_i420(

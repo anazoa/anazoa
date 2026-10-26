@@ -24,8 +24,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 tun-rs = { version = "2", features = ["async"] }
 
-# For raylib
 cxx = "1"
+
+# Windowless CPU drawing for the synthetic video frames
+raylib = { version = "6.0.0", default-features = false, features = [
+    "software_renderer",
+    "SUPPORT_MODULE_RSHAPES",
+    "SUPPORT_MODULE_RTEXTURES",
+    "SUPPORT_IMAGE_GENERATION",
+] }
 
 # For Noise authentication
 base64 = "0.23"
@@ -46,6 +53,6 @@ jni = "0.21"
 # build.rs's own source evaluates against the *host* it's compiled on, not
 # the crate's target, so gating the dependency that way would leave no
 # correct way to reference it from build.rs. Runtime-branch on the `TARGET`
-# env var (as build.rs already does for raylib's cross-compile args) instead.
+# env var (as build.rs already does for configure_jni_symbols) instead.
 [build-dependencies]
 webrtc-sys-build = { path = "../livekit/webrtc-sys/build" }

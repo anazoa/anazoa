@@ -51,6 +51,9 @@ if [ "$skip_rust" = 0 ]; then
     fi
 
     export ANDROID_NDK_HOME
+    # raylib-sys builds raylib through CMake's built-in Android support, which
+    # finds the NDK via ANDROID_NDK_ROOT (it ignores ANDROID_NDK_HOME).
+    export ANDROID_NDK_ROOT="$ANDROID_NDK_HOME"
     export LK_CUSTOM_WEBRTC="$REPO_ROOT/livekit/webrtc-sys/libwebrtc/android-arm64-release"
     export PATH="$TOOLCHAIN/bin:$PATH"
     export CC_aarch64_linux_android="$TOOLCHAIN/bin/aarch64-linux-android23-clang"
