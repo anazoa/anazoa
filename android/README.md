@@ -64,6 +64,25 @@ release key. Uninstalling normally deletes app data. Later releases signed
 with that same key can update in place. Local debug builds also require a
 reinstall when switching between debug and release signing identities.
 
+## Emulator
+
+`scripts/android-emulator.sh` runs a headless API 34 x86_64 emulator; its
+built-in ARM translation runs the arm64-only APK. Install the SDK packages
+once, then start it in the background:
+
+```sh
+.scratch/android-sdk/cmdline-tools/latest/bin/sdkmanager \
+  "emulator" "system-images;android-34;google_apis;x86_64"
+systemd-run --user --collect --unit=anazoa-emulator --working-directory="$PWD" \
+  scripts/android-emulator.sh --lan 192.168.1.7
+adb install -r android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+`--lan ADDR` relays the emulator's adb port to `ADDR:5555`, so another host
+can run `adb connect ADDR:5555` and `scrcpy -s ADDR:5555`. The emulator's adb
+has no authentication: anyone who can reach that port controls the emulator.
+Stop it with `systemctl --user stop anazoa-emulator`.
+
 ## Testing H.264 on a phone
 
 Android's encoder and decoder factories already prefer hardware MediaCodec
