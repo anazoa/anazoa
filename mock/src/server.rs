@@ -32,6 +32,9 @@ const CALLER_PARTICIPANT_ID: i64 = 2;
 pub(crate) const CALLTAKER_EXTERNAL_ID: &str = "1001";
 const CALLER_EXTERNAL_ID: &str = "1002";
 const MOCK_SIGNALING_TOKEN: &str = "mock-token";
+/// How long a pair stays open after one peer leaves, for the other to
+/// read `hungup` and close.
+const PEER_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 const MOCK_ONEME_VERSION: u8 = 10;
 const MOCK_ONEME_CMD_EVENT: u8 = 0;
 const MOCK_ONEME_CMD_SUCCESS: u8 = 1;
@@ -559,7 +562,11 @@ async fn run_mock_signaling_server(listen: &str) -> Result<()> {
             "Mock signaling paired conversation={}",
             calltaker.conversation_id
         );
-        run_pair(calltaker, caller).await?;
+        // One broken conversation mustn't take the server down for the
+        // next (the reconnect test places several calls).
+        if let Err(err) = run_pair(calltaker, caller).await {
+            tracing::warn!("mock signaling conversation ended: {err:#}");
+        }
     }
 }
 
@@ -730,25 +737,48 @@ async fn run_pair(calltaker: PeerConn, caller: PeerConn) -> Result<()> {
     loop {
         tokio::select! {
             msg = calltaker_rx.recv() => {
-                match msg.transpose()?.flatten() {
-                    Some(value) => handle_message(PeerRole::Calltaker, value, &mut calltaker.send, &mut caller.send).await?,
-                    None => {
-                        send_json(&mut caller.send, hangup_notification()).await?;
-                        return Ok(());
-                    }
+                if !relay(PeerRole::Calltaker, msg, &mut calltaker.send, &mut caller.send).await? {
+                    return finish_pair(&mut caller.send, &mut caller_rx).await;
                 }
             }
             msg = caller_rx.recv() => {
-                match msg.transpose()?.flatten() {
-                    Some(value) => handle_message(PeerRole::Caller, value, &mut caller.send, &mut calltaker.send).await?,
-                    None => {
-                        send_json(&mut calltaker.send, hangup_notification()).await?;
-                        return Ok(());
-                    }
+                if !relay(PeerRole::Caller, msg, &mut caller.send, &mut calltaker.send).await? {
+                    return finish_pair(&mut calltaker.send, &mut calltaker_rx).await;
                 }
             }
         }
     }
+}
+
+/// Handles one message from a peer. Returns false once that peer has left:
+/// it hung up, closed its stream, or its stream failed.
+async fn relay(
+    role: PeerRole,
+    msg: Option<Result<Option<Value>>>,
+    sender: &mut wtransport::SendStream,
+    other: &mut wtransport::SendStream,
+) -> Result<bool> {
+    match msg {
+        Some(Ok(Some(value))) => handle_message(role, value, sender, other).await,
+        Some(Err(err)) => {
+            tracing::debug!("mock signaling {role:?} stream failed: {err:#}");
+            Ok(false)
+        }
+        Some(Ok(None)) | None => Ok(false),
+    }
+}
+
+/// One peer left: sends the other `hungup`, then waits (bounded) for it to
+/// close its side. Returning straight away dropped both connections, and
+/// the QUIC close could discard the `hungup` still in flight.
+async fn finish_pair(
+    send: &mut wtransport::SendStream,
+    rx: &mut mpsc::Receiver<Result<Option<Value>>>,
+) -> Result<()> {
+    send_json(send, hangup_notification()).await?;
+    let drain = async { while let Some(Ok(Some(_))) = rx.recv().await {} };
+    let _ = tokio::time::timeout(PEER_CLOSE_TIMEOUT, drain).await;
+    Ok(())
 }
 
 /// Owns `recv` on a task, forwarding each decoded message. Stops after the
@@ -785,14 +815,15 @@ async fn read_client_message(recv: &mut wtransport::RecvStream) -> Result<Option
     Ok(Some(value))
 }
 
+/// Answers or relays one message. Returns false once the sender hung up.
 async fn handle_message(
     sender_role: PeerRole,
     msg: Value,
     sender: &mut wtransport::SendStream,
     other: &mut wtransport::SendStream,
-) -> Result<()> {
+) -> Result<bool> {
     if msg.get("__ping__").is_some() || msg.as_object().is_some_and(|o| o.is_empty()) {
-        return Ok(());
+        return Ok(true);
     }
     let command = msg
         .get("command")
@@ -835,11 +866,11 @@ async fn handle_message(
         }
         "hangup" => {
             send_json(sender, response(command, sequence, json!({}))).await?;
-            send_json(other, hangup_notification()).await?;
+            return Ok(false);
         }
         other_command => bail!("unsupported mock signaling command: {other_command}"),
     }
-    Ok(())
+    Ok(true)
 }
 
 fn connection_notification(conversation_id: &str) -> Value {
