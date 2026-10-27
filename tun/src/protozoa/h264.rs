@@ -64,6 +64,30 @@ const NAL_SPS: u8 = 7;
 #[cfg(test)]
 const NAL_PPS: u8 = 8;
 
+/// `profile_idc` of the Baseline profile (H.264 Table A-1).
+const PROFILE_IDC_BASELINE: u8 = 0x42;
+/// constraint_set1_flag in the byte after `profile_idc`: set on a Baseline
+/// stream, it makes it Constrained Baseline.
+const CONSTRAINT_SET1_FLAG: u8 = 0x40;
+/// The low bits of that byte, reserved and zero in a valid profile-level-id.
+const CONSTRAINT_RESERVED_MASK: u8 = 0x0F;
+
+/// Whether an SDP `profile-level-id` (e.g. `42e01f`: profile_idc, constraint
+/// flags, level_idc) is Constrained Baseline: Baseline with constraint_set1,
+/// as WebRTC's own profile-level-id parser decides it.
+pub fn is_constrained_baseline(profile_level_id: &str) -> bool {
+    let Ok(id) = u32::from_str_radix(profile_level_id, 16) else {
+        return false;
+    };
+    if profile_level_id.len() != 6 {
+        return false;
+    }
+    let [_, profile_idc, constraints, _] = id.to_be_bytes();
+    profile_idc == PROFILE_IDC_BASELINE
+        && constraints & CONSTRAINT_SET1_FLAG != 0
+        && constraints & CONSTRAINT_RESERVED_MASK == 0
+}
+
 #[inline]
 fn nal_type(header: u8) -> u8 {
     header & 0x1F
@@ -674,6 +698,19 @@ mod tests {
         let mut overrun = frame.clone();
         overrun[START_CODE.len() + 2] = 0xFE;
         assert!(unpack_carrier(&overrun).is_empty());
+    }
+
+    #[test]
+    fn constrained_baseline_follows_constraint_set1() {
+        for id in ["42e01f", "42E01F", "42c01f", "424015", "42f00b"] {
+            assert!(is_constrained_baseline(id), "{id}");
+        }
+        // Plain Baseline, Main, reserved bits set, malformed.
+        for id in [
+            "42001f", "42801f", "4d001f", "4d401f", "42e11f", "42e0", "42e01f0", "zze01f", "",
+        ] {
+            assert!(!is_constrained_baseline(id), "{id}");
+        }
     }
 
     #[test]

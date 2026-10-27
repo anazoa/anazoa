@@ -39,6 +39,7 @@ use webrtc_sys::video_track::ffi::{
 };
 use webrtc_sys::webrtc::ffi::{MediaType, RtpTransceiverDirection};
 
+use super::h264;
 use super::media::{AUDIO_CHANNELS, AUDIO_SAMPLE_RATE};
 use super::tunnel::tunnel_state;
 
@@ -358,6 +359,26 @@ pub fn prefer_codec(
         // Fail loudly here rather than letting the call connect and then die
         // later with an unrelated-looking Noise handshake timeout.
         return Err(anyhow!("codec {name} not found in libwebrtc capabilities"));
+    }
+    if VideoCodec::parse(name) == Some(VideoCodec::H264) {
+        // Hardware encoders (Android MediaCodec) only offer Constrained
+        // Baseline, but OpenH264 lists plain Baseline first, and livekit
+        // only picks a hardware encoder for the exact profile negotiated.
+        // Every H264 encoder here supports Constrained Baseline, so lead
+        // with it (packetization-mode 1 first, as both list it).
+        selected.sort_by_key(|codec| {
+            let param = |key: &str| {
+                codec
+                    .parameters
+                    .iter()
+                    .find(|p| p.key == key)
+                    .map(|p| p.value.to_ascii_lowercase())
+            };
+            let constrained_baseline =
+                param("profile-level-id").is_some_and(|id| h264::is_constrained_baseline(&id));
+            let mode_1 = param("packetization-mode").as_deref() == Some("1");
+            (!constrained_baseline, !mode_1)
+        });
     }
     // Video is a caller request, not a preference that the answerer can
     // silently replace. Retain repair codecs, but exclude other video codecs.
