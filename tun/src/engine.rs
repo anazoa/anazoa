@@ -836,11 +836,14 @@ async fn finish_call(
     }
 }
 
+/// Returns true once the call got as far as `finish_call`, whose teardown
+/// hangs the conversation up. A failed or abandoned signaling connect sends
+/// no hangup, so that conversation may still be ringing and is answerable.
 async fn run_incoming_call(
     oneme: Arc<Mutex<SessionClient>>,
     incoming: IncomingCall,
     env: &mut CallEnv<'_>,
-) {
+) -> bool {
     info!(
         "incoming call from peer {} (conversation {})",
         incoming.caller_id, incoming.conversation_id
@@ -875,12 +878,12 @@ async fn run_incoming_call(
         Some(Err(err)) => {
             warn!("signaling connect: {err:#}");
             stop_keepalive(keepalive_stop_tx, keepalive).await;
-            return;
+            return false;
         }
         None => {
             info!("call abandoned during signaling connect");
             stop_keepalive(keepalive_stop_tx, keepalive).await;
-            return;
+            return false;
         }
     };
 
@@ -894,6 +897,7 @@ async fn run_incoming_call(
         env,
     )
     .await;
+    true
 }
 
 async fn run_outgoing_call(
@@ -1252,11 +1256,12 @@ pub async fn run_daemon(
                     status,
                 };
                 let conversation_id = call.conversation_id.clone();
-                run_incoming_call(Arc::clone(&oneme), call, &mut env).await;
-                if ended_conversations.len() == ENDED_CONVERSATIONS_KEPT {
-                    ended_conversations.pop_front();
+                if run_incoming_call(Arc::clone(&oneme), call, &mut env).await {
+                    if ended_conversations.len() == ENDED_CONVERSATIONS_KEPT {
+                        ended_conversations.pop_front();
+                    }
+                    ended_conversations.push_back(conversation_id);
                 }
-                ended_conversations.push_back(conversation_id);
             }
             IdleOutcome::OutgoingRequested { peer_id, resp } => {
                 let mut env = CallEnv {

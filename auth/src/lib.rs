@@ -31,7 +31,9 @@ pub(crate) fn root_store() -> rustls::RootCertStore {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     roots
-        .add(rustls::pki_types::CertificateDer::from(RUSSIAN_TRUSTED_ROOT_CA))
+        .add(rustls::pki_types::CertificateDer::from(
+            RUSSIAN_TRUSTED_ROOT_CA,
+        ))
         .expect("bundled Russian Trusted Root CA parses");
     roots
 }
