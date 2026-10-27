@@ -22,6 +22,7 @@ media-video-codec = "vp9"
 # before it's answered.
 answer-delay-secs = [3, 8]
 
+# Desktop only (Android ignores it); defaults to "tun0".
 tun-name = "tun0"
 privdrop = "nobody:nogroup"
 ctl-socket = "/run/anazoa.sock"

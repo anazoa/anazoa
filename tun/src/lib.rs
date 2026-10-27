@@ -36,7 +36,9 @@ pub struct Config {
     pub media_video_codec: String,
     #[serde(rename = "ctl-socket", default = "default_socket_path")]
     pub ctl_socket: String,
-    #[serde(rename = "tun-name")]
+    /// Name of the TUN device the desktop binary creates. Android gets an
+    /// already-open TUN fd and never reads it.
+    #[serde(rename = "tun-name", default = "default_tun_name")]
     pub tun_name: String,
     #[serde(default)]
     pub privdrop: Option<String>,
@@ -65,6 +67,10 @@ fn default_oneme_keepalive_secs() -> u64 {
 
 fn default_answer_delay_secs() -> [u64; 2] {
     [3, 8]
+}
+
+fn default_tun_name() -> String {
+    "tun0".to_string()
 }
 
 fn default_socket_path() -> String {
@@ -195,5 +201,28 @@ pub async fn shutdown_signal() {
 pub fn trigger_shutdown() {
     if let Some(tx) = shutdown_tx() {
         tx.send_replace(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sample_config_parses_without_desktop_only_keys() {
+        let sample = include_str!("../../anazoa.toml.sample");
+        let android: String = sample
+            .lines()
+            .filter(|l| {
+                !["tun-name", "privdrop", "ctl-socket"]
+                    .iter()
+                    .any(|k| l.starts_with(k))
+            })
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let cfg: Config = toml::from_str(&android).expect("sample parses");
+        assert_eq!(cfg.tun_name, "tun0");
+        assert_eq!(cfg.privdrop, None);
+        assert_eq!(cfg.ctl_socket, "/run/anazoa.sock");
     }
 }
