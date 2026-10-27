@@ -21,6 +21,7 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import com.google.android.material.bottomnavigation.BottomNavigationView
+import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -33,7 +34,14 @@ class MainActivity : AppCompatActivity() {
     // Main tab
     private lateinit var statusText: TextView
     private lateinit var connectButton: Button
-    private lateinit var logPreviewText: TextView
+    private lateinit var statsTable: View
+    private lateinit var statsDuration: TextView
+    private lateinit var statsUp: TextView
+    private lateinit var statsDown: TextView
+    private lateinit var statsCapacity: TextView
+    private lateinit var statsLatency: TextView
+    private lateinit var statsVideo: TextView
+    private lateinit var connectionStats: ConnectionStats
 
     // Settings tab
     private lateinit var cidrInput: EditText
@@ -64,13 +72,13 @@ class MainActivity : AppCompatActivity() {
                 setConnected(false)
             } else {
                 setStatus(describeState(state))
+                updateStats()
                 handler.postDelayed(this, STATUS_POLL_MS)
             }
         }
     }
 
-    // Same single-instance rule as statusTick. Runs on every tab except
-    // Settings, which shows no log.
+    // Same single-instance rule as statusTick. Runs only on the Log tab.
     private val logTick = object : Runnable {
         override fun run() {
             updateLog()
@@ -88,7 +96,6 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val STATUS_POLL_MS = 2000L
         private const val LOG_POLL_MS = 2000L
-        private const val LOG_PREVIEW_LINES = 3
         private const val STATE_TAB = "tab"
 
         private val mediaCopier = Executors.newSingleThreadExecutor { r -> Thread(r, "anazoa-media-copy") }
@@ -173,7 +180,14 @@ class MainActivity : AppCompatActivity() {
 
         statusText = findViewById(R.id.status_text)
         connectButton = findViewById(R.id.connect_button)
-        logPreviewText = findViewById(R.id.log_preview_text)
+        statsTable = findViewById(R.id.stats_table)
+        statsDuration = findViewById(R.id.stats_duration)
+        statsUp = findViewById(R.id.stats_up)
+        statsDown = findViewById(R.id.stats_down)
+        statsCapacity = findViewById(R.id.stats_capacity)
+        statsLatency = findViewById(R.id.stats_latency)
+        statsVideo = findViewById(R.id.stats_video)
+        connectionStats = ConnectionStats(this)
         cidrInput = findViewById(R.id.cidr_input)
         configInput = findViewById(R.id.config_input)
         mediaStatusText = findViewById(R.id.media_status_text)
@@ -182,10 +196,6 @@ class MainActivity : AppCompatActivity() {
 
         connectButton.setOnClickListener {
             if (connected) disconnect() else connect()
-        }
-
-        logPreviewText.setOnClickListener {
-            bottomNav.selectedItemId = R.id.nav_log
         }
 
         val address = prefs.getString("local_address", null) ?: getString(R.string.default_cidr).substringBefore("/")
@@ -228,7 +238,10 @@ class MainActivity : AppCompatActivity() {
         // rather than assuming we're disconnected.
         val state = AnazoaVpnService.currentState()
         setConnected(state != null)
-        if (state != null) setStatus(describeState(state))
+        if (state != null) {
+            setStatus(describeState(state))
+            updateStats()
+        }
         startLogPolling()
         resumed = this
         updateMediaStatus()
@@ -303,6 +316,7 @@ class MainActivity : AppCompatActivity() {
             startPolling()
         } else {
             stopPolling()
+            statsTable.visibility = View.INVISIBLE
             // A session that died on its own says why; a Disconnect, or a
             // fresh start, has no failure to show.
             val failure = AnazoaVpnService.lastFailure()
@@ -323,7 +337,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun startLogPolling() {
         handler.removeCallbacks(logTick)
-        if (currentTab != R.id.nav_settings) handler.post(logTick)
+        if (currentTab == R.id.nav_log) handler.post(logTick)
     }
 
     private fun setStatus(text: String) {
@@ -332,10 +346,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateLog() {
         val log = runCatching { TunnelNative.nativeRecentLog() }.getOrDefault("")
-        if (currentTab == R.id.nav_main) {
-            logPreviewText.text = log.trimEnd().lines().takeLast(LOG_PREVIEW_LINES).joinToString("\n")
-            return
-        }
 
         // Replacing the text wipes any in-progress selection (the old
         // Spannable buffer is discarded outright), which is why a copy
@@ -353,6 +363,24 @@ class MainActivity : AppCompatActivity() {
         if (wasAtBottom) {
             logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
         }
+    }
+
+    // Shown only while in a call; INVISIBLE rather than GONE keeps the
+    // Connect button from jumping when it appears.
+    private fun updateStats() {
+        val status = runCatching { JSONObject(TunnelNative.nativeStatus()) }.getOrNull()
+        val rows = status?.let { connectionStats.format(it, System.currentTimeMillis()) }
+        if (rows == null) {
+            statsTable.visibility = View.INVISIBLE
+            return
+        }
+        statsDuration.text = rows.duration
+        statsUp.text = rows.up
+        statsDown.text = rows.down
+        statsCapacity.text = rows.capacity
+        statsLatency.text = rows.latency
+        statsVideo.text = rows.video
+        statsTable.visibility = View.VISIBLE
     }
 
     private fun updateMediaStatus() {

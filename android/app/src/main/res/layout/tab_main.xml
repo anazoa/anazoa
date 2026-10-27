@@ -40,16 +40,107 @@
         android:layout_height="0dp"
         android:layout_weight="1" />
 
-    <!-- Last few log lines; tapping it opens the Log tab. -->
-    <TextView
-        android:id="@+id/log_preview_text"
+    <!-- Connection stats, filled from nativeStatus while in a call. Fixed
+         height (one line per value, two for Video and its optional "limited
+         by" line), so changing values don't shift the Connect button. -->
+    <TableLayout
+        android:id="@+id/stats_table"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:background="#1a1a1a"
-        android:padding="8dp"
-        android:minLines="3"
-        android:fontFamily="monospace"
-        android:textSize="10sp"
-        android:textColor="#e0e0e0" />
+        android:shrinkColumns="1"
+        android:stretchColumns="1"
+        android:visibility="invisible">
+
+        <TableRow android:paddingVertical="3dp">
+
+            <TextView
+                android:paddingEnd="16dp"
+                android:textColor="?android:attr/textColorSecondary"
+                android:text="@string/stats_duration" />
+
+            <TextView
+                android:id="@+id/stats_duration"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:fontFeatureSettings="tnum" />
+
+        </TableRow>
+
+        <TableRow android:paddingVertical="3dp">
+
+            <TextView
+                android:paddingEnd="16dp"
+                android:textColor="?android:attr/textColorSecondary"
+                android:text="@string/stats_up" />
+
+            <TextView
+                android:id="@+id/stats_up"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:fontFeatureSettings="tnum" />
+
+        </TableRow>
+
+        <TableRow android:paddingVertical="3dp">
+
+            <TextView
+                android:paddingEnd="16dp"
+                android:textColor="?android:attr/textColorSecondary"
+                android:text="@string/stats_down" />
+
+            <TextView
+                android:id="@+id/stats_down"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:fontFeatureSettings="tnum" />
+
+        </TableRow>
+
+        <TableRow android:paddingVertical="3dp">
+
+            <TextView
+                android:paddingEnd="16dp"
+                android:textColor="?android:attr/textColorSecondary"
+                android:text="@string/stats_capacity" />
+
+            <TextView
+                android:id="@+id/stats_capacity"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:fontFeatureSettings="tnum" />
+
+        </TableRow>
+
+        <TableRow android:paddingVertical="3dp">
+
+            <TextView
+                android:paddingEnd="16dp"
+                android:textColor="?android:attr/textColorSecondary"
+                android:text="@string/stats_latency" />
+
+            <TextView
+                android:id="@+id/stats_latency"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:fontFeatureSettings="tnum" />
+
+        </TableRow>
+
+        <TableRow android:paddingVertical="3dp">
+
+            <TextView
+                android:paddingEnd="16dp"
+                android:textColor="?android:attr/textColorSecondary"
+                android:text="@string/stats_video" />
+
+            <TextView
+                android:id="@+id/stats_video"
+                android:ellipsize="end"
+                android:lines="2"
+                android:fontFeatureSettings="tnum" />
+
+        </TableRow>
+
+    </TableLayout>
 
 </LinearLayout>

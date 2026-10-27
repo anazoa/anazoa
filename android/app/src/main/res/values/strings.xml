@@ -26,4 +26,17 @@
     <string name="media_status_loaded">%1$s loaded</string>
     <string name="media_status_copying">copying…</string>
     <string name="error_load_media">Could not read that file</string>
+    <string name="stats_duration">Duration</string>
+    <string name="stats_up">Up</string>
+    <string name="stats_down">Down</string>
+    <string name="stats_capacity">Capacity</string>
+    <string name="stats_latency">Latency</string>
+    <string name="stats_video">Video</string>
+    <string name="stats_none">—</string>
+    <string name="stats_capacity_value">%1$s · %2$d%% in use</string>
+    <string name="stats_rtt">%1$d ms</string>
+    <string name="stats_path_relay">via TURN relay</string>
+    <string name="stats_path_direct">direct</string>
+    <string name="stats_fps">%1$d fps</string>
+    <string name="stats_limited">limited by %1$s</string>
 </resources>
