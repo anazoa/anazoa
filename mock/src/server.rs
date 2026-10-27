@@ -874,7 +874,8 @@ fn accepted_call_notification() -> Value {
 fn hangup_notification() -> Value {
     json!({
         "type": "notification",
-        "notification": "hangup",
+        "notification": "hungup",
+        "reason": "HUNGUP",
         "stamp": 0,
     })
 }

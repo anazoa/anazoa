@@ -4,6 +4,7 @@
 //! belongs to the caller; this module only knows how to drive calls once a
 //! TUN device and a command channel exist.
 
+use std::collections::VecDeque;
 use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use anazoa_auth::TurnServer;
 use anazoa_auth::oneme::{IncomingCall, SessionClient};
-use anazoa_auth::signaling::SignalingClient;
+use anazoa_auth::signaling::{RemoteHungUp, SignalingClient};
 use anazoa_config::ServiceEndpoints;
 
 use crate::daemon::DaemonCmd;
@@ -51,6 +52,9 @@ const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // NOISE_CHECK_FRAMES covers ~4 s at 50 fps; 10 s leaves headroom for slow ICE/DTLS
 // before audio begins. noise_auth_failed() via custom_tick is the normal failure path.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Recently ended incoming conversations remembered, so their late
+/// incoming-call events are ignored instead of answered.
+const ENDED_CONVERSATIONS_KEPT: usize = 8;
 
 /// Parses `noise-privkey`/`noise-peer-pubkey` (if both set) and registers them
 /// for Noise KK authentication; clears any previously registered pair if
@@ -293,7 +297,11 @@ async fn drive_call(
                 match received {
                     Ok(Ok(data)) => handle_remote_signal(&mut call, data, role).await?,
                     Ok(Err(err)) => {
-                        debug!("signaling receive failed: {err:#}");
+                        if let Some(hungup) = err.downcast_ref::<RemoteHungUp>() {
+                            info!("{hungup}");
+                        } else {
+                            debug!("signaling receive failed: {err:#}");
+                        }
                         break;
                     }
                     Err(_) => {
@@ -661,6 +669,7 @@ async fn idle_loop(
     peer_id: i64,
     cmd_rx: &mut mpsc::Receiver<DaemonCmd>,
     answer_deadline: &mut AnswerState,
+    ended_conversations: &VecDeque<String>,
 ) -> IdleOutcome {
     let (call_tx, mut call_rx) = mpsc::channel(1);
     let mut wait_task = spawn_wait_task(Arc::clone(&oneme), call_tx.clone());
@@ -674,6 +683,17 @@ async fn idle_loop(
 
             Some(result) = call_rx.recv() => {
                 match result {
+                    // Incoming-call events queued while we were in a call
+                    // arrive once we're idle again; answering one for a
+                    // conversation that already ended only earns a
+                    // conversation-ended error.
+                    Ok(incoming) if ended_conversations.contains(&incoming.conversation_id) => {
+                        info!(
+                            "ignoring stale incoming call from peer {} (conversation {} already ended)",
+                            incoming.caller_id, incoming.conversation_id
+                        );
+                        wait_task = spawn_wait_task(Arc::clone(&oneme), call_tx.clone());
+                    }
                     Ok(incoming) if incoming.caller_id == peer_id => {
                         if answer_window_open(answer_deadline) {
                             if !matches!(answer_deadline, AnswerState::Forever) {
@@ -787,7 +807,10 @@ async fn run_incoming_call(
     incoming: IncomingCall,
     env: &mut CallEnv<'_>,
 ) {
-    info!("incoming call from peer {}", incoming.caller_id);
+    info!(
+        "incoming call from peer {} (conversation {})",
+        incoming.caller_id, incoming.conversation_id
+    );
     env.status.send_replace(EngineState::Answering {
         peer_id: incoming.caller_id,
     });
@@ -1150,6 +1173,7 @@ pub async fn run_daemon(
 
     let mut answer_deadline = AnswerState::Closed;
     let mut first_dial = true;
+    let mut ended_conversations = VecDeque::with_capacity(ENDED_CONVERSATIONS_KEPT);
     loop {
         status.send_replace(EngineState::Idle);
         let outcome = if auto_call {
@@ -1178,6 +1202,7 @@ pub async fn run_daemon(
                 cfg.remote_peer_id,
                 cmd_rx,
                 &mut answer_deadline,
+                &ended_conversations,
             )
             .await
         };
@@ -1192,7 +1217,12 @@ pub async fn run_daemon(
                     cmd_rx,
                     status,
                 };
+                let conversation_id = call.conversation_id.clone();
                 run_incoming_call(Arc::clone(&oneme), call, &mut env).await;
+                if ended_conversations.len() == ENDED_CONVERSATIONS_KEPT {
+                    ended_conversations.pop_front();
+                }
+                ended_conversations.push_back(conversation_id);
             }
             IdleOutcome::OutgoingRequested { peer_id, resp } => {
                 let mut env = CallEnv {

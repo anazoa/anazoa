@@ -729,6 +729,15 @@ fn run_mock_test(cli: TestCli) -> Result<()> {
     if !hangup_status.success() {
         bail!("ctl hangup failed: caller was not in a call");
     }
+    // The calltaker must end the call on the server's hungup notification,
+    // well before ICE alone would time out (~10 s).
+    wait_for_log_contains(
+        &calltaker_log,
+        "remote hung up",
+        Duration::from_secs(3),
+        child_mut(&mut harness, calltaker_idx)?,
+        "calltaker saw remote hangup",
+    )?;
     wait_for_log_contains(
         &calltaker_log,
         "call ended",

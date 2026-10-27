@@ -24,6 +24,7 @@ use wtransport::{ClientConfig, Endpoint};
 const WT_CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SIGNALING_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECTION_NOTIFICATION_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Upper bound on a single (deflate-compressed) WebTransport frame read
 /// from the untrusted signaling server, before allocating a buffer for it.
 const MAX_SIGNALING_FRAME_LEN: usize = 1 << 20;
@@ -34,6 +35,23 @@ const MAX_SIGNALING_DECOMPRESSED_LEN: usize = 8 << 20;
 use crate::{
     FingerprintConfig, ServiceEndpoints, calls::StartedConversationInfo, oneme::IncomingCall,
 };
+
+/// The peer hung up: the signaling server sent a `hungup` notification.
+#[derive(Debug)]
+pub struct RemoteHungUp {
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Display for RemoteHungUp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.reason {
+            Some(reason) => write!(f, "remote hung up ({reason})"),
+            None => f.write_str("remote hung up"),
+        }
+    }
+}
+
+impl std::error::Error for RemoteHungUp {}
 
 // ── Wire abstraction ─────────────────────────────────────────────────────────
 
@@ -554,6 +572,8 @@ impl SignalingClient {
         self.receive_signal().await
     }
 
+    /// Next `transmitted-data` payload from the peer.  Fails with
+    /// [`RemoteHungUp`] once the server reports that the peer hung up.
     pub async fn receive_signal<T: DeserializeOwned>(&mut self) -> Result<T> {
         loop {
             let msg = self.receive_json_value().await?;
@@ -567,6 +587,10 @@ impl SignalingClient {
                 .get("notification")
                 .and_then(Value::as_str)
                 .unwrap_or("?");
+            if notif == "hungup" {
+                let reason = msg.get("reason").and_then(Value::as_str).map(str::to_owned);
+                return Err(RemoteHungUp { reason }.into());
+            }
             if notif != "transmitted-data" {
                 tracing::debug!("signaling rx skipped: notification={notif}");
                 continue;
