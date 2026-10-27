@@ -18,6 +18,9 @@ media-video-resolution = "1280x720"
 # Codec requested for outgoing calls: "vp9" (default) or "h264".
 # Incoming calls accept either codec independently of this setting.
 media-video-codec = "vp9"
+# An incoming call rings for a random number of seconds in this range
+# before it's answered.
+answer-delay-secs = [3, 8]
 
 tun-name = "tun0"
 privdrop = "nobody:nogroup"

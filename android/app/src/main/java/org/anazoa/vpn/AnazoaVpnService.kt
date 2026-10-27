@@ -146,7 +146,9 @@ class AnazoaVpnService : VpnService() {
             }
             ACTION_DISCONNECT -> stopTunnel()
         }
-        return START_STICKY
+        // Not sticky: a restart after the process was killed would place
+        // a call nobody asked for.
+        return START_NOT_STICKY
     }
 
     private fun startTunnel(
@@ -261,8 +263,7 @@ class AnazoaVpnService : VpnService() {
     }
 
     // The tunnel only carries traffic in `in_call`; everything before it
-    // (session connect, dialing, signaling setup, and the redial backoff
-    // that shows up as `idle` after a call drops) is still "connecting"
+    // (session connect, dialing, signaling setup) is still "connecting"
     // from the user's point of view.
     private fun describeState(state: String): String = when (state) {
         "in_call" -> getString(R.string.status_connected)

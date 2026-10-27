@@ -433,11 +433,9 @@ class MainActivity : AppCompatActivity() {
     }
 
     // Only `in_call` means the tunnel is actually carrying traffic. The
-    // engine passes through `connecting` (OneMe session), `dialing` /
-    // `answering` (signaling setup) and — after a call drops — `idle` for
-    // the redial backoff; mapping all of those to "Connected" hid the
-    // difference between a working tunnel and one that was silently
-    // waiting to retry. The engine is running throughout (the button stays
+    // engine passes through `connecting` (OneMe session) and `dialing` /
+    // `answering` (signaling setup); mapping all of those to "Connected"
+    // hid the difference between a working tunnel and one still coming up. The engine is running throughout (the button stays
     // Disconnect), it just isn't connected yet.
     private fun describeState(state: String): String = when (state) {
         "in_call" -> getString(R.string.status_connected)

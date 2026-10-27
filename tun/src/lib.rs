@@ -45,6 +45,10 @@ pub struct Config {
         default = "default_oneme_keepalive_secs"
     )]
     pub oneme_keepalive_secs: u64,
+    /// How long an incoming call rings before it's answered: a random
+    /// number of seconds between the two bounds.
+    #[serde(rename = "answer-delay-secs", default = "default_answer_delay_secs")]
+    pub answer_delay_secs: [u64; 2],
     /// Base64-encoded 32-byte X25519 private key for Noise KK authentication.
     #[serde(rename = "noise-privkey", default)]
     pub noise_privkey: Option<String>,
@@ -57,6 +61,10 @@ pub const DEFAULT_ONEME_KEEPALIVE_SECS: u64 = 25;
 
 fn default_oneme_keepalive_secs() -> u64 {
     DEFAULT_ONEME_KEEPALIVE_SECS
+}
+
+fn default_answer_delay_secs() -> [u64; 2] {
+    [3, 8]
 }
 
 fn default_socket_path() -> String {

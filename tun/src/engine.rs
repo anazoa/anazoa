@@ -99,8 +99,9 @@ pub fn video_resolution(cfg: &Config) -> Result<Resolution> {
 /// daemon loop until shutdown. The caller is responsible for opening the TUN
 /// device (differs by platform) and for the command channel's producer side.
 ///
-/// `auto_call`: place a call to `cfg.remote_peer_id` as soon as the daemon
-/// reaches idle for the first time, instead of waiting for a `Call` command.
+/// `auto_call`: place one call to `cfg.remote_peer_id` as soon as the
+/// daemon reaches idle, instead of waiting for a `Call` command, and stop
+/// when it ends (see [`run_daemon`]).
 /// Android is always the caller side and has no `anazoa-ctl`-equivalent
 /// separate step, so its single Connect button needs this; the desktop CLI
 /// passes `false` and keeps using `anazoa-ctl call`/`answer` explicitly.
@@ -193,7 +194,7 @@ async fn run_call(
     peer_id: i64,
     started_at: Instant,
     env: &mut CallEnv<'_>,
-) -> Result<()> {
+) -> Result<CallEnd> {
     let mut call = WebrtcCall::new(&turn, role, env.resolution, env.video_codec)?;
 
     match role {
@@ -223,7 +224,7 @@ async fn run_call(
             let Some(waited) = setup_step(wait_for_sdp(signaling), env.cmd_rx, &in_call).await
             else {
                 info!("call abandoned while waiting for remote SDP offer");
-                return Ok(());
+                return Ok(CallEnd::Local);
             };
             let (sdp, early_signals) = waited?;
             log_sdp_negotiation("remote offer", &sdp);
@@ -255,6 +256,59 @@ async fn run_call(
     drive_call(signaling, call, role, shutdown_rx, peer_id, started_at, env).await
 }
 
+/// Why a call ended. Together with whether ICE ever connected
+/// ([`CallResult`]), it's what `auto_call` reports when it stops.
+#[derive(Debug)]
+enum CallEnd {
+    /// Ended from this side: shutdown, or a `Hangup` command.
+    Local,
+    /// The peer hung up. An unanswered call ends this way too, with a
+    /// reason such as `MISSED` or `REJECTED`.
+    RemoteHungUp(Option<String>),
+    /// The peer connection or signaling went away.
+    Dropped,
+    /// Noise KK authentication failed or timed out.
+    AuthFailed,
+    /// Call setup, or the call itself, returned this error.
+    Failed(String),
+}
+
+impl std::fmt::Display for CallEnd {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CallEnd::Local => write!(f, "hung up"),
+            CallEnd::RemoteHungUp(Some(reason)) => write!(f, "remote hung up: {reason}"),
+            CallEnd::RemoteHungUp(None) => write!(f, "remote hung up"),
+            CallEnd::Dropped => write!(f, "connection lost"),
+            CallEnd::AuthFailed => write!(f, "Noise authentication failed"),
+            CallEnd::Failed(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+struct CallResult {
+    end: CallEnd,
+    connected: bool,
+}
+
+impl CallResult {
+    fn not_connected(end: CallEnd) -> Self {
+        CallResult {
+            end,
+            connected: false,
+        }
+    }
+
+    /// Why `auto_call` stopped after this call.
+    fn stop_reason(self, peer_id: i64) -> anyhow::Error {
+        match (self.connected, self.end) {
+            (_, CallEnd::Local) => anyhow!("call hung up"),
+            (true, end) => anyhow!("call to peer {peer_id} ended ({end})"),
+            (false, end) => anyhow!("call to peer {peer_id} didn't connect ({end})"),
+        }
+    }
+}
+
 async fn drive_call(
     signaling: &mut SignalingClient,
     mut call: WebrtcCall,
@@ -263,7 +317,7 @@ async fn drive_call(
     peer_id: i64,
     started_at: Instant,
     env: &mut CallEnv<'_>,
-) -> Result<()> {
+) -> Result<CallEnd> {
     let mut audio_tick = interval(Duration::from_millis(20));
     audio_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut video_tick = interval(Duration::from_millis(1000 / VIDEO_FPS));
@@ -275,35 +329,37 @@ async fn drive_call(
     let silence = vec![0i16; AUDIO_FRAME_SAMPLES * AUDIO_CHANNELS as usize];
     tokio::pin!(auth_deadline);
 
-    loop {
+    let end = loop {
         tokio::select! {
             _ = shutdown_signal() => {
                 info!("call shutting down");
-                break;
+                break CallEnd::Local;
             }
 
             _ = shutdown_rx.changed() => {
                 info!("call shutting down");
-                break;
+                break CallEnd::Local;
             }
 
             Some(event) = call.events.recv() => {
                 if !handle_local_event(signaling, &mut call, event).await? {
-                    break;
+                    break CallEnd::Dropped;
                 }
             }
 
             received = tokio::time::timeout(SIGNAL_TIMEOUT, signaling.receive_signal_value()) => {
                 match received {
                     Ok(Ok(data)) => handle_remote_signal(&mut call, data, role).await?,
-                    Ok(Err(err)) => {
-                        if let Some(hungup) = err.downcast_ref::<RemoteHungUp>() {
+                    Ok(Err(err)) => match err.downcast::<RemoteHungUp>() {
+                        Ok(hungup) => {
                             info!("{hungup}");
-                        } else {
-                            debug!("signaling receive failed: {err:#}");
+                            break CallEnd::RemoteHungUp(hungup.reason);
                         }
-                        break;
-                    }
+                        Err(err) => {
+                            debug!("signaling receive failed: {err:#}");
+                            break CallEnd::Dropped;
+                        }
+                    },
                     Err(_) => {
                         debug!("no signaling data for {}s", SIGNAL_TIMEOUT.as_secs());
                     }
@@ -360,7 +416,7 @@ async fn drive_call(
             _ = custom_tick.tick() => {
                 if noise_auth_failed() {
                     warn!("Noise KK authentication failed, hanging up");
-                    break;
+                    break CallEnd::AuthFailed;
                 }
                 if let Err(err) = signaling.send_custom_data().await {
                     debug!("custom-data send failed: {err:#}");
@@ -375,7 +431,7 @@ async fn drive_call(
                         .is_some_and(|s| !s.authenticated.load(std::sync::atomic::Ordering::Relaxed))
                 {
                     warn!("Noise KK authentication deadline exceeded, hanging up");
-                    break;
+                    break CallEnd::AuthFailed;
                 }
 
                 auth_deadline
@@ -385,14 +441,14 @@ async fn drive_call(
 
             cmd = env.cmd_rx.recv() => {
                 if handle_call_cmd(cmd, peer_id, started_at) {
-                    break;
+                    break CallEnd::Local;
                 }
             }
         }
-    }
+    };
 
     call.pc.close();
-    Ok(())
+    Ok(end)
 }
 
 /// Coarse engine state, published through a `watch` channel so a host can
@@ -461,6 +517,10 @@ fn utilization_window_json(data: u64, total: u64, secs: u64) -> Value {
 /// Whether the current call's ICE transport is connected. Cleared when a
 /// call starts and ends; set from the call's ICE events.
 static ICE_CONNECTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the current call's ICE transport has connected at any point.
+/// Cleared when a call starts; reported when `auto_call` stops.
+static ICE_EVER_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 /// True once an `InCall` actually carries traffic: ICE connected and the
 /// Noise handshake done. `InCall` is published as soon as signaling
@@ -813,10 +873,11 @@ async fn finish_call(
     keepalive_stop_tx: watch::Sender<bool>,
     keepalive: JoinHandle<()>,
     env: &mut CallEnv<'_>,
-) {
+) -> CallResult {
     let (hangup_tx, hangup_rx) = watch::channel(false);
     let started_at = Instant::now();
     ICE_CONNECTED.store(false, Ordering::Relaxed);
+    ICE_EVER_CONNECTED.store(false, Ordering::Relaxed);
     clear_call_stats();
     env.status.send_replace(EngineState::InCall {
         peer_id,
@@ -830,9 +891,19 @@ async fn finish_call(
     clear_call_stats();
     teardown_call(signaling, keepalive_stop_tx, keepalive).await;
 
-    match call_result {
-        Ok(()) => info!("call ended"),
-        Err(err) => warn!("call ended with error: {err:#}"),
+    let end = match call_result {
+        Ok(end) => {
+            info!("call ended");
+            end
+        }
+        Err(err) => {
+            warn!("call ended with error: {err:#}");
+            CallEnd::Failed(format!("{err:#}"))
+        }
+    };
+    CallResult {
+        end,
+        connected: ICE_EVER_CONNECTED.load(Ordering::Relaxed),
     }
 }
 
@@ -864,15 +935,29 @@ async fn run_incoming_call(
         keepalive_stop_rx,
     ));
 
+    let answering = EngineState::Answering {
+        peer_id: incoming.caller_id,
+    };
+
+    // Let it ring first: answering every call within a fraction of a
+    // second looks scripted.
+    let delay = answer_delay(env.cfg.answer_delay_secs);
+    info!("answering in {:.1} s", delay.as_secs_f64());
+    if setup_step(tokio::time::sleep(delay), env.cmd_rx, &answering)
+        .await
+        .is_none()
+    {
+        info!("call abandoned while ringing");
+        stop_keepalive(keepalive_stop_tx, keepalive).await;
+        return false;
+    }
+
     let connect = SignalingClient::from_incoming(
         &incoming,
         &env.cfg.signaling_user_id,
         env.endpoints,
         &env.cfg.auth.fingerprint,
     );
-    let answering = EngineState::Answering {
-        peer_id: incoming.caller_id,
-    };
     let mut signaling = match setup_step(connect, env.cmd_rx, &answering).await {
         Some(Ok(s)) => s,
         Some(Err(err)) => {
@@ -900,12 +985,18 @@ async fn run_incoming_call(
     true
 }
 
+/// A random delay within `[min, max]` seconds (either order).
+fn answer_delay([a, b]: [u64; 2]) -> Duration {
+    let (min, max) = (a.min(b), a.max(b));
+    Duration::from_millis(rand::random_range(min * 1000..=max * 1000))
+}
+
 async fn run_outgoing_call(
     oneme: Arc<Mutex<SessionClient>>,
     peer_id: i64,
     call_resp: tokio::sync::oneshot::Sender<Result<Value>>,
     env: &mut CallEnv<'_>,
-) {
+) -> CallResult {
     info!("placing call to {peer_id}");
     env.status.send_replace(EngineState::Dialing { peer_id });
     prepare_noise_for_call(NoiseRole::Initiator);
@@ -918,12 +1009,14 @@ async fn run_outgoing_call(
             // response, so this would otherwise vanish without a trace.
             warn!("start_outgoing_call: {err:#}");
             let _ = call_resp.send(Err(anyhow!("start_outgoing_call: {err:#}")));
-            return;
+            return CallResult::not_connected(CallEnd::Failed(format!(
+                "start_outgoing_call: {err:#}"
+            )));
         }
         None => {
             info!("call abandoned while starting outgoing call");
             let _ = call_resp.send(Err(anyhow!("call cancelled")));
-            return;
+            return CallResult::not_connected(CallEnd::Local);
         }
     };
 
@@ -943,11 +1036,13 @@ async fn run_outgoing_call(
         Some(Ok(s)) => s,
         Some(Err(err)) => {
             warn!("signaling connect: {err:#}");
-            return;
+            return CallResult::not_connected(CallEnd::Failed(format!(
+                "signaling connect: {err:#}"
+            )));
         }
         None => {
             info!("call abandoned during signaling connect");
-            return;
+            return CallResult::not_connected(CallEnd::Local);
         }
     };
 
@@ -969,7 +1064,7 @@ async fn run_outgoing_call(
         keepalive,
         env,
     )
-    .await;
+    .await
 }
 
 /// Runs one call-setup step (session request, signaling connect, waiting
@@ -1173,12 +1268,12 @@ async fn reconnect_session(
     false
 }
 
-/// `auto_call`: see [`run_with_tun`]. Not one-shot — every time the daemon
-/// would otherwise go idle (the call ended, or never got going: callee
-/// rejected, signaling failed, session dropped) it redials after
-/// `RECONNECT_DELAY`. Android has no other way to redial: its UI never
-/// issues a `Call` command, so a single failed attempt would otherwise
-/// leave the app sitting in `idle` with no tunnel until Disconnect/Connect.
+/// `auto_call`: see [`run_with_tun`]. One-shot: once that call ends, for
+/// whatever reason (unanswered, rejected, setup failed, dropped), the
+/// daemon returns, with the reason as its error unless shutdown ended the
+/// call. It never redials: calling again and again when the peer doesn't
+/// answer looks suspicious to Max. Android shows the error and the user
+/// reconnects by hand.
 pub async fn run_daemon(
     cfg: &Config,
     media: &mut Option<RaylibMedia>,
@@ -1197,7 +1292,7 @@ pub async fn run_daemon(
     info!("outgoing video codec: {}", video_codec.rtp_name());
     // Before the session and the first dial, so a build that can't send the
     // configured codec fails once with the reason instead of ringing the
-    // peer and redialing into the same error.
+    // peer only to hit the same error.
     ensure_send_codec(video_codec)?;
 
     // Establish the OneMe session once and keep it alive across calls,
@@ -1210,23 +1305,10 @@ pub async fn run_daemon(
     let oneme = Arc::new(Mutex::new(client));
 
     let mut answer_deadline = AnswerState::Closed;
-    let mut first_dial = true;
     let mut ended_conversations = VecDeque::with_capacity(ENDED_CONVERSATIONS_KEPT);
     loop {
         status.send_replace(EngineState::Idle);
         let outcome = if auto_call {
-            if !std::mem::take(&mut first_dial) {
-                // The call usually ends *because* of shutdown (Android's
-                // Disconnect); don't announce a redial that the wait below
-                // would cancel on its first poll.
-                if shutdown_requested() {
-                    return Ok(());
-                }
-                info!("auto-call: redialing in {RECONNECT_DELAY:?}");
-                if wait_answering_cmds(RECONNECT_DELAY, cmd_rx, &EngineState::Idle).await {
-                    return Ok(());
-                }
-            }
             // No RPC caller is waiting on this ack (there was no Call
             // command at all), so the response end is just dropped.
             let (resp, _resp_rx) = tokio::sync::oneshot::channel();
@@ -1273,7 +1355,15 @@ pub async fn run_daemon(
                     cmd_rx,
                     status,
                 };
-                run_outgoing_call(Arc::clone(&oneme), peer_id, resp, &mut env).await;
+                let result = run_outgoing_call(Arc::clone(&oneme), peer_id, resp, &mut env).await;
+                if auto_call {
+                    // The call usually ends *because* of shutdown
+                    // (Android's Disconnect), which is no error.
+                    if shutdown_requested() {
+                        return Ok(());
+                    }
+                    return Err(result.stop_reason(peer_id));
+                }
             }
             IdleOutcome::Shutdown => return Ok(()),
             IdleOutcome::SessionError => {
@@ -1286,9 +1376,8 @@ pub async fn run_daemon(
 
         // A call can leave the session dead behind it (the in-call
         // heartbeat failed, or start_outgoing_call hit a broken socket
-        // after e.g. a Wi-Fi→LTE switch). idle_loop would notice via its
-        // wait task, but auto_call never enters idle_loop: without this
-        // check Android would redial forever on the same dead client.
+        // after e.g. a Wi-Fi→LTE switch). idle_loop would notice too, via
+        // its wait task; checking here reconnects straight away.
         if oneme.lock().await.is_broken()
             && reconnect_session(&oneme, cfg, &endpoints, cmd_rx, status).await
         {
@@ -1340,14 +1429,15 @@ async fn handle_local_event(
         }
         LocalEvent::IceState(state) => {
             info!("ICE state = {}", ice_state_name(state));
-            ICE_CONNECTED.store(
-                matches!(
-                    state,
-                    IceConnectionState::IceConnectionConnected
-                        | IceConnectionState::IceConnectionCompleted
-                ),
-                Ordering::Relaxed,
+            let connected = matches!(
+                state,
+                IceConnectionState::IceConnectionConnected
+                    | IceConnectionState::IceConnectionCompleted
             );
+            ICE_CONNECTED.store(connected, Ordering::Relaxed);
+            if connected {
+                ICE_EVER_CONNECTED.store(true, Ordering::Relaxed);
+            }
         }
         LocalEvent::ConnectionState(state) => {
             info!("connection state = {}", pc_state_name(state));
@@ -1634,5 +1724,28 @@ a=rtpmap:100 H264/90000\r\nm=video 0 UDP/TLS/RTP/SAVPF 100\r\n\
 a=rtpmap:100 H264/90000\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
 a=rtpmap:96 VP8/90000\r\na=rtpmap:98 VP9/90000\r\n";
         assert_eq!(sdp_preferred_tunnel_codec(offer), None);
+    }
+
+    #[test]
+    fn stop_reason_says_whether_the_call_connected() {
+        let reason = |connected, end| CallResult { end, connected }.stop_reason(1).to_string();
+        assert_eq!(
+            reason(false, CallEnd::RemoteHungUp(Some("MISSED".into()))),
+            "call to peer 1 didn't connect (remote hung up: MISSED)"
+        );
+        assert_eq!(
+            reason(true, CallEnd::Dropped),
+            "call to peer 1 ended (connection lost)"
+        );
+        assert_eq!(reason(true, CallEnd::Local), "call hung up");
+    }
+
+    #[test]
+    fn answer_delay_stays_within_bounds() {
+        for bounds in [[3, 8], [8, 3], [0, 0]] {
+            let delay = answer_delay(bounds);
+            assert!(delay >= Duration::from_secs(bounds[0].min(bounds[1])));
+            assert!(delay <= Duration::from_secs(bounds[0].max(bounds[1])));
+        }
     }
 }
