@@ -217,6 +217,13 @@ class MainActivity : AppCompatActivity() {
             loadConfigFile.launch("*/*")
         }
 
+        val fingerprintText = findViewById<EditText>(R.id.fingerprint_text)
+        fingerprintText.keyListener = null
+        fingerprintText.setText(DeviceFingerprint.toml(this))
+        findViewById<Button>(R.id.copy_fingerprint_button).setOnClickListener {
+            copyText(fingerprintText.text.toString(), R.string.toast_fingerprint_copied)
+        }
+
         loadMediaButton = findViewById(R.id.load_media_button)
         loadMediaButton.setOnClickListener {
             loadMediaFile.launch("*/*")
@@ -393,14 +400,15 @@ class MainActivity : AppCompatActivity() {
         statsTable.visibility = View.VISIBLE
     }
 
-    private fun copyLog() {
-        val log = logText.text.toString()
-        if (log.isEmpty()) return
+    private fun copyLog() = copyText(logText.text.toString(), R.string.toast_log_copied)
+
+    private fun copyText(text: String, toast: Int) {
+        if (text.isEmpty()) return
         getSystemService(ClipboardManager::class.java)
-            .setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), log))
+            .setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), text))
         // Android 13+ confirms clipboard writes itself.
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-            Toast.makeText(this, getString(R.string.toast_log_copied), Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, getString(toast), Toast.LENGTH_SHORT).show()
         }
     }
 

@@ -84,4 +84,41 @@
         android:textSize="12sp"
         android:hint="@string/hint_config" />
 
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="@string/label_fingerprint" />
+
+        <Button
+            android:id="@+id/copy_fingerprint_button"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:minWidth="0dp"
+            android:minHeight="0dp"
+            android:paddingEnd="0dp"
+            android:text="@string/action_copy" />
+
+    </LinearLayout>
+
+    <!-- Read-only (MainActivity drops its key listener) but selectable. -->
+    <EditText
+        android:id="@+id/fingerprint_text"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:gravity="top|start"
+        android:inputType="textMultiLine|textNoSuggestions"
+        android:textIsSelectable="true"
+        android:typeface="monospace"
+        android:textSize="12sp" />
+
 </LinearLayout>

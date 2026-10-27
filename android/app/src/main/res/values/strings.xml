@@ -29,6 +29,9 @@
     <string name="action_clear_log">Clear</string>
     <string name="action_copy_log">Copy</string>
     <string name="toast_log_copied">Log copied</string>
+    <string name="label_fingerprint">This phone\'s fingerprint</string>
+    <string name="action_copy">Copy</string>
+    <string name="toast_fingerprint_copied">Fingerprint copied</string>
     <string name="stats_duration">Duration</string>
     <string name="stats_up">Up</string>
     <string name="stats_down">Down</string>
