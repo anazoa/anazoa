@@ -1,21 +1,53 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Only one scrolling ancestor here (unlike the old nested-ScrollView
-     layout on the main screen, which fought itself over scroll position
-     whenever the log text updated). No android:id on the root: the
-     <include> in activity_main.xml replaces it with @id/tab_log. -->
-<org.anazoa.vpn.NoAutoScrollScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+<!-- No android:id on the root: the <include> in activity_main.xml replaces
+     it with @id/tab_log. Only one scrolling ancestor for the log text
+     (unlike the old nested-ScrollView layout on the main screen, which
+     fought itself over scroll position whenever the log text updated). -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:orientation="vertical"
     android:background="#1a1a1a">
 
-    <TextView
-        android:id="@+id/log_text"
+    <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:padding="8dp"
-        android:fontFamily="monospace"
-        android:textSize="10sp"
-        android:textColor="#e0e0e0"
-        android:textIsSelectable="true" />
+        android:orientation="horizontal"
+        android:gravity="end"
+        android:paddingHorizontal="8dp">
 
-</org.anazoa.vpn.NoAutoScrollScrollView>
+        <Button
+            android:id="@+id/log_clear_button"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/action_clear_log" />
+
+        <Button
+            android:id="@+id/log_copy_button"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/action_copy_log" />
+
+    </LinearLayout>
+
+    <org.anazoa.vpn.NoAutoScrollScrollView
+        android:id="@+id/log_scroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="1">
+
+        <TextView
+            android:id="@+id/log_text"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:padding="8dp"
+            android:fontFamily="monospace"
+            android:textSize="10sp"
+            android:textColor="#e0e0e0"
+            android:textIsSelectable="true" />
+
+    </org.anazoa.vpn.NoAutoScrollScrollView>
+
+</LinearLayout>

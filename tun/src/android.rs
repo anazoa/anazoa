@@ -12,6 +12,7 @@
 //!     external fun nativeHangup(): Boolean
 //!     external fun nativeStatus(): String
 //!     external fun nativeRecentLog(): String
+//!     external fun nativeClearLog()
 //! }
 //! ```
 //!
@@ -355,4 +356,13 @@ pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeRecentLog<'local>(
         Ok(s) => s.into_raw(),
         Err(_) => std::ptr::null_mut(),
     }
+}
+
+/// Empties the buffer `nativeRecentLog` reads. Safe at any time, like it.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_org_anazoa_vpn_TunnelNative_nativeClearLog(
+    _env: JNIEnv<'_>,
+    _class: JClass<'_>,
+) {
+    anazoa_config::clear_recent_log();
 }

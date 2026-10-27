@@ -1,10 +1,13 @@
 package org.anazoa.vpn
 
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.res.ColorStateList
 import android.graphics.Color
 import android.net.VpnService
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -191,12 +194,19 @@ class MainActivity : AppCompatActivity() {
         cidrInput = findViewById(R.id.cidr_input)
         configInput = findViewById(R.id.config_input)
         mediaStatusText = findViewById(R.id.media_status_text)
-        logScroll = findViewById(R.id.tab_log)
+        logScroll = findViewById(R.id.log_scroll)
         logText = findViewById(R.id.log_text)
 
         connectButton.setOnClickListener {
             if (connected) disconnect() else connect()
         }
+
+        findViewById<Button>(R.id.log_clear_button).setOnClickListener {
+            runCatching { TunnelNative.nativeClearLog() }
+            logText.text = ""
+        }
+
+        findViewById<Button>(R.id.log_copy_button).setOnClickListener { copyLog() }
 
         val address = prefs.getString("local_address", null) ?: getString(R.string.default_cidr).substringBefore("/")
         val prefixLength = prefs.getString("prefix_length", null) ?: getString(R.string.default_cidr).substringAfter("/")
@@ -381,6 +391,17 @@ class MainActivity : AppCompatActivity() {
         statsLatency.text = rows.latency
         statsVideo.text = rows.video
         statsTable.visibility = View.VISIBLE
+    }
+
+    private fun copyLog() {
+        val log = logText.text.toString()
+        if (log.isEmpty()) return
+        getSystemService(ClipboardManager::class.java)
+            .setPrimaryClip(ClipData.newPlainText(getString(R.string.app_name), log))
+        // Android 13+ confirms clipboard writes itself.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+            Toast.makeText(this, getString(R.string.toast_log_copied), Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun updateMediaStatus() {

@@ -163,6 +163,11 @@ pub fn recent_log_lines() -> Vec<String> {
     log_ring().lock().unwrap().iter().cloned().collect()
 }
 
+/// Drops the lines [`recent_log_lines`] would return.
+pub fn clear_recent_log() {
+    log_ring().lock().unwrap().clear();
+}
+
 fn parse_log_level(level: &str) -> LevelFilter {
     match level.to_ascii_lowercase().as_str() {
         "trace" => LevelFilter::TRACE,

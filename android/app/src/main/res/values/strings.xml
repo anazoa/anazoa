@@ -26,6 +26,9 @@
     <string name="media_status_loaded">%1$s loaded</string>
     <string name="media_status_copying">copying…</string>
     <string name="error_load_media">Could not read that file</string>
+    <string name="action_clear_log">Clear</string>
+    <string name="action_copy_log">Copy</string>
+    <string name="toast_log_copied">Log copied</string>
     <string name="stats_duration">Duration</string>
     <string name="stats_up">Up</string>
     <string name="stats_down">Down</string>

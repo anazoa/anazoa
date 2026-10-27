@@ -53,4 +53,7 @@ object TunnelNative {
      * any time, including before [nativeStart] (returns "" until then).
      */
     external fun nativeRecentLog(): String
+
+    /** Empties the buffer [nativeRecentLog] reads. */
+    external fun nativeClearLog()
 }
