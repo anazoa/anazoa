@@ -201,7 +201,7 @@ index 490388b9..81769ca7 100644
  ]
 +target_os = ['android', 'linux']
 diff --git a/webrtc-sys/libwebrtc/build_android.sh b/webrtc-sys/libwebrtc/build_android.sh
-index 6d4323f4..a0c2dce8 100755
+index 6d4323f4..b794b6d2 100755
 --- a/webrtc-sys/libwebrtc/build_android.sh
 +++ b/webrtc-sys/libwebrtc/build_android.sh
 @@ -82,6 +82,12 @@ apply_patch "$COMMAND_DIR/patches/external_audio_source.patch"
@@ -217,7 +217,7 @@ index 6d4323f4..a0c2dce8 100755
  cd third_party/libyuv
  apply_patch "$COMMAND_DIR/patches/disable_sme_for_libyuv.patch"
  
-@@ -106,7 +112,7 @@ args="is_debug=$debug \
+@@ -106,10 +112,11 @@ args="is_debug=$debug \
    rtc_include_tests=false \
    rtc_build_tools=false \
    rtc_build_examples=false \
@@ -225,7 +225,12 @@ index 6d4323f4..a0c2dce8 100755
 +  rtc_libvpx_build_vp9=true \
    is_component_build=false \
    enable_stripping=true \
-   rtc_use_h264=false \
+-  rtc_use_h264=false \
++  ffmpeg_branding=\"Chrome\" \
++  rtc_use_h264=true \
+   rtc_use_h265=true \
+   rtc_use_pipewire=false \
+   symbol_level=0 \
 diff --git a/webrtc-sys/libwebrtc/build_linux.sh b/webrtc-sys/libwebrtc/build_linux.sh
 index fdfa1302..fa5bf0dd 100755
 --- a/webrtc-sys/libwebrtc/build_linux.sh
