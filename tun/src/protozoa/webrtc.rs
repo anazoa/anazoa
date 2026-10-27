@@ -551,36 +551,87 @@ pub async fn add_ice_candidate(
         .map_err(|e| anyhow!(e))
 }
 
+/// Video sender and connection figures from one `getStats()` report.
+pub async fn call_stats(pc: &SharedPtr<PeerConnection>) -> Result<CallStats> {
+    let (tx, rx) = oneshot::channel::<String>();
+    pc.get_stats(Box::new(PeerContext(Box::new(tx))), stats_delivered);
+    let report: Value = serde_json::from_str(&rx.await.context("get_stats callback dropped")?)
+        .context("parse stats report")?;
+    let stats = report.as_array().map(Vec::as_slice).unwrap_or_default();
+    Ok(CallStats {
+        video_send: video_send_stats(stats),
+        connection: connection_stats(stats),
+    })
+}
+
+/// What [`call_stats`] reads from one `getStats` report.
+pub struct CallStats {
+    /// The video sender, once it has encoded a frame.
+    pub video_send: Option<Value>,
+    /// The selected ICE candidate pair, once there is one.
+    pub connection: Option<Value>,
+}
+
 /// The video sender's encoder figures from a `getStats()` report: the
 /// target bitrate WebRTC gives the encoder (from bandwidth estimation),
 /// the frame rate our source delivers (`source_fps`, before any dropping)
 /// and the rate actually encoded (`fps`), and what WebRTC says is limiting
 /// quality ("bandwidth", "cpu" or "none"). Null fields if this libwebrtc
 /// doesn't report them; None until the encoder has produced a frame.
-pub async fn video_send_stats(pc: &SharedPtr<PeerConnection>) -> Result<Option<Value>> {
-    let (tx, rx) = oneshot::channel::<String>();
-    pc.get_stats(Box::new(PeerContext(Box::new(tx))), stats_delivered);
-    let report: Value = serde_json::from_str(&rx.await.context("get_stats callback dropped")?)
-        .context("parse stats report")?;
-    let stats = report.as_array().map(Vec::as_slice).unwrap_or_default();
-    let Some(rtp) = stats
+fn video_send_stats(stats: &[Value]) -> Option<Value> {
+    let rtp = stats
         .iter()
         .find(|s| s["type"] == "outbound-rtp" && s["kind"] == "video")
-        .filter(|s| s["framesEncoded"].as_u64().is_some_and(|n| n > 0))
-    else {
-        return Ok(None);
-    };
+        .filter(|s| s["framesEncoded"].as_u64().is_some_and(|n| n > 0))?;
     let source = stats
         .iter()
         .find(|s| s["type"] == "media-source" && s["kind"] == "video");
-    Ok(Some(json!({
+    Some(json!({
         "target_bitrate": rtp["targetBitrate"],
         "source_fps": source.map_or(&Value::Null, |s| &s["framesPerSecond"]),
         "fps": rtp["framesPerSecond"],
         "frames_encoded": rtp["framesEncoded"],
         "quality_limitation": rtp["qualityLimitationReason"],
         "encoder": rtp["encoderImplementation"],
-    })))
+    }))
+}
+
+/// Round-trip time and path of the selected candidate pair.  `path` is
+/// "relay" when either end is a TURN relay candidate, else "direct".
+fn connection_stats(stats: &[Value]) -> Option<Value> {
+    fn by_id<'a>(stats: &'a [Value], id: &Value) -> Option<&'a Value> {
+        stats.iter().find(|s| id.is_string() && s["id"] == *id)
+    }
+    let pair = stats
+        .iter()
+        .find(|s| s["type"] == "transport")
+        .and_then(|t| by_id(stats, &t["selectedCandidatePairId"]))
+        .or_else(|| {
+            stats.iter().find(|s| {
+                s["type"] == "candidate-pair" && s["nominated"] == true && s["state"] == "succeeded"
+            })
+        })?;
+    let local = by_id(stats, &pair["localCandidateId"]);
+    let remote = by_id(stats, &pair["remoteCandidateId"]);
+    let kind = |c: Option<&Value>| {
+        c.and_then(|c| c["candidateType"].as_str())
+            .unwrap_or("unknown")
+            .to_owned()
+    };
+    let (local_kind, remote_kind) = (kind(local), kind(remote));
+    let path = if local_kind == "relay" || remote_kind == "relay" {
+        "relay"
+    } else {
+        "direct"
+    };
+    Some(json!({
+        "rtt_ms": pair["currentRoundTripTime"].as_f64().map(|s| (s * 1000.0).round() as u64),
+        "available_outgoing_bitrate": pair["availableOutgoingBitrate"],
+        "path": path,
+        "local_candidate": local_kind,
+        "remote_candidate": remote_kind,
+        "protocol": local.map_or(&Value::Null, |c| &c["protocol"]),
+    }))
 }
 
 #[allow(clippy::boxed_local)]

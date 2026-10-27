@@ -35,8 +35,8 @@ use crate::protozoa::tunnel::{
 use crate::protozoa::vp9::VP9_BLACK_KEYFRAMES;
 use crate::protozoa::webrtc::{
     LocalEvent, Role, VideoCodec, WebrtcCall, add_ice_candidate, attach_existing_remote_tracks,
-    create_answer, create_offer, ensure_local_senders, ensure_send_codec, ice_state_name,
-    log_local_senders, pc_state_name, set_local_description, set_remote_sdp, video_send_stats,
+    call_stats, create_answer, create_offer, ensure_local_senders, ensure_send_codec,
+    ice_state_name, log_local_senders, pc_state_name, set_local_description, set_remote_sdp,
 };
 use crate::{Config, call_keepalive_loop, shutdown_requested, shutdown_signal, trigger_shutdown};
 use webrtc_sys::jsep::ffi::SdpType;
@@ -365,7 +365,7 @@ async fn drive_call(
                 if let Err(err) = signaling.send_custom_data().await {
                     debug!("custom-data send failed: {err:#}");
                 }
-                refresh_video_send_stats(&call).await;
+                refresh_call_stats(&call).await;
                 log_tunnel_stats();
             }
 
@@ -442,6 +442,7 @@ pub fn status_json(state: &EngineState) -> Value {
             "uptime_secs": started_at.elapsed().as_secs(),
             "tunnel_up": tunnel_up(),
             "video_send": VIDEO_SEND_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+            "connection": CONNECTION_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone(),
             "tunnel": tunnel_stats_json(),
         }),
         EngineState::Stopped => json!({"state": "stopped"}),
@@ -469,8 +470,13 @@ static ICE_CONNECTED: AtomicBool = AtomicBool::new(false);
 /// on the call's 5 s tick and cleared when a call starts and ends.
 static VIDEO_SEND_STATS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
 
-fn set_video_send_stats(stats: Option<Value>) {
-    *VIDEO_SEND_STATS.lock().unwrap_or_else(|e| e.into_inner()) = stats;
+/// The current call's selected ICE candidate pair: RTT and path (see
+/// `call_stats`), refreshed alongside `VIDEO_SEND_STATS`.
+static CONNECTION_STATS: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
+
+fn clear_call_stats() {
+    *VIDEO_SEND_STATS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *CONNECTION_STATS.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 /// Refreshes `VIDEO_SEND_STATS`, logging when WebRTC's reason for limiting
@@ -482,19 +488,47 @@ fn set_video_send_stats(stats: Option<Value>) {
 /// encoded rate alone isn't either: when the bitrate collapses the encoder
 /// drops frames too (8 of 30 on an idle host as ICE was failing), so only
 /// the source rate counts as starvation.
-async fn refresh_video_send_stats(call: &WebrtcCall) {
-    let stats = match tokio::time::timeout(Duration::from_secs(1), video_send_stats(&call.pc)).await
-    {
-        Ok(Ok(Some(stats))) => stats,
-        Ok(Ok(None)) => return,
+///
+/// Also refreshes `CONNECTION_STATS`, logging when the connection path
+/// changes (e.g. ICE moving from a TURN relay to a direct pair).
+async fn refresh_call_stats(call: &WebrtcCall) {
+    let stats = match tokio::time::timeout(Duration::from_secs(1), call_stats(&call.pc)).await {
+        Ok(Ok(stats)) => stats,
         Ok(Err(err)) => {
-            debug!("video sender stats: {err:#}");
+            debug!("call stats: {err:#}");
             return;
         }
         Err(_) => {
-            debug!("video sender stats timed out");
+            debug!("call stats timed out");
             return;
         }
+    };
+    if let Some(connection) = stats.connection {
+        let mut slot = CONNECTION_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let path = |c: &Value| {
+            (
+                c["path"].clone(),
+                c["local_candidate"].clone(),
+                c["remote_candidate"].clone(),
+            )
+        };
+        if slot
+            .as_ref()
+            .is_none_or(|prev| path(prev) != path(&connection))
+        {
+            info!(
+                "connection path: {} ({} to {}, {}), rtt {} ms",
+                connection["path"].as_str().unwrap_or("unknown"),
+                connection["local_candidate"].as_str().unwrap_or("unknown"),
+                connection["remote_candidate"].as_str().unwrap_or("unknown"),
+                connection["protocol"].as_str().unwrap_or("unknown"),
+                connection["rtt_ms"]
+            );
+        }
+        *slot = Some(connection);
+    }
+    let Some(stats) = stats.video_send else {
+        return;
     };
     let starved = |stats: &Value| {
         stats["source_fps"]
@@ -783,7 +817,7 @@ async fn finish_call(
     let (hangup_tx, hangup_rx) = watch::channel(false);
     let started_at = Instant::now();
     ICE_CONNECTED.store(false, Ordering::Relaxed);
-    set_video_send_stats(None);
+    clear_call_stats();
     env.status.send_replace(EngineState::InCall {
         peer_id,
         started_at,
@@ -793,7 +827,7 @@ async fn finish_call(
 
     let _ = hangup_tx.send(true);
     ICE_CONNECTED.store(false, Ordering::Relaxed);
-    set_video_send_stats(None);
+    clear_call_stats();
     teardown_call(signaling, keepalive_stop_tx, keepalive).await;
 
     match call_result {
